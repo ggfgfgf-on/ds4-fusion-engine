@@ -66780,13 +66780,13 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         snap->cap = capacity;
     }
 
-    FILE *fp = fmemopen(snap->ptr, (size_t)capacity, "wb");
+    FILE *fp = ds4_fmemopen_write(snap->ptr, (size_t)capacity);
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot");
         return 1;
     }
     const int rc = ds4_session_save_payload(s, fp, err, errlen);
-    if (fclose(fp) != 0 && rc == 0) {
+    if (ds4_fmemopen_close(fp) != 0 && rc == 0) {
         payload_set_err(err, errlen, "failed to finalize memory session snapshot");
         return 1;
     }
@@ -66809,7 +66809,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         return 1;
     }
 
-    FILE *fp = fmemopen((void *)snap->ptr, (size_t)snap->len, "rb");
+    FILE *fp = ds4_fmemopen_read((void *)snap->ptr, (size_t)snap->len);
     if (!fp) {
         payload_set_err(err, errlen, "failed to open memory stream for session snapshot restore");
         return 1;
@@ -73948,7 +73948,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         /* The agent may change directory before creating its first session.
          * Engram readers reopen this file and check it against model.fd. */
-        e->model_path = realpath(opt->model_path, NULL);
+        e->model_path = ds4_realpath_alloc(opt->model_path);
         if (!e->model_path) {
             fprintf(stderr, "ds4: cannot resolve V4.1 model path: %s\n", strerror(errno));
             ds4_engine_close(e);

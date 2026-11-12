@@ -674,9 +674,9 @@ static uint8_t jpeg_sample_chroma(const jpeg_decoder *dec, int component,
     int ny = sy + ((y & 1) ? 1 : -1);
     if (ny < 0) ny = 0;
     if (ny >= height) ny = height - 1;
-    int near = 3 * plane[sy * stride + sx] + plane[ny * stride + sx];
-    int far = 3 * plane[sy * stride + nx] + plane[ny * stride + nx];
-    return (uint8_t)((3 * near + far + ((x & 1) ? 7 : 8)) >> 4);
+    int near_v = 3 * plane[sy * stride + sx] + plane[ny * stride + sx];
+    int far_v = 3 * plane[sy * stride + nx] + plane[ny * stride + nx];
+    return (uint8_t)((3 * near_v + far_v + ((x & 1) ? 7 : 8)) >> 4);
 }
 
 /* Consume a restart marker at the current bitstream position.

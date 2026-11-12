@@ -1036,6 +1036,31 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     char port_arg[64], profile_arg[PATH_MAX + 64];
     snprintf(port_arg, sizeof(port_arg), "--remote-debugging-port=%d", web->port);
     snprintf(profile_arg, sizeof(profile_arg), "--user-data-dir=%s", web->profile_dir);
+#ifdef _WIN32
+    {
+        char cmdline[PATH_MAX * 2 + 256];
+        snprintf(cmdline, sizeof(cmdline),
+                 "\"%s\" %s --remote-allow-origins=* %s --no-first-run "
+                 "--no-default-browser-check --disable-sync --password-store=basic "
+                 "--mute-audio about:blank",
+                 exe, port_arg, profile_arg);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                            CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+                            NULL, NULL, &si, &pi)) {
+            web_set_err(err, err_len, "failed to launch Chrome: %lu",
+                        (unsigned long)GetLastError());
+            free(exe);
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        web->chrome_pid = (pid_t)pi.dwProcessId;
+    }
+#else
     pid_t pid = fork();
     if (pid < 0) {
         web_set_err(err, err_len, "failed to fork Chrome: %s", strerror(errno));
@@ -1077,8 +1102,9 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
 #endif
         _exit(127);
     }
-    free(exe);
     web->chrome_pid = pid;
+#endif
+    free(exe);
     for (int i = 0; i < 80; i++) {
         if (web_set_cancel_err(web, err, err_len)) return false;
         if (web_cdp_alive(web)) {
@@ -1086,8 +1112,8 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
             return true;
         }
         int status = 0;
-        pid_t rc = waitpid(pid, &status, WNOHANG);
-        if (rc == pid) {
+        pid_t rc = waitpid(web->chrome_pid, &status, WNOHANG);
+        if (rc == web->chrome_pid) {
             web->chrome_pid = 0;
             if (launched_via_open) continue;
             web_set_err(err, err_len, "Chrome exited before CDP became ready");

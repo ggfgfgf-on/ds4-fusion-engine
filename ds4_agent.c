@@ -20,7 +20,9 @@
 #include <pthread.h>
 #include <regex.h>
 #include <signal.h>
+#ifndef _WIN32
 #include <spawn.h>
+#endif
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -7054,6 +7056,9 @@ static bool agent_same_file_version(const struct stat *a, const struct stat *b) 
 #ifdef __APPLE__
     struct timespec am = a->st_mtimespec, bm = b->st_mtimespec;
     struct timespec ac = a->st_ctimespec, bc = b->st_ctimespec;
+#elif defined(_WIN32)
+    struct timespec am = { a->st_mtime, 0 }, bm = { b->st_mtime, 0 };
+    struct timespec ac = { a->st_ctime, 0 }, bc = { b->st_ctime, 0 };
 #else
     struct timespec am = a->st_mtim, bm = b->st_mtim;
     struct timespec ac = a->st_ctim, bc = b->st_ctim;
@@ -8941,6 +8946,40 @@ static void *agent_bash_monitor(void *arg) {
  * can exhaust memory before the child gets to exec, even with copy-on-write. */
 static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
                             const char *cmd) {
+#ifdef _WIN32
+    /* Windows port: cmd.exe via CreateProcess; only the pipe write end is
+     * inherited, stdin comes from NUL. */
+    char cmdline[8192];
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /d /s /c \"%s\"", cmd ? cmd : "");
+    HANDLE hOut = (HANDLE)_get_osfhandle(pipefd[1]);
+    HANDLE hIn = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, 0, NULL);
+    if (hIn == INVALID_HANDLE_VALUE) {
+        errno = EIO;
+        return errno;
+    }
+    SetHandleInformation(hOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation((HANDLE)_get_osfhandle(pipefd[0]), HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation((HANDLE)_get_osfhandle(tmpfd), HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hOut;
+    si.hStdError = hOut;
+    si.hStdInput = hIn;
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(hIn);
+        errno = EIO;
+        return errno;
+    }
+    CloseHandle(hIn);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    *pid = (pid_t)pi.dwProcessId;
+    return 0;
+#else
     posix_spawnattr_t attr;
     posix_spawn_file_actions_t actions;
     int rc = posix_spawnattr_init(&attr);
@@ -8965,6 +9004,7 @@ static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
     return rc;
+#endif
 }
 
 /* Spawn a shell command into its own process group so bash_stop/timeout can

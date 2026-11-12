@@ -67,7 +67,9 @@ bool ds4_repack_map_file(const char *log_prefix, const char *path, ds4_repack_fi
         return false;
     }
     m.size = (uint64_t)st.st_size;
+#ifndef _WIN32
     if (st.st_blksize > 1) m.direct_align = (uint64_t)st.st_blksize;
+#endif
 #if defined(__linux__) && defined(O_DIRECT)
     if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
         char proc_path[64];

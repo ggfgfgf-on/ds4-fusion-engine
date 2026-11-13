@@ -9118,9 +9118,15 @@ static int cuda_q8_mma_try_launch(
         uint32_t groups = 1,
         uint64_t w_stride_blocks = 0) {
     static int disabled = -1;
+    static int mma_min_tok = -1;
     if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
+    if (mma_min_tok < 0) {
+        const char *e = getenv("DS4_CUDA_Q8_MMA_MIN_TOK");
+        mma_min_tok = e && e[0] ? atoi(e) : 8;
+        if (mma_min_tok < 8) mma_min_tok = 8;
+    }
     if (disabled || !cuda_q4_mma_ok()) return 0;
-    if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
+    if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < (uint64_t)mma_min_tok) return 0;
     if (!w_stride_blocks) w_stride_blocks = blocks;
     if (w_stride_blocks < blocks) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;

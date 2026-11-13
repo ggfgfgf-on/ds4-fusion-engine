@@ -16211,6 +16211,74 @@ static void output_logits_one_decode_scratch(
 
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
+static pthread_t g_warm_thread;
+static pthread_mutex_t g_warm_mutex;
+static pthread_cond_t g_warm_cond;
+static bool g_warm_init = false;
+static bool g_warm_shutdown = false;
+static const uint8_t *g_warm_addrs[4];
+static uint64_t g_warm_sizes[4];
+static uint32_t g_warm_n;
+static uint64_t g_warm_req;
+static uint64_t g_warm_done;
+static volatile uint8_t g_warm_sink;
+
+static void *ds4_warm_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_warm_mutex);
+        while (g_warm_req == g_warm_done && !g_warm_shutdown) {
+            pthread_cond_wait(&g_warm_cond, &g_warm_mutex);
+        }
+        if (g_warm_shutdown && g_warm_req == g_warm_done) {
+            pthread_mutex_unlock(&g_warm_mutex);
+            return NULL;
+        }
+        const uint8_t *addrs[4];
+        uint64_t sizes[4];
+        uint32_t n = g_warm_n;
+        for (uint32_t i = 0; i < n && i < 4; i++) {
+            addrs[i] = g_warm_addrs[i];
+            sizes[i] = g_warm_sizes[i];
+        }
+        pthread_mutex_unlock(&g_warm_mutex);
+
+        uint8_t acc = 0;
+        for (uint32_t i = 0; i < n && i < 4; i++) {
+            const volatile uint8_t *p = addrs[i];
+            for (uint64_t off = 0; off < sizes[i]; off += 64) {
+                acc ^= p[off];
+            }
+        }
+        g_warm_sink = acc; /* keep the walk alive */
+
+        pthread_mutex_lock(&g_warm_mutex);
+        g_warm_done++;
+        pthread_mutex_unlock(&g_warm_mutex);
+    }
+}
+
+static void ds4_warm_request(const uint8_t **addrs, const uint64_t *sizes, uint32_t n) {
+    if (!g_warm_init) {
+        g_warm_init = true;
+        pthread_mutex_init(&g_warm_mutex, NULL);
+        pthread_cond_init(&g_warm_cond, NULL);
+        if (pthread_create(&g_warm_thread, NULL, ds4_warm_main, NULL) != 0) {
+            ds4_die("failed to create warm thread");
+        }
+    }
+    pthread_mutex_lock(&g_warm_mutex);
+    g_warm_n = n > 4 ? 4 : n;
+    for (uint32_t i = 0; i < g_warm_n; i++) {
+        g_warm_addrs[i] = addrs[i];
+        g_warm_sizes[i] = sizes[i];
+    }
+    g_warm_req++;
+    pthread_cond_signal(&g_warm_cond);
+    pthread_mutex_unlock(&g_warm_mutex);
+}
+
+
 static void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
@@ -16228,7 +16296,28 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     embed_token_f16(model, weights, token, scratch->plain);
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
 
+    const bool warm_next = getenv("DS4_WARM_NEXT") != NULL;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (warm_next && il + 1 < DS4_N_LAYER) {
+            const ds4_layer_weights *nl = &weights->layer[il + 1];
+            const uint8_t *waddrs[4];
+            uint64_t wsizes[4];
+            uint32_t wn = 0;
+#define DS4_WARM_ADD(t) do {                                                   \
+            const ds4_tensor *wt = (t);                                        \
+            if (wt && wt->ndim == 2) {                                         \
+                waddrs[wn] = tensor_data(model, wt);                           \
+                wsizes[wn] = (uint64_t)wt->dim[0] * wt->dim[1] * 2u;           \
+                wn++;                                                          \
+            }                                                                  \
+        } while (0)
+            DS4_WARM_ADD(nl->attn_compressor_kv);
+            DS4_WARM_ADD(nl->attn_compressor_gate);
+            DS4_WARM_ADD(nl->indexer_compressor_kv);
+            DS4_WARM_ADD(nl->indexer_compressor_gate);
+#undef DS4_WARM_ADD
+            ds4_warm_request(waddrs, wsizes, wn);
+        }
         layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
                                   cur, il, pos, token,
                                   steering_dirs,

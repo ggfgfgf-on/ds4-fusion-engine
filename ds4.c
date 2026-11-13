@@ -88,6 +88,124 @@ static ds4_tp *g_tp_block_ctx;
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
 
+/* ==================== Low-bit KV quantization (bitq) ====================
+ * DS4_CUDA_KV_BITQ family: pack the raw ring / attention-compressed cache /
+ * indexer cache rows into per-16-group scaled int codes (LOSSY: dequantized
+ * KV differs from the FP32 ring, so the attention numeric family changes
+ * and greedy output can flip near-threshold tokens — re-certify before
+ * enabling). DS4_CUDA_KV_BITQ_AUTO=quality|capacity (startup bit-width
+ * scheduler): ds4_kv_bitq_scheduler_settle() decides the profile once
+ * before the first allocation reads these getters. Manual bitq envs always
+ * win over the scheduler. */
+enum {
+    DS4_KV_BITQ_PROF_NONE = -1, /* scheduler inactive / not yet decided */
+    DS4_KV_BITQ_PROF_OFF  = 0,  /* legacy FP32/F16 path */
+    DS4_KV_BITQ_PROF_B    = 1,  /* certified B: raw6/comp4/idx4 (~4x) */
+    DS4_KV_BITQ_PROF_A    = 2,  /* certified A: raw4/comp4/idx4 (~5.3x) */
+};
+static int ds4_kv_bitq_auto_profile = DS4_KV_BITQ_PROF_NONE;
+
+static int ds4_kv_bitq_profile_raw_bits(int prof) {
+    return prof == DS4_KV_BITQ_PROF_B ? 6 : 4;
+}
+
+static int ds4_kv_bitq_enabled(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF)
+        return ds4_kv_bitq_auto_profile != DS4_KV_BITQ_PROF_OFF;
+    static int state = -1;
+    if (state < 0) state = getenv("DS4_CUDA_KV_BITQ") != NULL ? 1 : 0;
+    return state;
+}
+
+/* Code width and packed row stride (mirrors kv_bitq_bits in ds4_cuda.cu;
+ * 32 x 4B group scales + (512 x bits)/8 code bytes per 512-dim row). */
+static int ds4_kv_bitq_bits(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF)
+        return ds4_kv_bitq_profile_raw_bits(ds4_kv_bitq_auto_profile);
+    static int bits = -1;
+    if (bits < 0) {
+        bits = 4;
+        const char *env = getenv("DS4_CUDA_KV_BITQ_BITS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 2 && v <= 8) bits = (int)v;
+        }
+    }
+    return bits;
+}
+
+/* Per-cache bit widths: DS4_CUDA_KV_BITQ_RAW_BITS / _COMP_BITS / _IDX_BITS
+ * override the global DS4_CUDA_KV_BITQ_BITS per cache. */
+static int ds4_kv_bitq_cache_bits(const char *envname) {
+    const char *env = getenv(envname);
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v >= 2 && v <= 8) return (int)v;
+    }
+    return ds4_kv_bitq_bits();
+}
+static int ds4_kv_bitq_raw_bits(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF)
+        return ds4_kv_bitq_profile_raw_bits(ds4_kv_bitq_auto_profile);
+    return ds4_kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_RAW_BITS");
+}
+static int ds4_kv_bitq_comp_bits(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF) return 4;
+    return ds4_kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_COMP_BITS");
+}
+static int ds4_kv_bitq_idx_bits(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF) return 4;
+    return ds4_kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_IDX_BITS");
+}
+
+static uint32_t ds4_kv_bitq_row_bytes_bits(uint32_t head_dim, int bits) {
+    return (head_dim / 16u) * 4u + (head_dim / 8u) * (uint32_t)bits;
+}
+static uint32_t ds4_kv_bitq_row_bytes(uint32_t head_dim) {
+    return ds4_kv_bitq_row_bytes_bits(head_dim, ds4_kv_bitq_raw_bits());
+}
+static uint32_t ds4_kv_bitq_comp_row_bytes(uint32_t head_dim) {
+    return ds4_kv_bitq_row_bytes_bits(head_dim, ds4_kv_bitq_comp_bits());
+}
+static uint32_t ds4_kv_bitq_idx_row_bytes(uint32_t head_dim) {
+    return ds4_kv_bitq_row_bytes_bits(head_dim, ds4_kv_bitq_idx_bits());
+}
+
+/* The attention-compressed cache gets the same per-row pack under its own
+ * env (composes with the raw-ring env or stands alone). */
+static int ds4_kv_bitq_comp_enabled(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF)
+        return ds4_kv_bitq_auto_profile != DS4_KV_BITQ_PROF_OFF;
+    static int state = -1;
+    if (state < 0) state = getenv("DS4_CUDA_KV_BITQ_COMP") != NULL ? 1 : 0;
+    return state;
+}
+
+/* The indexer cache (128-dim f32 rows) under its own env. Prefill-side
+ * only; the GPU decode-side indexer is unsupported under it. */
+static int ds4_kv_bitq_idx_enabled(void) {
+    if (ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF)
+        return ds4_kv_bitq_auto_profile != DS4_KV_BITQ_PROF_OFF;
+    static int state = -1;
+    if (state < 0) state = getenv("DS4_CUDA_KV_BITQ_IDX") != NULL ? 1 : 0;
+    return state;
+}
+
+/* Scheduler decision exported to ds4_cuda.cu (its getters mirror these). */
+int ds4_kv_bitq_auto_active(void) {
+    return ds4_kv_bitq_auto_profile >= DS4_KV_BITQ_PROF_OFF;
+}
+int ds4_kv_bitq_auto_enabled(void) {
+    return ds4_kv_bitq_auto_profile > DS4_KV_BITQ_PROF_OFF;
+}
+int ds4_kv_bitq_auto_raw_bits(void) {
+    return ds4_kv_bitq_profile_raw_bits(ds4_kv_bitq_auto_profile);
+}
+int ds4_kv_bitq_auto_comp_bits(void) { return 4; }
+int ds4_kv_bitq_auto_idx_bits(void)  { return 4; }
+
 static uint32_t metal_graph_cuda_tp_output_requested_ways(void) {
     const char *env = getenv("DS4_CUDA_TP_OUTPUT_WAYS");
     if (!env || !env[0]) return 8;

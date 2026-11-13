@@ -2970,6 +2970,240 @@ static int cuda_wddm_global_shared_usage_bytes(uint64_t *usage_out) {
 #endif
 }
 
+/* ==================== Low-bit KV quantization (bitq) core ====================
+ * Pack/unpack kernels + env readers. The dispatch sites (ring store,
+ * attention gathers, comp/index pack APIs) are wired in the follow-up
+ * commit against this base's attention paths. LOSSY: dequantized KV differs
+ * from the FP32 ring — re-certify before enabling.
+ *
+ * DS4_CUDA_KV_BITQ_AUTO (startup bit-width scheduler, decided in ds4.c):
+ * when active, these getters return the settled profile instead of reading
+ * envs; manual bitq envs keep the legacy env semantics. */
+extern "C" int ds4_kv_bitq_auto_active(void);
+extern "C" int ds4_kv_bitq_auto_enabled(void);
+extern "C" int ds4_kv_bitq_auto_raw_bits(void);
+extern "C" int ds4_kv_bitq_auto_comp_bits(void);
+extern "C" int ds4_kv_bitq_auto_idx_bits(void);
+
+/* Defined later in this file; forward-declared for the bitq store kernel. */
+__device__ static void fp8_kv_quantize_row(
+        float    *xr,
+        uint32_t  head_dim,
+        uint32_t  n_rot,
+        float    *scratch);
+
+static int kv_bitq_bits(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_raw_bits();
+    static int bits = -1;
+    if (bits < 0) {
+        bits = 4;
+        const char *env = getenv("DS4_CUDA_KV_BITQ_BITS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 2 && v <= 8) bits = (int)v;
+        }
+    }
+    return bits;
+}
+
+/* Per-cache bit widths: DS4_CUDA_KV_BITQ_RAW_BITS / _COMP_BITS / _IDX_BITS
+ * override the global DS4_CUDA_KV_BITQ_BITS, mirroring the ds4.c readers. */
+static int kv_bitq_cache_bits(const char *envname) {
+    const char *env = getenv(envname);
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v >= 2 && v <= 8) return (int)v;
+    }
+    return kv_bitq_bits();
+}
+static int kv_bitq_raw_bits(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_raw_bits();
+    return kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_RAW_BITS");
+}
+static int kv_bitq_comp_bits(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_comp_bits();
+    return kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_COMP_BITS");
+}
+static int kv_bitq_idx_bits(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_idx_bits();
+    return kv_bitq_cache_bits("DS4_CUDA_KV_BITQ_IDX_BITS");
+}
+
+static int kv_bitq_on(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_enabled();
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_KV_BITQ") != NULL ? 1 : 0;
+    return on;
+}
+
+/* The attention-compressed cache (512-dim f32 rows, append-only) gets the
+ * same per-row pack under its own env so it composes with the raw ring
+ * quantization or stands alone. */
+static int kv_bitq_comp_on(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_enabled();
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_KV_BITQ_COMP") != NULL ? 1 : 0;
+    return on;
+}
+
+static int kv_bitq_idx_on(void) {
+    if (ds4_kv_bitq_auto_active()) return ds4_kv_bitq_auto_enabled();
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_KV_BITQ_IDX") != NULL ? 1 : 0;
+    return on;
+}
+
+static __host__ __device__ inline uint32_t kv_bitq_row_bytes(uint32_t head_dim, int bits) {
+    /* 32 x 4B scales + (512 x bits)/8 code bytes (per 512-dim row). */
+    return (head_dim / 16u) * 4u + (head_dim / 8u) * (uint32_t)bits;
+}
+
+/* Ring byte-capacity check that follows the packed stride under the env
+ * (the ring is ALLOCATED at row_bytes per row when bitq is on). */
+static inline bool kv_ring_bytes_ok(const ds4_gpu_tensor *t,
+        uint32_t raw_cap, uint32_t head_dim) {
+    if (!t) return false;
+    if (kv_bitq_on()) {
+        return t->bytes >=
+               (uint64_t)raw_cap * kv_bitq_row_bytes(head_dim, kv_bitq_raw_bits());
+    }
+    return t->bytes >= (uint64_t)raw_cap * head_dim * sizeof(float);
+}
+
+/* Comp-cache capacity check that follows the packed stride under
+ * DS4_CUDA_KV_BITQ_COMP. */
+static inline bool kv_comp_bytes_ok(const ds4_gpu_tensor *t,
+        uint32_t cap, uint32_t head_dim) {
+    if (!t) return false;
+    if (kv_bitq_comp_on()) {
+        return t->bytes >=
+               (uint64_t)cap * kv_bitq_row_bytes(head_dim, kv_bitq_comp_bits());
+    }
+    return t->bytes >= (uint64_t)cap * head_dim * sizeof(float);
+}
+
+static __device__ __forceinline__ void kv_bitq_pack_row(
+        unsigned char *dst, const float *src, uint32_t head_dim, int bits) {
+    const int max_code = (1 << (bits - 1)) - 1;
+    const uint32_t group_bytes = (16u * (uint32_t)bits) / 8u;
+    for (uint32_t g = 0; g < head_dim / 16u; g++) {
+        float mx = 0.0f;
+        for (uint32_t c = 0; c < 16u; c++) {
+            const float a = fabsf(src[g * 16u + c]);
+            if (a > mx) mx = a;
+        }
+        const float scale = mx / (float)max_code;
+        *(float *)(dst + g * 4u) = scale;
+        unsigned char *pack = dst + (head_dim / 16u) * 4u + g * group_bytes;
+        for (uint32_t i = 0; i < group_bytes; i++) pack[i] = 0;
+        for (uint32_t c = 0; c < 16u; c++) {
+            float v = src[g * 16u + c];
+            int code = (int)roundf(v / (scale > 0.0f ? scale : 1.0f));
+            if (code > max_code) code = max_code;
+            if (code < -max_code) code = -max_code;
+            const uint32_t u = (uint32_t)code & ((1u << bits) - 1u);
+            const uint32_t bitpos = c * (uint32_t)bits;
+            const uint32_t byte = bitpos >> 3u;
+            const uint32_t shift = bitpos & 7u;
+            pack[byte] |= (unsigned char)(u << shift);
+            if (shift + (uint32_t)bits > 8u) {
+                pack[byte + 1u] |= (unsigned char)(u >> (8u - shift));
+            }
+        }
+    }
+}
+
+/* Decode-store variant: the certified decode ring rows are F16-rounded
+ * (fp8_kv_quantize_store_rows_kernel writes half-rounded floats), so the
+ * bitq pack must round to F16 first to keep the same canonical values. */
+static __device__ __forceinline__ void kv_bitq_pack_row_f16(
+        unsigned char *dst, const float *src, uint32_t head_dim, int bits) {
+    const int max_code = (1 << (bits - 1)) - 1;
+    const uint32_t group_bytes = (16u * (uint32_t)bits) / 8u;
+    for (uint32_t g = 0; g < head_dim / 16u; g++) {
+        float v16[16];
+        float mx = 0.0f;
+        for (uint32_t c = 0; c < 16u; c++) {
+            v16[c] = __half2float(__float2half(src[g * 16u + c]));
+            const float a = fabsf(v16[c]);
+            if (a > mx) mx = a;
+        }
+        const float scale = mx / (float)max_code;
+        *(float *)(dst + g * 4u) = scale;
+        unsigned char *pack = dst + (head_dim / 16u) * 4u + g * group_bytes;
+        for (uint32_t i = 0; i < group_bytes; i++) pack[i] = 0;
+        for (uint32_t c = 0; c < 16u; c++) {
+            int code = (int)roundf(v16[c] / (scale > 0.0f ? scale : 1.0f));
+            if (code > max_code) code = max_code;
+            if (code < -max_code) code = -max_code;
+            const uint32_t u = (uint32_t)code & ((1u << bits) - 1u);
+            const uint32_t bitpos = c * (uint32_t)bits;
+            const uint32_t byte = bitpos >> 3u;
+            const uint32_t shift = bitpos & 7u;
+            pack[byte] |= (unsigned char)(u << shift);
+            if (shift + (uint32_t)bits > 8u) {
+                pack[byte + 1u] |= (unsigned char)(u >> (8u - shift));
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ float kv_bitq_unpack_elem(
+        const unsigned char *row, uint32_t head_dim, uint32_t c, int bits) {
+    const uint32_t g = c / 16u;
+    const float scale = *(const float *)(row + g * 4u);
+    const unsigned char *pack = row + (head_dim / 16u) * 4u +
+            g * ((16u * (uint32_t)bits) / 8u);
+    const uint32_t bitpos = (c & 15u) * (uint32_t)bits;
+    const uint32_t byte = bitpos >> 3u;
+    const uint32_t shift = bitpos & 7u;
+    uint32_t u = pack[byte] >> shift;
+    if (shift + (uint32_t)bits > 8u) {
+        u |= (uint32_t)pack[byte + 1u] << (8u - shift);
+    }
+    u &= (1u << bits) - 1u;
+    int code = (int)u;
+    const int max_code = (1 << (bits - 1)) - 1;
+    if (code > max_code) code -= 1 << bits;
+    return (float)code * scale;
+}
+
+__global__ static void store_raw_kv_bitq_batch_kernel(
+        unsigned char *raw, const float *kv, uint32_t raw_cap,
+        uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int bits) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens) return;
+    const uint32_t row = (pos0 + t) % raw_cap;
+    kv_bitq_pack_row(raw + (uint64_t)row * kv_bitq_row_bytes(head_dim, bits),
+                     kv + (uint64_t)t * head_dim, head_dim, bits);
+}
+
+/* DS4_CUDA_KV_BITQ decode-store variant of fp8_kv_quantize_store_rows_kernel:
+ * same FP8 non-RoPE round trip + F16 rounding as the certified decode ring
+ * rows, then packed into the ring (row offset = raw_start * row_bytes). */
+__global__ static void fp8_kv_bitq_store_rows_kernel(
+        float                           *x,
+        cuda_attention_decode_row_table  rows,
+        uint32_t                         n_rows,
+        uint32_t                         head_dim,
+        uint32_t                         n_rot,
+        int                              bits) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    __shared__ float scratch[64];
+    float *xr = x + (uint64_t)row * head_dim;
+    fp8_kv_quantize_row(xr, head_dim, n_rot, scratch);
+
+    const ds4_gpu_attention_decode_row dsc = rows.row[row];
+    unsigned char *raw = (unsigned char *)(uintptr_t)dsc.raw_kv;
+    if (threadIdx.x == 0u) {
+        kv_bitq_pack_row_f16(raw + (uint64_t)dsc.raw_start *
+                kv_bitq_row_bytes(head_dim, bits), xr, head_dim, bits);
+    }
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */

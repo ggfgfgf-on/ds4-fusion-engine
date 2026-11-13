@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+﻿#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -829,7 +829,7 @@ static inline uint64_t tt_align256_u64(uint64_t x) {
  *
  * The legacy g_cuda_tmp slab is untouched: init-time / preload callers
  * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
- * and g_gpu[0].scratch — they are independently owned and freed.
+ * and g_gpu[0].scratch 鈥?they are independently owned and freed.
  *
  * Added for multi-GPU execution (multi-GPU execution), step A3 of the
  * spec (sub-area 2). */
@@ -1502,7 +1502,7 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
  *     g_gpu[logical_tier].device_id and looks up the slice strictly
  *     in the per-device selective cache via ds4_gpu_lookup_cache_strict.
  *     On miss, logs a diagnostic and returns NULL (no host-pointer
- *     fallback — a miss here is a placement/install bug).
+ *     fallback 鈥?a miss here is a placement/install bug).
  *
  * The caller is responsible for cudaSetDevice'ing to the right physical
  * device before launching the kernel that consumes the returned pointer.
@@ -1707,14 +1707,14 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     }
 
     /* Smaller cards (< 40 GiB): 8GB laptop cards used to keep a 4 GiB
-     * reserve here — half the card — which starved the selective Q8->F16
+     * reserve here 鈥?half the card 鈥?which starved the selective Q8->F16
      * cache and forced the q8 kernels. WDDM eviction of device pages is
      * verified correct on this port (test_pinned probe series + the
      * slot-table root-cause fix), so overflow allocations are safely paged
      * to shared GPU memory; keep only a modest floor for cuBLAS workspaces
      * and driver bookkeeping. DS4_CUDA_Q8_F16_CACHE_RESERVE_MB overrides.
      * Budget coordination: the prefill graph capture (pg) registers a
-     * deterministic headroom charge — the q8 cache yields for the graph
+     * deterministic headroom charge 鈥?the q8 cache yields for the graph
      * state instead of leaving the layer-major encode on the VRAM cliff. */
     uint64_t min_reserve = 768ull * 1048576ull;
     if (getenv("DS4_CUDA_PREFILL_GRAPH") != NULL) {
@@ -1890,7 +1890,7 @@ static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_
  * new entry with device_id == expected_device, restores the previous device,
  * and returns the new pointer.
  *
- * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path —
+ * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path 鈥?
  * legacy entries were stamped device_id=0, so the map remains authoritative.
  * Multi-tier linear-scans the ranges vector filtering on device_id (the same
  * offset may now legitimately map to multiple entries, one per device).
@@ -1927,7 +1927,7 @@ static const __half *cuda_q8_f16_ptr(
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
 
     /* Source Q8 bytes:
-     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr — preserves the
+     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr 鈥?preserves the
      *    legacy behavior (FD cache, host-register, or cudaMalloc-and-copy).
      *  - Multi-tier (g_n_gpus > 1): the per-device selective cache must
      *    already contain the weight on expected_device. Use the strict
@@ -2974,7 +2974,7 @@ static int cuda_wddm_global_shared_usage_bytes(uint64_t *usage_out) {
  * Pack/unpack kernels + env readers. The dispatch sites (ring store,
  * attention gathers, comp/index pack APIs) are wired in the follow-up
  * commit against this base's attention paths. LOSSY: dequantized KV differs
- * from the FP32 ring — re-certify before enabling.
+ * from the FP32 ring 鈥?re-certify before enabling.
  *
  * DS4_CUDA_KV_BITQ_AUTO (startup bit-width scheduler, decided in ds4.c):
  * when active, these getters return the settled profile instead of reading
@@ -3621,7 +3621,7 @@ static int cuda_model_arena_lru_make_room(uint64_t aligned) {
         const cuda_model_range &r = g_model_ranges[i];
         if (!r.arena_allocated || r.bytes == 0) continue;
         /* Prefill mode: only ranges resolved before the current chunk
-         * (last_use <= floor) are reclaimable — the in-flight chunk holds
+         * (last_use <= floor) are reclaimable 鈥?the in-flight chunk holds
          * direct pointers to everything newer. */
         if (g_arena_prefill_mode && r.last_use > g_arena_prefill_floor) continue;
         /* Protection rules: graph-pinned tensors hold direct device
@@ -3707,7 +3707,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     /* LRU hole reuse: freed ranges are carved before any new growth.  This
      * path needs no cudaMalloc, so it stays legal even after a real OOM
-     * (g_model_cache_full) — evicting live ranges can free a hole. */
+     * (g_model_cache_full) 鈥?evicting live ranges can free a hole. */
     if (cuda_model_arena_lru_enabled() || g_arena_prefill_mode) {
         char *hole_ptr = cuda_model_arena_hole_carve(aligned);
         if (hole_ptr) return hole_ptr;
@@ -4055,7 +4055,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * partial state on failure. We publish `i + 1` BEFORE allocating any
      * resources for context `i`, so even if (e.g.) stream creation
      * succeeds but event creation fails, cleanup still walks device `i`
-     * and destroys the stream. ds4_gpu_cleanup is null-safe per field —
+     * and destroys the stream. ds4_gpu_cleanup is null-safe per field 鈥?
      * partial state is OK. */
     for (int i = 0; i < cfg->n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
@@ -4111,7 +4111,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * validation at init (see the loop below): write distinct known
      * patterns, peer-copy them to the destination, read back, and only
      * set peer_ok[i][j] if every probe round-trips byte-perfect. A
-     * single small probe is not sufficient — it can pass while realistic
+     * single small probe is not sufficient 鈥?it can pass while realistic
      * activation-sized copies still corrupt. On any failure the entry
      * stays at 0 and cross-device copies fall back to the pinned-host
      * bounce path automatically. */
@@ -4406,7 +4406,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     return 0;
 }
 
-/* Async D2D copy queued on the destination device's default stream —
+/* Async D2D copy queued on the destination device's default stream 鈥?
  * ordering against the producer comes from the caller's fence; the CPU
  * does not block (unlike ds4_gpu_tensor_copy's sync cudaMemcpy). */
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
@@ -5547,7 +5547,7 @@ extern "C" int ds4_gpu_set_current_device(int logical_tier) {
 /* Fenced device switch for sequential cross-device pipelines (GLM
  * per-layer placement): work queued on the next device's default stream
  * waits for everything queued so far on the previous device's default
- * stream. Async — no host sync. Falls back to a plain switch when the
+ * stream. Async 鈥?no host sync. Falls back to a plain switch when the
  * device does not change. */
 extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
@@ -5597,7 +5597,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
  * ds4_gpu_device_cache_tensors copies the listed source ranges from the
  * host mmap onto device_id's selective slab and appends sorted lookup
  * entries. The legacy chunked-copy machinery (cuda_model_range_*) is
- * NOT disturbed — it continues to drive all existing callers. New
+ * NOT disturbed 鈥?it continues to drive all existing callers. New
  * lookups fall back to it when no selective entry covers the range.
  *
  * Caller-context preference for overlap: when the same source range is
@@ -5651,14 +5651,14 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
      * init, default driver-side reservations). On a borderline budget
      * that overhead pushes a "fits-by-packer-math" layout past the actual
      * free pool and the cudaMalloc below OOMs after the engine already
-     * committed to the layout — same silent-late-OOM failure mode the
+     * committed to the layout 鈥?same silent-late-OOM failure mode the
      * upfront refusal path was added to eliminate. Catch it here too. */
     {
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
             /* free_b already excludes the existing slab (it's still
              * allocated), so the additional cudaMalloc only needs
-             * new_bytes free — not new_bytes + c.bytes. The old slab is
+             * new_bytes free 鈥?not new_bytes + c.bytes. The old slab is
              * freed AFTER the d2d copy succeeds. 2 GiB safety covers what
              * the engine will allocate AFTER the cache slab in the same
              * session_create: per-tier graph scratch (the planner can't
@@ -5667,7 +5667,7 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
              * reserves, and driver-side allocator slack. Without this
              * headroom a borderline budget that fits the slab itself can
              * still OOM at the per-tier tensor allocations a few moments
-             * later — same silent-late-OOM failure mode, one layer up. */
+             * later 鈥?same silent-late-OOM failure mode, one layer up. */
             const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
             const size_t need = new_bytes + safety;
             if (need > free_b) {
@@ -6667,7 +6667,7 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
             : CUBLAS_TF32_TENSOR_OP_MATH;
     /* Walk every initialized per-tier handle. Single-tier (g_n_gpus == 1)
      * walks exactly one entry. On any device-switch failure,
-     * skip the tier and continue — the function is void and the math-mode
+     * skip the tier and continue 鈥?the function is void and the math-mode
      * setting is advisory, but log so misconfiguration is visible. */
     for (int i = 0; i < g_n_gpus; i++) {
         if (!g_gpu[i].cublas_ready || !g_gpu[i].cublas) continue;
@@ -11694,8 +11694,8 @@ __global__ static void attention_decode_splitkv_combine_kernel(
             M = fmaxf(M, m_j);   /* -INF partials never raise M */
         }
         M_s = M;
-        /* L = Σ_j exp(m_j - M) * l_j + exp(sink - M); sink term added last to
-         * mirror the reference's denom = Σ scores + expf(sink - max). Chunks
+        /* L = 危_j exp(m_j - M) * l_j + exp(sink - M); sink term added last to
+         * mirror the reference's denom = 危 scores + expf(sink - max). Chunks
          * with l_j == 0 / m_j == -INF contribute exactly 0 (guarded to avoid
          * exp(-INF - finite) * 0 edge cases). */
         float L = 0.0f;
@@ -19737,7 +19737,7 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
     if (!kv || !raw_cache || raw_cap == 0u || n_rot > head_dim ||
         kv->device_id != raw_cache->device_id ||
         kv->bytes < (uint64_t)head_dim * sizeof(float) ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        !kv_ring_bytes_ok(raw_cache, raw_cap, head_dim)) {
         return 0;
     }
     cuda_attention_decode_row_table table;
@@ -19745,6 +19745,11 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
     table.row[0].raw_kv = (uint64_t)(uintptr_t)raw_cache->ptr;
     table.row[0].raw_cap = raw_cap;
     table.row[0].raw_start = raw_row % raw_cap;
+    if (kv_bitq_on()) {
+        fp8_kv_bitq_store_rows_kernel<<<1, 64>>>(
+                (float *)kv->ptr, table, 1u, head_dim, n_rot, kv_bitq_raw_bits());
+        return cuda_ok(cudaGetLastError(), "fp8 KV bitq store launch");
+    }
     fp8_kv_quantize_store_rows_kernel<<<1, 64>>>(
             (float *)kv->ptr, table, 1u, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8 KV quantize/store launch");
@@ -19769,12 +19774,17 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
         const ds4_gpu_tensor *raw = raw_caches[i];
         if (!raw || raw_caps[i] == 0u || raw_rows[i] >= raw_caps[i] ||
             raw->device_id != kv->device_id ||
-            raw->bytes < (uint64_t)raw_caps[i] * head_dim * sizeof(float)) {
+            !kv_ring_bytes_ok(raw, raw_caps[i], head_dim)) {
             return 0;
         }
         table.row[i].raw_kv = (uint64_t)(uintptr_t)raw->ptr;
         table.row[i].raw_cap = raw_caps[i];
         table.row[i].raw_start = raw_rows[i];
+    }
+    if (kv_bitq_on()) {
+        fp8_kv_bitq_store_rows_kernel<<<n_rows, 64>>>(
+                (float *)kv->ptr, table, n_rows, head_dim, n_rot, kv_bitq_raw_bits());
+        return cuda_ok(cudaGetLastError(), "fp8 KV bitq store rows launch");
     }
     fp8_kv_quantize_store_rows_kernel<<<n_rows, 64>>>(
             (float *)kv->ptr, table, n_rows, head_dim, n_rot);
@@ -19782,16 +19792,28 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        !kv_ring_bytes_ok(raw_cache, raw_cap, head_dim) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    if (kv_bitq_on()) {
+        store_raw_kv_bitq_batch_kernel<<<1, 256>>>(
+                (unsigned char *)raw_cache->ptr, (const float *)kv->ptr,
+                raw_cap, row, 1, head_dim, kv_bitq_raw_bits());
+        return cuda_ok(cudaGetLastError(), "store_raw_kv bitq launch");
+    }
     store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        !kv_ring_bytes_ok(raw_cache, raw_cap, head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
+    if (kv_bitq_on()) {
+        store_raw_kv_bitq_batch_kernel<<<(n_tokens + 255) / 256, 256>>>(
+                (unsigned char *)raw_cache->ptr, (const float *)kv->ptr,
+                raw_cap, pos0, n_tokens, head_dim, kv_bitq_raw_bits());
+        return cuda_ok(cudaGetLastError(), "raw kv bitq store launch");
+    }
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
@@ -20359,8 +20381,12 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        !kv_ring_bytes_ok(raw_kv, raw_cap, head_dim) ||
+        (n_comp && (kv_bitq_comp_on()
+             ? (g_indexer_paging_table
+                 ? !kv_comp_bytes_ok(comp_kv, 512u, head_dim)
+                 : !kv_comp_bytes_ok(comp_kv, n_comp, head_dim))
+             : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
@@ -20368,15 +20394,35 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
+    /* DS4_CUDA_KV_BITQ: every kernel below reads the ring as
+     * (raw_start + idx) % raw_cap; dequant the wrapped span first and run
+     * with raw_start' = 0, raw_cap' = n_raw over the contiguous temp. */
+    const float *raw_ptr = (const float *)raw_kv->ptr;
+    uint32_t rc_cap = raw_cap;
+    uint32_t rc_start = raw_start;
+    if (kv_bitq_on()) {
+        raw_ptr = attention_bitq_gather_span(raw_kv, raw_cap, raw_start,
+                n_raw, head_dim, logical_tier, "decode heads bitq span");
+        if (!raw_ptr) return 0;
+        rc_cap = n_raw;
+        rc_start = 0u;
+    }
+    /* DS4_CUDA_KV_BITQ_COMP: dequant the comp rows into the dedicated temp. */
+    const float *comp_ptr = n_comp ? (const float *)comp_kv->ptr : raw_ptr;
+    if (kv_bitq_comp_on() && n_comp != 0u) {
+        comp_ptr = attention_bitq_comp_gather(comp_kv, n_comp, head_dim,
+                logical_tier, "decode heads comp span");
+        if (!comp_ptr) return 0;
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             !g_cuda_no_window_attention) {
             const uint32_t synthetic_pos0 = n_raw - 1u;
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             cuda_attention_online_launch(online_grid, (float *)heads->ptr, sinks,
-                (const float *)q->ptr, (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr, 1,
-                synthetic_pos0, n_raw, raw_cap, raw_start, n_comp, 0, 0, n_head, head_dim);
+                (const float *)q->ptr, raw_ptr,
+                n_comp ? comp_ptr : raw_ptr, 1,
+                synthetic_pos0, n_raw, rc_cap, rc_start, n_comp, 0, 0, n_head, head_dim);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -20388,9 +20434,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         const uint32_t synthetic_pos0 = n_raw - 1u;
         dim3 online_grid(1, (n_head + 7u) / 8u, 1);
         cuda_attention_online_launch(online_grid, (float *)heads->ptr, sinks,
-            (const float *)q->ptr, (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr, 1,
-            synthetic_pos0, n_raw, raw_cap, raw_start, n_comp, 0, 0, n_head, head_dim);
+            (const float *)q->ptr, raw_ptr,
+            n_comp ? comp_ptr : raw_ptr, 1,
+            synthetic_pos0, n_raw, rc_cap, rc_start, n_comp, 0, 0, n_head, head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode heads8 online launch");
     }
     const uint32_t score_lanes =
@@ -20400,10 +20446,10 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         !g_cuda_no_decode_value512 ? 512u : 256u;
     int score_split_rc = attention_decode_score_split_launch(
             logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            raw_ptr,
+            n_comp ? comp_ptr : raw_ptr,
             use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
-            0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
+            0, n_raw, rc_cap, rc_start, n_comp, 0, 0,
             n_head, head_dim, threads, NULL);
     if (score_split_rc == 1) {
         return cuda_ok(cudaGetLastError(), "attention exact score split launch");
@@ -20414,10 +20460,10 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     if (cuda_splitkv_decode_requested()) {
         int rc = attention_decode_splitkv_launch(
                 logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-                (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                raw_ptr,
+                n_comp ? comp_ptr : raw_ptr,
                 use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
-                0, n_raw, raw_cap, raw_start, n_comp, 0, 0, n_head, head_dim);
+                0, n_raw, rc_cap, rc_start, n_comp, 0, 0, n_head, head_dim);
         if (rc == 1) return cuda_ok(cudaGetLastError(), "attention decode splitkv launch");
         if (rc < 0) return 0;
     }
@@ -20425,11 +20471,11 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     attention_decode_mixed_kernel<<<grid, threads>>>((float *)heads->ptr,
                                                      sinks,
                                                      (const float *)q->ptr,
-                                                     (const float *)raw_kv->ptr,
-                                                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                     raw_ptr,
+                                                     n_comp ? comp_ptr : raw_ptr,
                                                      use_mask ? (const float *)comp_mask->ptr : NULL,
                                                      use_mask,
-                                                     1, 0, n_raw, raw_cap, raw_start, n_comp,
+                                                     1, 0, n_raw, rc_cap, rc_start, n_comp,
                                                      0, 0, n_head, head_dim,
                                                      score_lanes);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
@@ -20484,8 +20530,10 @@ extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        !kv_ring_bytes_ok(raw_kv, raw_cap, head_dim) ||
+        (n_comp && (kv_bitq_comp_on()
+             ? !kv_comp_bytes_ok(comp_kv, n_comp, head_dim)
+             : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float)) ||
         !cuda_attention_score_buffer_fits(n_comp)) {
         return ds4_gpu_attention_decode_heads_tensor(
@@ -20508,6 +20556,24 @@ extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
             logical_tier, "attn_sinks");
     if (!sinks) return 0;
+    /* DS4_CUDA_KV_BITQ: dequant the wrapped span and run the fused path
+     * with raw_start' = 0, raw_cap' = n_raw over the contiguous temp. */
+    const float *raw_ptr = (const float *)raw_kv->ptr;
+    uint32_t rc_cap = raw_cap;
+    uint32_t rc_start = raw_start;
+    if (kv_bitq_on()) {
+        raw_ptr = attention_bitq_gather_span(raw_kv, raw_cap, raw_start,
+                n_raw, head_dim, logical_tier, "decode rope bitq span");
+        if (!raw_ptr) return 0;
+        rc_cap = n_raw;
+        rc_start = 0u;
+    }
+    const float *comp_ptr = n_comp ? (const float *)comp_kv->ptr : raw_ptr;
+    if (kv_bitq_comp_on() && n_comp != 0u) {
+        comp_ptr = attention_bitq_comp_gather(comp_kv, n_comp, head_dim,
+                logical_tier, "decode rope comp span");
+        if (!comp_ptr) return 0;
+    }
     cuda_attention_inv_rope_params rope;
     rope.n_rot = n_rot;
     rope.pos0 = pos0;
@@ -20520,10 +20586,10 @@ extern "C" int ds4_gpu_attention_decode_heads_rope_tensor(
     rope.beta_slow = beta_slow;
     int score_split_rc = attention_decode_score_split_launch(
             logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            raw_ptr,
+            n_comp ? comp_ptr : raw_ptr,
             use_mask ? (const float *)comp_mask->ptr : NULL, use_mask,
-            0, n_raw, raw_cap, raw_start, n_comp, 0, 0,
+            0, n_raw, rc_cap, rc_start, n_comp, 0, 0,
             n_head, head_dim, threads, &rope);
     if (score_split_rc == 1) {
         if (fused_inv_rope) *fused_inv_rope = 1;
@@ -20832,8 +20898,10 @@ static int attention_decode_batch_launch(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        !kv_ring_bytes_ok(raw_kv, raw_cap, head_dim) ||
+        (n_comp && (kv_bitq_comp_on()
+             ? !kv_comp_bytes_ok(comp_kv, n_comp, head_dim)
+             : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -20841,6 +20909,24 @@ static int attention_decode_batch_launch(
     const int logical_tier = ds4_tensor_device_idx(heads);
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
+    /* DS4_CUDA_KV_BITQ: dequant the wrapped span and run every kernel below
+     * with raw_start' = 0, raw_cap' = n_raw over the contiguous temp. */
+    const float *raw_ptr = (const float *)raw_kv->ptr;
+    uint32_t rc_cap = raw_cap;
+    uint32_t rc_start = raw_start;
+    if (kv_bitq_on()) {
+        raw_ptr = attention_bitq_gather_span(raw_kv, raw_cap, raw_start,
+                n_raw, head_dim, logical_tier, "decode batch bitq span");
+        if (!raw_ptr) return 0;
+        rc_cap = n_raw;
+        rc_start = 0u;
+    }
+    const float *comp_ptr = n_comp ? (const float *)comp_kv->ptr : raw_ptr;
+    if (kv_bitq_comp_on() && n_comp != 0u) {
+        comp_ptr = attention_bitq_comp_gather(comp_kv, n_comp, head_dim,
+                logical_tier, "decode batch comp span");
+        if (!comp_ptr) return 0;
+    }
     if (!sinks) return 0;
     if (g_n_gpus == 1 && !use_comp_mask &&
         n_tokens >= 128u && head_dim == kTTHeadDim && n_head == 64u &&
@@ -20905,15 +20991,15 @@ static int attention_decode_batch_launch(
                              "launch dense token-tile record builder")) return 0;
                 attention_tokentile_raw_mirror_kernel
                     <<<n_mirror_rows, 256, 0, stream>>>(
-                        raw_mirror, (const float *)raw_kv->ptr, NULL, pos0,
-                        n_tokens, raw_cap, raw_start, first_raw_pos,
+                        raw_mirror, raw_ptr, NULL, pos0,
+                        n_tokens, rc_cap, rc_start, first_raw_pos,
                         raw_row_min, head_dim);
                 if (!cuda_ok(cudaGetLastError(),
                              "launch dense token-tile raw mirror")) return 0;
                 if (n_comp != 0u) {
                     attention_tokentile_comp_mirror_kernel
                         <<<n_comp, 256, 0, stream>>>(
-                            comp_mirror, (const float *)comp_kv->ptr,
+                            comp_mirror, comp_ptr,
                             n_comp, head_dim);
                     if (!cuda_ok(cudaGetLastError(),
                                  "launch dense token-tile compressed mirror")) {
@@ -20940,9 +21026,9 @@ static int attention_decode_batch_launch(
             !g_cuda_no_window_attention) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
             cuda_attention_online_launch(online_grid, (float *)heads->ptr, sinks,
-                (const float *)q->ptr, (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr, n_tokens,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
+                (const float *)q->ptr, raw_ptr,
+                n_comp ? comp_ptr : raw_ptr, n_tokens,
+                pos0, n_raw, rc_cap, rc_start, n_comp, window, ratio, n_head, head_dim);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -20955,9 +21041,9 @@ static int attention_decode_batch_launch(
                              (n_tokens <= 6u && ds4_gpu_device_is_spark()))))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         cuda_attention_online_launch(grid, (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr, n_tokens, pos0,
-            n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
+            raw_ptr,
+            n_comp ? comp_ptr : raw_ptr, n_tokens, pos0,
+            n_raw, rc_cap, rc_start, n_comp, window, ratio, n_head, head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     if (!use_comp_mask && n_tokens == 1u && head_dim == 512 &&
@@ -20965,9 +21051,9 @@ static int attention_decode_batch_launch(
         !g_cuda_no_window_attention) {
         dim3 grid(1, (n_head + 7u) / 8u, 1);
         cuda_attention_online_launch(grid, (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr, n_tokens, pos0,
-            n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
+            raw_ptr,
+            n_comp ? comp_ptr : raw_ptr, n_tokens, pos0,
+            n_raw, rc_cap, rc_start, n_comp, window, ratio, n_head, head_dim);
         return cuda_ok(cudaGetLastError(), "attention decode heads8 online batch launch");
     }
     const uint32_t score_lanes =
@@ -20978,10 +21064,10 @@ static int attention_decode_batch_launch(
     if (n_tokens == 1u) {
         int score_split_rc = attention_decode_score_split_launch(
                 logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-                (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                raw_ptr,
+                n_comp ? comp_ptr : raw_ptr,
                 use_comp_mask ? (const float *)comp_mask->ptr : NULL, use_comp_mask,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio,
+                pos0, n_raw, rc_cap, rc_start, n_comp, window, ratio,
                 n_head, head_dim, threads, NULL);
         if (score_split_rc == 1) {
             return cuda_ok(cudaGetLastError(), "attention exact score split batch launch");
@@ -20994,10 +21080,10 @@ static int attention_decode_batch_launch(
     if (n_tokens == 1u && cuda_splitkv_decode_requested()) {
         int rc = attention_decode_splitkv_launch(
                 logical_tier, (float *)heads->ptr, sinks, (const float *)q->ptr,
-                (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                raw_ptr,
+                n_comp ? comp_ptr : raw_ptr,
                 use_comp_mask ? (const float *)comp_mask->ptr : NULL, use_comp_mask,
-                pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head, head_dim);
+                pos0, n_raw, rc_cap, rc_start, n_comp, window, ratio, n_head, head_dim);
         if (rc == 1) return cuda_ok(cudaGetLastError(), "attention decode splitkv batch launch");
         if (rc < 0) return 0;
     }
@@ -21005,11 +21091,11 @@ static int attention_decode_batch_launch(
     attention_decode_mixed_kernel<<<grid, threads>>>((float *)heads->ptr,
                                                      sinks,
                                                      (const float *)q->ptr,
-                                                     (const float *)raw_kv->ptr,
-                                                     n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                     raw_ptr,
+                                                     n_comp ? comp_ptr : raw_ptr,
                                                      use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-                                                     use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
-                                                     raw_start, n_comp, window, ratio, n_head, head_dim,
+                                                     use_comp_mask, n_tokens, pos0, n_raw, rc_cap,
+                                                     rc_start, n_comp, window, ratio, n_head, head_dim,
                                                      score_lanes);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
@@ -21106,8 +21192,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        !kv_ring_bytes_ok(raw_kv, raw_cap, head_dim) ||
+        (kv_bitq_comp_on()
+             ? !kv_comp_bytes_ok(comp_kv, n_comp, head_dim)
+             : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
@@ -21116,6 +21204,24 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
+    /* DS4_CUDA_KV_BITQ: dequant the wrapped span (same protocol as the
+     * non-indexed batch path). */
+    const float *raw_ptr = (const float *)raw_kv->ptr;
+    uint32_t rc_cap = raw_cap;
+    uint32_t rc_start = raw_start;
+    if (kv_bitq_on()) {
+        raw_ptr = attention_bitq_gather_span(raw_kv, raw_cap, raw_start,
+                n_raw, head_dim, logical_tier, "indexed batch bitq span");
+        if (!raw_ptr) return 0;
+        rc_cap = n_raw;
+        rc_start = 0u;
+    }
+    const float *comp_ptr = (const float *)comp_kv->ptr;
+    if (kv_bitq_comp_on()) {
+        comp_ptr = attention_bitq_comp_gather(comp_kv, n_comp, head_dim,
+                logical_tier, "indexed batch comp span");
+        if (!comp_ptr) return 0;
+    }
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     if (g_n_gpus == 1 && n_tokens >= 128u && head_dim == kTTHeadDim &&
         n_head == 64u && top_k == 512u && window == kTTRawWindow &&
@@ -21200,14 +21306,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                              "launch token-tile union builder")) return 0;
                 attention_tokentile_raw_mirror_kernel
                     <<<n_mirror_rows, 256, 0, stream>>>(
-                        raw_mirror, (const float *)raw_kv->ptr, NULL, pos0,
-                        n_tokens, raw_cap, raw_start, first_raw_pos,
+                        raw_mirror, raw_ptr, NULL, pos0,
+                        n_tokens, rc_cap, rc_start, first_raw_pos,
                         raw_row_min, head_dim);
                 if (!cuda_ok(cudaGetLastError(),
                              "launch token-tile raw mirror")) return 0;
                 attention_tokentile_comp_mirror_kernel
                     <<<n_comp, 256, 0, stream>>>(
-                        comp_mirror, (const float *)comp_kv->ptr,
+                        comp_mirror, comp_ptr,
                         n_comp, head_dim);
                 if (!cuda_ok(cudaGetLastError(),
                              "launch token-tile compressed mirror")) return 0;
@@ -21255,8 +21361,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 dim3 grid(n_tokens, (n_head + 15u) / 16u, split);
                 attention_indexed_mixed_heads8_online_kernel<8, 16, true><<<grid, 512>>>(
                     (float *)heads->ptr, sinks, (const float *)q->ptr,
-                    (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, topk_ptr,
-                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio,
+                    raw_ptr, comp_ptr, topk_ptr,
+                    n_tokens, pos0, n_raw, rc_cap, rc_start, n_comp, top_k, window, ratio,
                     n_head, head_dim, partials, split);
                 if (!cuda_ok(cudaGetLastError(), "attention indexed splitkv launch")) return 0;
                 attention_decode_splitkv_combine_kernel<<<dim3(n_tokens, n_head, 1), 256>>>(
@@ -21267,14 +21373,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
                                                                                (const float *)q->ptr,
-                                                                               (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
+                                                                               raw_ptr,
+                                                                               comp_ptr,
                                                                                topk_ptr,
                                                                                n_tokens,
                                                                                pos0,
                                                                                n_raw,
-                                                                               raw_cap,
-                                                                               raw_start,
+                                                                               rc_cap,
+                                                                               rc_start,
                                                                                n_comp,
                                                                                top_k,
                                                                                window,
@@ -21289,14 +21395,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                  sinks,
                                                                  (const float *)q->ptr,
-                                                                 (const float *)raw_kv->ptr,
-                                                                 (const float *)comp_kv->ptr,
+                                                                 raw_ptr,
+                                                                 comp_ptr,
                                                                  topk_ptr,
                                                                  n_tokens,
                                                                  pos0,
                                                                  n_raw,
-                                                                 raw_cap,
-                                                                 raw_start,
+                                                                 rc_cap,
+                                                                 rc_start,
                                                                  n_comp,
                                                                  top_k,
                                                                  window,
@@ -21313,30 +21419,30 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             void *scratch = cuda_tmp_alloc_on(logical_tier, attention_indexed_one_scratch_bytes(n_head),
                                               "indexed one-row attention");
             const int rc = attention_indexed_one_launch((float *)heads->ptr, sinks, (const float *)q->ptr,
-                                                        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
-                                                        topk_ptr, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                                                        raw_ptr, comp_ptr,
+                                                        topk_ptr, pos0, n_raw, rc_cap, rc_start, n_comp, top_k,
                                                         window, ratio, n_head, head_dim, scratch,
                                                         cuda_decode_stream());
             if (rc != 0) return rc > 0;
         }
         attention_indexed_mixed_kernel<true><<<grid, 256, 0, cuda_decode_stream()>>>(
             (float *)heads->ptr, sinks, (const float *)q->ptr,
-            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
-            topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start,
+            raw_ptr, comp_ptr,
+            topk_ptr, n_tokens, pos0, n_raw, rc_cap, rc_start,
             n_comp, top_k, window, ratio, n_head, head_dim);
         return cuda_ok(cudaGetLastError(), "attention indexed cached query launch");
     }
     attention_indexed_mixed_kernel<><<<grid, 256>>>((float *)heads->ptr,
                                                   sinks,
                                                   (const float *)q->ptr,
-                                                  (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
+                                                  raw_ptr,
+                                                  comp_ptr,
                                                   topk_ptr,
                                                   n_tokens,
                                                   pos0,
                                                   n_raw,
-                                                  raw_cap,
-                                                  raw_start,
+                                                  rc_cap,
+                                                  rc_start,
                                                   n_comp,
                                                   top_k,
                                                   window,

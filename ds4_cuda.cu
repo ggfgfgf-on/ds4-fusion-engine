@@ -2575,11 +2575,198 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     return mb * 1048576ull;
 }
 
+/* Drop LRU tombstones and rebuild the offset map with fresh indices.
+ * Called when evictions have left the range vector dominated by dead
+ * entries (the linear scans would otherwise degrade). */
+static void cuda_model_arena_lru_compact(void) {
+    std::vector<cuda_model_range> keep;
+    keep.reserve(g_model_ranges.size() - (size_t)g_model_lru_dead);
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.bytes != 0 || r.host_base != NULL) keep.push_back(r);
+    }
+    g_model_ranges = std::move(keep);
+    g_model_range_by_offset.clear();
+    for (size_t i = 0; i < g_model_ranges.size(); i++) {
+        const cuda_model_range &r = g_model_ranges[i];
+        if (r.bytes != 0) g_model_range_by_offset[r.offset] = i;
+    }
+    g_model_lru_dead = 0;
+}
+
+/* Carve `aligned` bytes out of an arena hole (first-fit).  Returns NULL
+ * when no hole is large enough.  No allocation happens here, so this path
+ * is always legal under the shared-pool cap. */
+static char *cuda_model_arena_hole_carve(uint64_t aligned) {
+    const uint64_t align = 256u;
+    for (cuda_model_arena &a : g_model_arenas) {
+        for (size_t h = 0; h < a.holes.size(); h++) {
+            if (a.holes[h].second < aligned) continue;
+            char *ptr = a.device_ptr + a.holes[h].first;
+            const uint64_t rem = a.holes[h].second - aligned;
+            if (rem >= align) {
+                a.holes[h].first += aligned;
+                a.holes[h].second = rem;
+            } else {
+                if (h + 1 < a.holes.size()) a.holes[h] = a.holes.back();
+                a.holes.pop_back();
+            }
+            return ptr;
+        }
+    }
+    return NULL;
+}
+
+/* Evict least-recently-used arena ranges until >= max(aligned, 64 MiB) of
+ * hole space exists (batched: one O(n) scan frees thousands of the tiny
+ * per-token compressor ranges the streaming path accumulates, instead of
+ * one eviction per allocation).  Device-synchronizes once up front so no
+ * in-flight kernel can read a page we are about to hand out again.
+ * Returns 1 when a hole >= aligned exists, 0 when nothing evictable
+ * remains. */
+static int cuda_model_arena_lru_make_room(uint64_t aligned) {
+    if (!cuda_model_arena_lru_enabled() && !g_arena_prefill_mode) return 0;
+    /* Eviction is only safe inside the single-threaded decode-token step
+     * (g_decode_fast_attention toggles on around each token encode) or the
+     * prefill chunk/layer-boundary protocol (ds4_gpu_arena_prefill_*),
+     * where the current layer's ranges are protected by the tick floor and
+     * the device-sync below drains every earlier layer before anything is
+     * freed. */
+    if (!g_arena_prefill_mode && !g_decode_fast_attention) return 0;
+    (void)cudaDeviceSynchronize();
+
+    /* Compact tombstones when they start dominating the scans. */
+    if (g_model_lru_dead > 1024u &&
+        g_model_lru_dead * 2u > g_model_ranges.size() - g_model_lru_dead) {
+        cuda_model_arena_lru_compact();
+    }
+
+    const uint64_t want = aligned > (64ull << 20) ? aligned : (64ull << 20);
+    const uint64_t lru_max = g_arena_prefill_mode
+        ? cuda_arena_prefill_lru_max_bytes()
+        : cuda_model_arena_lru_max_bytes();
+    /* Model-tail guard: the output family (lm-head / OutQ8 / hc tensors,
+     * measured ~2.1 GiB at the end of this model) is resolved early and its
+     * device pointers are held directly by graph tensors until the final
+     * read, so it must never be evicted mid-pass.  DS4_CUDA_WEIGHT_ARENA_TAIL_MB
+     * tunes the guard (default 3072; the old 512/2048 were too small and
+     * let the prefill LRU recycle the output tensors -> illegal memory
+     * access). */
+    static uint64_t tail_guard_cached = UINT64_MAX;
+    if (tail_guard_cached == UINT64_MAX) {
+        uint64_t mb = 3072;
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_TAIL_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        tail_guard_cached = mb * 1048576ull;
+    }
+    const uint64_t tail_guard = (g_model_file_size > tail_guard_cached)
+                                ? g_model_file_size - tail_guard_cached : 0;
+    struct lru_cand { uint64_t tick; size_t idx; };
+    std::vector<lru_cand> cands;
+    cands.reserve(g_model_ranges.size());
+    for (size_t i = 0; i < g_model_ranges.size(); i++) {
+        const cuda_model_range &r = g_model_ranges[i];
+        if (!r.arena_allocated || r.bytes == 0) continue;
+        /* Prefill mode: only ranges resolved before the current chunk
+         * (last_use <= floor) are reclaimable — the in-flight chunk holds
+         * direct pointers to everything newer. */
+        if (g_arena_prefill_mode && r.last_use > g_arena_prefill_floor) continue;
+        /* Protection rules: graph-pinned tensors hold direct device
+         * pointers without re-resolving, so never evict anything larger
+         * than LRU_MAX_MB or anything in the model's output tail. */
+        if (lru_max != 0 && r.bytes > lru_max) continue;
+        if (tail_guard != 0 && r.offset >= tail_guard) continue;
+        cands.push_back({r.last_use, i});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const lru_cand &x, const lru_cand &y) { return x.tick < y.tick; });
+
+    uint64_t freed_total = 0;
+    std::vector<std::vector<std::pair<uint64_t, uint64_t>>> arena_holes(
+            g_model_arenas.size());
+    for (const lru_cand &c : cands) {
+        if (freed_total >= want) break;
+        cuda_model_range &r = g_model_ranges[c.idx];
+        int found = 0;
+        for (size_t ai = 0; ai < g_model_arenas.size(); ai++) {
+            cuda_model_arena &a = g_model_arenas[ai];
+            if (r.device_ptr >= a.device_ptr &&
+                r.device_ptr < a.device_ptr + a.bytes) {
+                arena_holes[ai].push_back(
+                        {(uint64_t)(r.device_ptr - a.device_ptr), r.bytes});
+                found = 1;
+                break;
+            }
+        }
+        if (!found) continue; /* orphaned pointer: leave the range alone */
+        g_model_range_by_offset.erase(r.offset);
+        g_model_range_bytes -= r.bytes;
+        freed_total += r.bytes;
+        g_model_lru_dead++;
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA arena LRU evicted %s range at %.2f GiB "
+                    "(%.2f MiB, last_use=%llu)\n",
+                    r.host_base == g_model_host_base ? "model" : "aux",
+                    (double)r.offset / 1073741824.0,
+                    (double)r.bytes / 1048576.0,
+                    (unsigned long long)r.last_use);
+        }
+        /* tombstone: inert in every scan, safe for stale by_offset lookups */
+        r.host_base = NULL;
+        r.bytes = 0;
+        r.device_ptr = NULL;
+        r.arena_allocated = 0;
+    }
+    for (size_t ai = 0; ai < g_model_arenas.size(); ai++) {
+        if (arena_holes[ai].empty()) continue;
+        cuda_model_arena &a = g_model_arenas[ai];
+        for (const auto &h : arena_holes[ai]) a.holes.push_back(h);
+        std::sort(a.holes.begin(), a.holes.end());
+        std::vector<std::pair<uint64_t, uint64_t>> merged;
+        merged.reserve(a.holes.size());
+        for (const auto &h : a.holes) {
+            if (!merged.empty() &&
+                h.first <= merged.back().first + merged.back().second) {
+                const uint64_t end = h.first + h.second >
+                                     merged.back().first + merged.back().second
+                                     ? h.first + h.second
+                                     : merged.back().first + merged.back().second;
+                merged.back().second = end - merged.back().first;
+            } else {
+                merged.push_back(h);
+            }
+        }
+        a.holes = std::move(merged);
+    }
+    for (const cuda_model_arena &a : g_model_arenas) {
+        for (const auto &h : a.holes) {
+            if (h.second >= aligned) return 1;
+        }
+    }
+    return 0;
+}
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
+
+    /* LRU hole reuse: freed ranges are carved before any new growth.  This
+     * path needs no cudaMalloc, so it stays legal even after a real OOM
+     * (g_model_cache_full) — evicting live ranges can free a hole. */
+    if (cuda_model_arena_lru_enabled() || g_arena_prefill_mode) {
+        char *hole_ptr = cuda_model_arena_hole_carve(aligned);
+        if (hole_ptr) return hole_ptr;
+        if (g_model_cache_full && cuda_model_arena_lru_make_room(aligned)) {
+            char *hole_ptr2 = cuda_model_arena_hole_carve(aligned);
+            if (hole_ptr2) return hole_ptr2;
+        }
+    }
+    if (g_model_cache_full) return NULL;
 
     for (cuda_model_arena &a : g_model_arenas) {
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
@@ -2591,17 +2778,39 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     }
 
     const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
+    if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) {
+        if ((cuda_model_arena_lru_enabled() || g_arena_prefill_mode) &&
+            cuda_model_arena_lru_make_room(aligned)) {
+            char *hole_ptr = cuda_model_arena_hole_carve(aligned);
+            if (hole_ptr) return hole_ptr;
+        }
+        return NULL;
+    }
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        if ((cuda_model_arena_lru_enabled() || g_arena_prefill_mode) &&
+            cuda_model_arena_lru_make_room(aligned)) {
+            char *hole_ptr = cuda_model_arena_hole_carve(aligned);
+            if (hole_ptr) {
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                    fprintf(stderr,
+                            "ds4: CUDA model arena alloc failed for %s "
+                            "(%.2f MiB chunk): %s; LRU hole reuse succeeded\n",
+                            what ? what : "weights",
+                            (double)chunk / 1048576.0,
+                            cudaGetErrorString(err));
+                }
+                return hole_ptr;
+            }
+        }
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
                 (double)chunk / 1048576.0,
                 cudaGetErrorString(err));
-        (void)cudaGetLastError();
         g_model_cache_full = 1;
         return NULL;
     }

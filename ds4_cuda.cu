@@ -829,7 +829,7 @@ static inline uint64_t tt_align256_u64(uint64_t x) {
  *
  * The legacy g_cuda_tmp slab is untouched: init-time / preload callers
  * still use cuda_tmp_alloc directly. No aliasing between g_cuda_tmp
- * and g_gpu[0].scratch 鈥?they are independently owned and freed.
+ * and g_gpu[0].scratch 閳?they are independently owned and freed.
  *
  * Added for multi-GPU execution (multi-GPU execution), step A3 of the
  * spec (sub-area 2). */
@@ -1502,7 +1502,7 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
  *     g_gpu[logical_tier].device_id and looks up the slice strictly
  *     in the per-device selective cache via ds4_gpu_lookup_cache_strict.
  *     On miss, logs a diagnostic and returns NULL (no host-pointer
- *     fallback 鈥?a miss here is a placement/install bug).
+ *     fallback 閳?a miss here is a placement/install bug).
  *
  * The caller is responsible for cudaSetDevice'ing to the right physical
  * device before launching the kernel that consumes the returned pointer.
@@ -1707,14 +1707,14 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     }
 
     /* Smaller cards (< 40 GiB): 8GB laptop cards used to keep a 4 GiB
-     * reserve here 鈥?half the card 鈥?which starved the selective Q8->F16
+     * reserve here 閳?half the card 閳?which starved the selective Q8->F16
      * cache and forced the q8 kernels. WDDM eviction of device pages is
      * verified correct on this port (test_pinned probe series + the
      * slot-table root-cause fix), so overflow allocations are safely paged
      * to shared GPU memory; keep only a modest floor for cuBLAS workspaces
      * and driver bookkeeping. DS4_CUDA_Q8_F16_CACHE_RESERVE_MB overrides.
      * Budget coordination: the prefill graph capture (pg) registers a
-     * deterministic headroom charge 鈥?the q8 cache yields for the graph
+     * deterministic headroom charge 閳?the q8 cache yields for the graph
      * state instead of leaving the layer-major encode on the VRAM cliff. */
     uint64_t min_reserve = 768ull * 1048576ull;
     if (getenv("DS4_CUDA_PREFILL_GRAPH") != NULL) {
@@ -1890,7 +1890,7 @@ static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_
  * new entry with device_id == expected_device, restores the previous device,
  * and returns the new pointer.
  *
- * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path 鈥?
+ * Single-tier (g_n_gpus <= 1) uses the offset-keyed map for a fast path 閳?
  * legacy entries were stamped device_id=0, so the map remains authoritative.
  * Multi-tier linear-scans the ranges vector filtering on device_id (the same
  * offset may now legitimately map to multiple entries, one per device).
@@ -1927,7 +1927,7 @@ static const __half *cuda_q8_f16_ptr(
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
 
     /* Source Q8 bytes:
-     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr 鈥?preserves the
+     *  - Single-tier (g_n_gpus <= 1): cuda_model_range_ptr 閳?preserves the
      *    legacy behavior (FD cache, host-register, or cudaMalloc-and-copy).
      *  - Multi-tier (g_n_gpus > 1): the per-device selective cache must
      *    already contain the weight on expected_device. Use the strict
@@ -2974,7 +2974,7 @@ static int cuda_wddm_global_shared_usage_bytes(uint64_t *usage_out) {
  * Pack/unpack kernels + env readers. The dispatch sites (ring store,
  * attention gathers, comp/index pack APIs) are wired in the follow-up
  * commit against this base's attention paths. LOSSY: dequantized KV differs
- * from the FP32 ring 鈥?re-certify before enabling.
+ * from the FP32 ring 閳?re-certify before enabling.
  *
  * DS4_CUDA_KV_BITQ_AUTO (startup bit-width scheduler, decided in ds4.c):
  * when active, these getters return the settled profile instead of reading
@@ -3261,7 +3261,7 @@ static float *attention_bitq_gather_span(const ds4_gpu_tensor *ring,
     }
     float *kv = (float *)g_bitq_gather;
     const uint32_t n = n_raw * head_dim;
-    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             kv, (const unsigned char *)ring->ptr, raw_cap, raw_start, n_raw,
             head_dim, kv_bitq_raw_bits());
     if (!cuda_ok(cudaGetLastError(), "attention bitq span gather")) return NULL;
@@ -3285,7 +3285,7 @@ extern "C" int ds4_gpu_bitq_dequant_rows_dump(
                                             "bitq dequant dump");
     if (!dev) return 0;
     const uint32_t n = n_rows * head_dim;
-    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             dev, (const unsigned char *)ring->ptr, raw_cap, first_row, n_rows,
             head_dim, bits);
     if (!cuda_ok(cudaGetLastError(), "bitq dequant dump gather")) return 0;
@@ -3387,7 +3387,7 @@ static float *attention_bitq_comp_gather(const ds4_gpu_tensor *cache,
     float *kv = (float *)g_bitq_comp_gather;
     const uint32_t n = n_rows * head_dim;
     if (g_indexer_paging_table) {
-        attention_bitq_comp_gather_paged_kernel<<<(n + 255u) / 256u, 256u>>>(
+        attention_bitq_comp_gather_paged_kernel<<<(n + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
                 kv, (const unsigned char *)cache->ptr, g_indexer_paging_table,
                 n_rows, head_dim, kv_bitq_comp_bits());
         if (!cuda_ok(cudaGetLastError(), "attention bitq comp paged gather")) return NULL;
@@ -3396,7 +3396,7 @@ static float *attention_bitq_comp_gather(const ds4_gpu_tensor *cache,
         g_indexer_paging_table = NULL;
         return kv;
     }
-    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             kv, (const unsigned char *)cache->ptr, n_rows, 0u, n_rows,
             head_dim, kv_bitq_comp_bits());
     if (!cuda_ok(cudaGetLastError(), "attention bitq comp gather")) return NULL;
@@ -3416,7 +3416,7 @@ extern "C" int ds4_gpu_comp_cache_bitq_pack_stage_tensor(
     if (!kv_bitq_comp_on()) return 1;
     if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
     if (!kv_comp_bytes_ok(cache, cap, head_dim)) return 0;
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
             first_row, rows, head_dim, kv_bitq_comp_bits());
     return cuda_ok(cudaGetLastError(), "comp bitq pack stage launch");
@@ -3439,7 +3439,7 @@ extern "C" int ds4_gpu_comp_cache_bitq_pack_page_tensor(
         return 0;
     }
     const int bits = kv_bitq_comp_bits();
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             (unsigned char *)cache->ptr +
                     (uint64_t)phys_slot * 512u * kv_bitq_row_bytes(head_dim, bits),
             (const float *)stage->ptr + (uint64_t)stage_row * head_dim,
@@ -3483,7 +3483,7 @@ static float *attention_bitq_idx_gather(const ds4_gpu_tensor *cache,
     }
     float *kv = (float *)g_bitq_idx_gather;
     const uint32_t n = n_rows * head_dim;
-    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             kv, (const unsigned char *)cache->ptr, n_rows, 0u, n_rows,
             head_dim, kv_bitq_idx_bits());
     if (!cuda_ok(cudaGetLastError(), "attention bitq idx gather")) return NULL;
@@ -3503,7 +3503,7 @@ extern "C" int ds4_gpu_index_cache_bitq_pack_stage_tensor(
     if (!kv_bitq_idx_on()) return 1;
     if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
     if (!kv_idx_bytes_ok(cache, cap, head_dim)) return 0;
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
             (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
             first_row, rows, head_dim, kv_bitq_idx_bits());
     return cuda_ok(cudaGetLastError(), "idx bitq pack stage launch");
@@ -3621,7 +3621,7 @@ static int cuda_model_arena_lru_make_room(uint64_t aligned) {
         const cuda_model_range &r = g_model_ranges[i];
         if (!r.arena_allocated || r.bytes == 0) continue;
         /* Prefill mode: only ranges resolved before the current chunk
-         * (last_use <= floor) are reclaimable 鈥?the in-flight chunk holds
+         * (last_use <= floor) are reclaimable 閳?the in-flight chunk holds
          * direct pointers to everything newer. */
         if (g_arena_prefill_mode && r.last_use > g_arena_prefill_floor) continue;
         /* Protection rules: graph-pinned tensors hold direct device
@@ -3707,7 +3707,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     /* LRU hole reuse: freed ranges are carved before any new growth.  This
      * path needs no cudaMalloc, so it stays legal even after a real OOM
-     * (g_model_cache_full) 鈥?evicting live ranges can free a hole. */
+     * (g_model_cache_full) 閳?evicting live ranges can free a hole. */
     if (cuda_model_arena_lru_enabled() || g_arena_prefill_mode) {
         char *hole_ptr = cuda_model_arena_hole_carve(aligned);
         if (hole_ptr) return hole_ptr;
@@ -4055,7 +4055,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * partial state on failure. We publish `i + 1` BEFORE allocating any
      * resources for context `i`, so even if (e.g.) stream creation
      * succeeds but event creation fails, cleanup still walks device `i`
-     * and destroys the stream. ds4_gpu_cleanup is null-safe per field 鈥?
+     * and destroys the stream. ds4_gpu_cleanup is null-safe per field 閳?
      * partial state is OK. */
     for (int i = 0; i < cfg->n_gpus; i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
@@ -4111,7 +4111,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * validation at init (see the loop below): write distinct known
      * patterns, peer-copy them to the destination, read back, and only
      * set peer_ok[i][j] if every probe round-trips byte-perfect. A
-     * single small probe is not sufficient 鈥?it can pass while realistic
+     * single small probe is not sufficient 閳?it can pass while realistic
      * activation-sized copies still corrupt. On any failure the entry
      * stays at 0 and cross-device copies fall back to the pinned-host
      * bounce path automatically. */
@@ -4406,7 +4406,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     return 0;
 }
 
-/* Async D2D copy queued on the destination device's default stream 鈥?
+/* Async D2D copy queued on the destination device's default stream 閳?
  * ordering against the producer comes from the caller's fence; the CPU
  * does not block (unlike ds4_gpu_tensor_copy's sync cudaMemcpy). */
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
@@ -5547,7 +5547,7 @@ extern "C" int ds4_gpu_set_current_device(int logical_tier) {
 /* Fenced device switch for sequential cross-device pipelines (GLM
  * per-layer placement): work queued on the next device's default stream
  * waits for everything queued so far on the previous device's default
- * stream. Async 鈥?no host sync. Falls back to a plain switch when the
+ * stream. Async 閳?no host sync. Falls back to a plain switch when the
  * device does not change. */
 extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
@@ -5597,7 +5597,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
  * ds4_gpu_device_cache_tensors copies the listed source ranges from the
  * host mmap onto device_id's selective slab and appends sorted lookup
  * entries. The legacy chunked-copy machinery (cuda_model_range_*) is
- * NOT disturbed 鈥?it continues to drive all existing callers. New
+ * NOT disturbed 閳?it continues to drive all existing callers. New
  * lookups fall back to it when no selective entry covers the range.
  *
  * Caller-context preference for overlap: when the same source range is
@@ -5651,14 +5651,14 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
      * init, default driver-side reservations). On a borderline budget
      * that overhead pushes a "fits-by-packer-math" layout past the actual
      * free pool and the cudaMalloc below OOMs after the engine already
-     * committed to the layout 鈥?same silent-late-OOM failure mode the
+     * committed to the layout 閳?same silent-late-OOM failure mode the
      * upfront refusal path was added to eliminate. Catch it here too. */
     {
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
             /* free_b already excludes the existing slab (it's still
              * allocated), so the additional cudaMalloc only needs
-             * new_bytes free 鈥?not new_bytes + c.bytes. The old slab is
+             * new_bytes free 閳?not new_bytes + c.bytes. The old slab is
              * freed AFTER the d2d copy succeeds. 2 GiB safety covers what
              * the engine will allocate AFTER the cache slab in the same
              * session_create: per-tier graph scratch (the planner can't
@@ -5667,7 +5667,7 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
              * reserves, and driver-side allocator slack. Without this
              * headroom a borderline budget that fits the slab itself can
              * still OOM at the per-tier tensor allocations a few moments
-             * later 鈥?same silent-late-OOM failure mode, one layer up. */
+             * later 閳?same silent-late-OOM failure mode, one layer up. */
             const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
             const size_t need = new_bytes + safety;
             if (need > free_b) {
@@ -6667,7 +6667,7 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
             : CUBLAS_TF32_TENSOR_OP_MATH;
     /* Walk every initialized per-tier handle. Single-tier (g_n_gpus == 1)
      * walks exactly one entry. On any device-switch failure,
-     * skip the tier and continue 鈥?the function is void and the math-mode
+     * skip the tier and continue 閳?the function is void and the math-mode
      * setting is advisory, but log so misconfiguration is visible. */
     for (int i = 0; i < g_n_gpus; i++) {
         if (!g_gpu[i].cublas_ready || !g_gpu[i].cublas) continue;
@@ -11694,8 +11694,8 @@ __global__ static void attention_decode_splitkv_combine_kernel(
             M = fmaxf(M, m_j);   /* -INF partials never raise M */
         }
         M_s = M;
-        /* L = 危_j exp(m_j - M) * l_j + exp(sink - M); sink term added last to
-         * mirror the reference's denom = 危 scores + expf(sink - max). Chunks
+        /* L = 鍗盻j exp(m_j - M) * l_j + exp(sink - M); sink term added last to
+         * mirror the reference's denom = 鍗?scores + expf(sink - max). Chunks
          * with l_j == 0 / m_j == -INF contribute exactly 0 (guarded to avoid
          * exp(-INF - finite) * 0 edge cases). */
         float L = 0.0f;
@@ -21475,7 +21475,9 @@ static int attention_prefill_mixed_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && (kv_bitq_comp_on()
+             ? !kv_comp_bytes_ok(comp_kv, n_comp, head_dim)
+             : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -21483,6 +21485,14 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)cuda_resolve_weight_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), logical_tier, "attn_sinks");
     if (!sinks) return 0;
+    /* DS4_CUDA_KV_BITQ_COMP: the prefill raw rows are batch-local FP32 (not
+     * the ring), so only the compressed cache needs the dequant gather. */
+    const float *comp_ptr = n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr;
+    if (kv_bitq_comp_on() && n_comp != 0u) {
+        comp_ptr = attention_bitq_comp_gather(comp_kv, n_comp, head_dim,
+                logical_tier, "prefill mixed comp span");
+        if (!comp_ptr) return 0;
+    }
     if (!use_comp_mask && g_n_gpus == 1 && n_tokens >= 128u &&
         head_dim == kTTHeadDim && n_head == 64u &&
         window == kTTRawWindow && ratio != 0u && n_comp <= 32768u &&
@@ -21505,7 +21515,7 @@ static int attention_prefill_mixed_launch(
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   n_comp ? comp_ptr : (const float *)raw_kv->ptr,
                                                                    n_tokens,
                                                                    n_comp,
                                                                    window,
@@ -21533,7 +21543,7 @@ static int attention_prefill_mixed_launch(
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                n_comp ? comp_ptr : (const float *)raw_kv->ptr,
                 n_tokens,
                 n_comp,
                 head_dim);
@@ -21604,7 +21614,7 @@ static int attention_prefill_mixed_launch(
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                  n_comp ? comp_ptr : (const float *)raw_kv->ptr,
                                                   use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                   use_comp_mask, n_tokens, n_comp, window, ratio,
                                                   n_head, head_dim);
@@ -37896,3 +37906,5 @@ extern "C" int ds4_gpu_compressor_verify_rows_tensor(
             n_rows);
     return cuda_ok(cudaGetLastError(), "compressor wide rows store launch");
 }
+
+

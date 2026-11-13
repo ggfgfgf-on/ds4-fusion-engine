@@ -486,6 +486,25 @@ void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+/* DS4_CUDA_KV_BITQ: pack staged f32 rows into the packed caches. */
+int ds4_gpu_comp_cache_bitq_pack_stage_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache, uint32_t cap,
+        uint32_t first_row, uint32_t rows, uint32_t head_dim);
+int ds4_gpu_comp_cache_bitq_pack_page_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache,
+        uint32_t phys_slot, uint32_t page_row, uint32_t stage_row,
+        uint32_t rows, uint32_t head_dim);
+int ds4_gpu_index_cache_bitq_pack_stage_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache, uint32_t cap,
+        uint32_t first_row, uint32_t rows, uint32_t head_dim);
+int ds4_gpu_bitq_dequant_rows_dump(
+        const ds4_gpu_tensor *ring, uint32_t raw_cap, uint32_t first_row,
+        uint32_t n_rows, uint32_t head_dim, int bits, float *dst);
+int ds4_gpu_bitq_pack_rows_upload(
+        ds4_gpu_tensor *ring, uint32_t raw_cap, uint32_t first_row,
+        uint32_t n_rows, uint32_t head_dim, int bits, const float *src);
+void ds4_gpu_indexer_paging_table_set(const ds4_gpu_tensor *table);
+void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t);
 /* Prefill-safe weight-arena eviction protocol: enter/exit bracket one
  * SSD-streamed chunked prefill; each chunk boundary lets the arena reclaim
  * ranges resolved by earlier chunks that are already past the device. */

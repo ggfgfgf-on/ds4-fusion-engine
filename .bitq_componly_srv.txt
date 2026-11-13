@@ -1,0 +1,25 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 5070 Laptop GPU (sm_120) dev=0
+ds4: WARNING: SSD streaming expert cache (16 experts) is under twice the per-token routed working set (43 layers x 6 experts = 258); expect heavy thrashing below 3.40 GiB
+ds4: SSD streaming initial cuda model map (1 spans, 0.99 GiB tensor span)
+ds4: CUDA preparing model tensor mappings
+ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool free for DWM/OS (DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=8, 0=off)
+ds4: WDDM shared-pool budget 44.93 GiB
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.538s
+ds4: cuda backend initialized for graph diagnostics
+ds4: memory: KV 0.39 GiB (raw 0.36 + compressed 0.04) + buffers 0.06 GiB + resident model 2.81 GiB + expert cache 0.11 GiB = 3.37 GiB planned
+ds4: memory detail: ctx=8192 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=2050 backend=cuda
+1113 20:52:56 ds4-server: context buffers 468.84 MiB (ctx=8192, backend=cuda, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=2050)
+1113 20:52:56 ds4-server: listening on http://127.0.0.1:8000
+1113 20:52:57 ds4-server: chat ctx=0..118:118 prompt start
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=64.00 MiB cached=0.00 GiB free=0.00 GiB reserve=0.75 GiB total=7.93 GiB)
+ds4: CUDA SSD expert cache: 227 slots, 1.50 GiB
+ds4: CUDA SSD expert cache: 228 slots, 1.50 GiB
+ds4: CUDA loading model tensors 1.75 GiB cached
+ds4: CUDA loading model tensors 3.60 GiB cached
+ds4: CUDA loading model tensors 5.47 GiB cached
+ds4: CUDA loading model tensors 7.19 GiB cached
+1113 20:53:39 ds4-server: chat ctx=0..118:118 prompt done 41.716s
+ds4: CUDA loading model tensors 8.20 GiB cached
+1113 20:55:33 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.42 t/s avg=0.42 t/s 113.788s
+1113 20:55:33 ds4-server: chat ctx=0..118:118 gen=48 finish=length 155.506s

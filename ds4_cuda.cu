@@ -6432,17 +6432,23 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 static cudaEvent_t g_end_batch_event = NULL;
+static cudaEvent_t g_end_decode_event = NULL;
 int g_end_batch_pending = 0;
 
 /* Optimized per-layer sync (deferred by default): the barrier stays, but
  * the wait is deferred until the host is about to overwrite buffers the
  * previous layer's kernels may still read — by then the next layer's
- * staging has absorbed the GPU tail, so the join costs ~0. */
+ * staging has absorbed the GPU tail, so the join costs ~0.
+ * Both the default stream AND the decode stream are covered: the bitq
+ * pack/gather kernels launch on cuda_decode_stream(), so a stream-0-only
+ * event would let them race the next layer's reads. */
 extern "C" int ds4_gpu_join_pending_commands(void) {
     if (!g_end_batch_event || !g_end_batch_pending) return 1;
     g_end_batch_pending = 0;
-    return cuda_ok(cudaEventSynchronize(g_end_batch_event),
-                   "join pending commands");
+    if (cudaEventSynchronize(g_end_batch_event) != cudaSuccess) return 0;
+    if (g_end_decode_event &&
+        cudaEventSynchronize(g_end_decode_event) != cudaSuccess) return 0;
+    return 1;
 }
 
 extern "C" int ds4_gpu_end_commands(void) {
@@ -6453,14 +6459,20 @@ extern "C" int ds4_gpu_end_commands(void) {
     if (getenv("DS4_CUDA_NO_DEFER_SYNC") == NULL) {
         if (!g_end_batch_event) {
             if (cudaEventCreateWithFlags(&g_end_batch_event,
+                                         cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&g_end_decode_event,
                                          cudaEventDisableTiming) != cudaSuccess) {
                 (void)cudaGetLastError();
                 return 0;
             }
         }
         g_end_batch_pending = 1;
-        return cuda_ok(cudaEventRecord(g_end_batch_event, 0),
-                       "end commands record");
+        int rc = cuda_ok(cudaEventRecord(g_end_batch_event, 0),
+                         "end commands record");
+        if (rc) rc = cuda_ok(cudaEventRecord(g_end_decode_event,
+                                             cuda_decode_stream()),
+                             "end commands decode-stream record");
+        return rc;
     }
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");

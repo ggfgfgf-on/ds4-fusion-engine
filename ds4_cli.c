@@ -2063,14 +2063,17 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
+            bool cache_auto = false;
             if (!ds4_parse_streaming_cache_experts_arg(
-                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                    need_arg(&i, argc, argv, arg), &experts, &bytes,
+                    &cache_auto)) {
                 fprintf(stderr,
-                        "ds4: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                        "ds4: --ssd-streaming-cache-experts must be a positive count, <number>GB, or auto\n");
                 exit(2);
             }
             c.engine.ssd_streaming_cache_experts = experts;
             c.engine.ssd_streaming_cache_bytes = bytes;
+            c.engine.ssd_streaming_cache_auto = cache_auto;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssd_streaming_full_layers = (uint32_t)v;

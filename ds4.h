@@ -146,6 +146,7 @@ typedef struct {
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    bool ssd_streaming_cache_auto;   /* "auto": WDDM band scheduler (dedicated VRAM + spill budget) */
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;

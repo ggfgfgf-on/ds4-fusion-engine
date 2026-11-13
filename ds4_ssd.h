@@ -19,7 +19,8 @@ typedef struct {
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
-                                           uint64_t   *bytes);
+                                           uint64_t   *bytes,
+                                           bool       *auto_plan);
 
 uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);

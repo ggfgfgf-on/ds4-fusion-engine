@@ -29071,14 +29071,30 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
-            const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
+            int headroom_present = 0;
+            const uint64_t reserve = cuda_parse_mib_env(
+                "DS4_CUDA_STAGE_HEADROOM_MB", &headroom_present);
+#ifndef _WIN32
+            /* Linux/Metal: keep the dedicated-VRAM headroom gate (default
+             * 512 MiB safety margin, env-tunable). */
+            const uint64_t effective_reserve =
+                headroom_present ? reserve : (UINT64_C(512) << 20);
+            const uint64_t available = free_bytes > effective_reserve ? free_bytes - effective_reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
                 fprintf(stderr, "ds4: CUDA SSD cache cannot stage %zu experts with system headroom\n",
                         unique.size());
                 return 0;
             }
+#else
+            /* WDDM: cudaMemGetInfo's dedicated-free figure is near zero by
+             * design (the device cache fills VRAM); staged allocations spill
+             * into the shared pool instead of failing.  Skip the free-based
+             * clamp and let the driver's spill handle the margin. */
+            (void)headroom_present;
+            (void)reserve;
+            (void)free_bytes;
+#endif
             /* A budget is a hint. Back off before publishing any live slots. */
             while (capacity >= unique.size()) {
                 if (cuda_stream_selected_ensure_bytes(&cache.gate_ptr, &cache.gate_capacity,

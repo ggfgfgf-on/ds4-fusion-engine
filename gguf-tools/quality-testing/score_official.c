@@ -748,15 +748,18 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            bool cache_auto = false;
             if (!ds4_parse_streaming_cache_experts_arg(
                     need_arg(&i, argc, argv, arg),
                     &ssd_streaming_cache_experts,
-                    &ssd_streaming_cache_bytes)) {
+                    &ssd_streaming_cache_bytes,
+                    &cache_auto)) {
                 fprintf(stderr,
                         "score_official: --ssd-streaming-cache-experts must be "
-                        "a positive count or <number>GB\n");
+                        "a positive count, <number>GB, or auto\n");
                 return 2;
             }
+            (void)cache_auto; /* auto is engine-side; scorer has no config field */
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             ssd_streaming_preload_experts =
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);

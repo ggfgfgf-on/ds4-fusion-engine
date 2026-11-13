@@ -44566,6 +44566,7 @@ struct ds4_engine {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    bool ssd_streaming_cache_auto; /* "auto": WDDM band scheduler (VRAM + spill budget) */
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -62899,8 +62900,19 @@ static void ds4_release_instance_lock(void) {
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
+#ifndef _WIN32
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
+#else
+    static char lock_path_buf[1024];
+    const char *path = getenv("DS4_LOCK_FILE");
+    if (!path || !path[0]) {
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !tmp[0]) tmp = ".";
+        snprintf(lock_path_buf, sizeof(lock_path_buf), "%s\\ds4.lock", tmp);
+        path = lock_path_buf;
+    }
+#endif
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {
@@ -71025,6 +71037,24 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* Read a DS4_SSD_AUTO_CACHE_*_MB WDDM band-scheduler parameter (MiB).
+ * Returns 0 on parse failure so callers fall back to the default. */
+static uint64_t ds4_wddm_auto_bytes(const char *name, uint64_t default_mb) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) {
+        return default_mb * 1024ull * 1024ull;
+    }
+    char *end = NULL;
+    const unsigned long v = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || v == 0 || v > 1048576ul) {
+        fprintf(stderr,
+                "ds4: %s=%s invalid (expected MiB in 1..1048576); using %llu MiB\n",
+                name, env, (unsigned long long)default_mb);
+        return default_mb * 1024ull * 1024ull;
+    }
+    return (uint64_t)v * 1024ull * 1024ull;
+}
+
 static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_size) {
 #ifdef DS4_NO_GPU
     (void)e;
@@ -71038,6 +71068,82 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         e->ssd_streaming_cache_bytes != 0) {
         return true;
     }
+
+    /* WDDM band scheduler (--ssd-streaming-cache-experts auto on native
+     * CUDA): land the TOTAL cache budget inside [thrash cliff, ceiling]:
+     *   T = (dedicated VRAM + safe shared-pool spill - fixed consumers) * PCT
+     *   clamped to [cliff, ceiling]
+     *   fixed consumers = KV + buffers + resident model estimate
+     *   cliff = measured good point (dynamic 1.62 GiB @95% hit + 3.38 GiB
+     *           prefill reserve = 5 GiB); ceiling = VRAM + spill - fixed.
+     * Parameterized by DS4_SSD_AUTO_CACHE_SPILL_MB / _FIXED_MB / _CLIFF_MB
+     * and the shared DS4_SSD_AUTO_CACHE_PCT. */
+#if !defined(DS4_ROCM_BUILD)
+    if (e->ssd_streaming_cache_auto) {
+        if (e->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming-cache-experts auto is only supported "
+                    "on the native CUDA backend; set N or NGB explicitly\n");
+            return false;
+        }
+        const uint64_t vram = ds4_gpu_recommended_working_set_size();
+        if (vram == 0) {
+            fprintf(stderr,
+                    "ds4: SSD streaming auto cache: total VRAM unavailable\n");
+            return false;
+        }
+        const uint64_t spill = ds4_wddm_auto_bytes("DS4_SSD_AUTO_CACHE_SPILL_MB", 1536);
+        const uint64_t fixed = ds4_wddm_auto_bytes("DS4_SSD_AUTO_CACHE_FIXED_MB", 3584);
+        const uint64_t cliff = ds4_wddm_auto_bytes("DS4_SSD_AUTO_CACHE_CLIFF_MB", 5120);
+        if (vram + spill < fixed) {
+            fprintf(stderr,
+                    "ds4: SSD streaming auto cache: VRAM (%.2f GiB) + spill (%.2f GiB) "
+                    "below fixed consumers (%.2f GiB)\n",
+                    (double)vram / 1073741824.0,
+                    (double)spill / 1073741824.0,
+                    (double)fixed / 1073741824.0);
+            return false;
+        }
+        const uint64_t available = vram + spill - fixed;
+        const uint64_t ceiling = available;
+        uint64_t pct = 80;
+        {
+            const char *env = getenv("DS4_SSD_AUTO_CACHE_PCT");
+            if (env && env[0]) {
+                char *end = NULL;
+                const unsigned long v = strtoul(env, &end, 10);
+                if (end != env && *end == '\0' && v >= 50 && v <= 95) {
+                    pct = (uint64_t)v;
+                } else {
+                    fprintf(stderr,
+                            "ds4: invalid DS4_SSD_AUTO_CACHE_PCT=%s "
+                            "(want 50..95); using default\n",
+                            env);
+                }
+            }
+        }
+        uint64_t total = (available / 100ull) * pct;
+        if (total < cliff) total = cliff;
+        if (total > ceiling) total = ceiling;
+        /* NGB form: the budget code splits it into prefill reserve + dynamic
+         * slots (identical to the hand-tuned 5GB path). */
+        e->ssd_streaming_cache_bytes = total;
+        e->ssd_streaming_cache_experts = 0;
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache (WDDM band scheduler): "
+                "vram %.2f + spill %.2f - fixed %.2f = %.2f GiB available; "
+                "pct %llu%% -> total cache %.2f GiB (cliff %.2f, ceiling %.2f)\n",
+                (double)vram / 1073741824.0,
+                (double)spill / 1073741824.0,
+                (double)fixed / 1073741824.0,
+                (double)available / 1073741824.0,
+                (unsigned long long)pct,
+                (double)total / 1073741824.0,
+                (double)cliff / 1073741824.0,
+                (double)ceiling / 1073741824.0);
+        return true;
+    }
+#endif /* !DS4_ROCM_BUILD */
     if (!ds4_backend_supports_streaming_auto_cache(e->backend) &&
         !(e->backend == DS4_BACKEND_CUDA && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)) {
         return true;
@@ -73803,6 +73909,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     opt->prefill_chunk);
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ssd_streaming_cache_auto = opt->ssd_streaming_cache_auto;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;

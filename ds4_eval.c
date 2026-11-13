@@ -1195,6 +1195,7 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    bool ssd_streaming_cache_auto;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
@@ -1726,14 +1727,17 @@ static eval_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
+            bool cache_auto = false;
             if (!ds4_parse_streaming_cache_experts_arg(
-                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                    need_arg(&i, argc, argv, arg), &experts, &bytes,
+                    &cache_auto)) {
                 fprintf(stderr,
-                        "ds4-eval: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                        "ds4-eval: --ssd-streaming-cache-experts must be a positive count, <number>GB, or auto\n");
                 exit(2);
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
+            c.ssd_streaming_cache_auto = cache_auto;
         } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
             int v = parse_nonnegative_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.ssd_streaming_full_layers = (uint32_t)v;
@@ -4780,6 +4784,7 @@ int main(int argc, char **argv) {
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_cache_auto = cfg.ssd_streaming_cache_auto,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,

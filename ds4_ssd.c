@@ -45,10 +45,17 @@ bool ds4_parse_gib_arg(const char *s, uint64_t *bytes) {
 
 bool ds4_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,
-                                           uint64_t   *bytes) {
+                                           uint64_t   *bytes,
+                                           bool       *auto_plan) {
     if (experts) *experts = 0;
     if (bytes) *bytes = 0;
+    if (auto_plan) *auto_plan = false;
     if (!s || !s[0] || !experts || !bytes) return false;
+
+    if (strcmp(s, "auto") == 0) {
+        if (auto_plan) *auto_plan = true;
+        return true;
+    }
 
     const size_t len = strlen(s);
     if (len > 2 &&

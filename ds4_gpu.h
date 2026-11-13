@@ -524,6 +524,15 @@ int ds4_gpu_probe_sampled_ce(
         const ds4_gpu_tensor *targets,
         ds4_gpu_tensor *scratch_logits, ds4_gpu_tensor *scratch_coeff,
         uint32_t n_pos, uint32_t n_row, uint32_t in_dim);
+/* Hybrid GPU head offload (DS4_HYBRID_GPU_HEAD): owned VRAM staging of a
+ * model range + bit-exact Q8_0 head matmul + fused top-1 + runtime check. */
+int ds4_gpu_stage_model_range_owned(const void *model_map,
+                                    uint64_t offset, uint64_t bytes);
+int ds4_gpu_matmul_q8_0_exact_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *xq);
+int ds4_gpu_cuda_ready(void);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

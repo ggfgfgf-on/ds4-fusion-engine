@@ -4011,6 +4011,244 @@ extern "C" int ds4_gpu_probe_sampled_ce(
     return cuda_ok(cudaGetLastError(), "probe sampled CE launch");
 }
 
+/* Forward decl: dp4a/plain dot helper defined later in this file. */
+__device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a);
+
+extern "C" int ds4_gpu_stage_model_range_owned(
+        const void *model_map,
+        uint64_t    offset,
+        uint64_t    bytes) {
+    if (!model_map || bytes == 0) return 0;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && r.offset == offset &&
+            r.bytes >= bytes && r.device_ptr && !r.host_registered) {
+            return 1;
+        }
+    }
+    void *dev = NULL;
+    cudaError_t err = cudaErrorUnknown;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        err = cudaMalloc(&dev, (size_t)bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: head weight staging alloc failed (%.1f MiB): %s\n",
+                    (double)bytes / 1048576.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+        } else {
+            const char *src = (const char *)model_map + offset;
+            const uint64_t chunk = 64ull * 1024ull * 1024ull;
+            for (uint64_t done = 0; err == cudaSuccess && done < bytes;
+                 done += chunk) {
+                const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+                err = cudaMemcpy((char *)dev + done, src + done, (size_t)n,
+                                 cudaMemcpyHostToDevice);
+                if (err != cudaSuccess) {
+                    fprintf(stderr,
+                            "ds4: head weight staging copy failed at %.1f/%.1f MiB: %s\n",
+                            (double)done / 1048576.0,
+                            (double)bytes / 1048576.0,
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                }
+            }
+            if (err != cudaSuccess) {
+                (void)cudaFree(dev);
+                dev = NULL;
+            }
+        }
+    }
+    if (!dev) return 0;
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev,
+                              NULL, NULL, 0, 0, 1});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    return 1;
+}
+
+/* Transpose a staged q8_0 weight range from row-major [out_dim][blocks][34]
+ * to block-major [blocks][out_dim][34].  The bit-exact head kernel keeps one
+ * thread per row (the float chain order forbids splitting), so row-major
+ * storage makes warp-adjacent rows read 34B entries with a full row stride
+ * (uncoalesced).  Block-major storage turns the same access into contiguous
+ * 34B entries across the warp.  One-time cost at staging. */
+__global__ static void matmul_q8_0_transpose_34_kernel(
+        unsigned char *dst,
+        const unsigned char *src,
+        uint32_t out_dim,
+        uint32_t blocks) {
+    const uint64_t e = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)out_dim * blocks;
+    if (e >= total) return;
+    const uint32_t r = (uint32_t)(e % out_dim);
+    const uint32_t b = (uint32_t)(e / out_dim);
+    const unsigned char *s = src + ((uint64_t)r * blocks + b) * 34u;
+    unsigned char *d = dst + e * 34u;
+    /* 34B entries are only 2-byte aligned; byte-wise copy avoids the
+     * misaligned-address trap on 4-byte word stores. */
+    #pragma unroll
+    for (uint32_t i = 0; i < 34u; i++) d[i] = s[i];
+}
+
+static struct {
+    const void *map;
+    uint64_t offset, bytes;
+    uint32_t out_dim, blocks;
+    char *dev;
+} g_head_tp;
+
+/* Returns the cached block-major copy of the staged range, transposing it on
+ * first use.  Requires the row-major owned staging (ds4_gpu_stage_model_range_owned)
+ * to exist first; NULL on failure. */
+static const char *cuda_head_transposed_ptr(
+        const void *model_map,
+        uint64_t    offset,
+        uint64_t    bytes,
+        uint32_t    out_dim,
+        uint32_t    blocks) {
+    if (g_head_tp.dev && g_head_tp.map == model_map &&
+        g_head_tp.offset == offset && g_head_tp.bytes == bytes &&
+        g_head_tp.out_dim == out_dim && g_head_tp.blocks == blocks) {
+        return g_head_tp.dev;
+    }
+    const char *src = NULL;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && r.offset == offset &&
+            r.bytes >= bytes && r.device_ptr) {
+            src = (const char *)r.device_ptr;
+            break;
+        }
+    }
+    if (!src) return NULL;
+    void *dev = NULL;
+    cudaError_t err = cudaErrorUnknown;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        err = cudaMalloc(&dev, (size_t)bytes);
+        if (err == cudaSuccess) {
+            const uint64_t total = (uint64_t)out_dim * blocks;
+            matmul_q8_0_transpose_34_kernel<<<(unsigned)((total + 255u) / 256u), 256>>>(
+                    (unsigned char *)dev, (const unsigned char *)src,
+                    out_dim, blocks);
+            err = cudaGetLastError();
+            if (err == cudaSuccess) err = cudaDeviceSynchronize();
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: head weight transpose failed: %s\n",
+                    cudaGetErrorString(err));
+            if (dev) (void)cudaFree(dev);
+            dev = NULL;
+        }
+    }
+    if (!dev) return NULL;
+    g_head_tp.map = model_map;
+    g_head_tp.offset = offset;
+    g_head_tp.bytes = bytes;
+    g_head_tp.out_dim = out_dim;
+    g_head_tp.blocks = blocks;
+    g_head_tp.dev = (char *)dev;
+    return g_head_tp.dev;
+}
+
+/* Hybrid CPU-decode GPU head offload (DS4_HYBRID_GPU_HEAD=1): bit-exact
+ * replication of the host dot_q8_0_row 4-block group as compiled by
+ * clang -O2 -ffast-math -march=native (x86-64).  The host vectorizes each
+ * group of 4 blocks and reduces pairwise:
+ *
+ *     p_b = RN(s_b * (float)d_b)               (one vmulps, lane-wise RN)
+ *     g   = RN(RN(p0 + p1) + RN(p2 + p3))     (vaddps pairwise + vaddss)
+ *     acc = RN(acc + g)                       (vaddss)
+ *
+ * with s_b = RN(f16_to_f32(scale_b) * xscale[b]) and d_b the exact int32
+ * dot of the 32 int8 products.  One thread per output row keeps the exact
+ * rounding order (any cross-thread split would reassociate the chain).
+ * No FMA anywhere: the host codegen is mul+add (two roundings per term).
+ * xq/xscale must be the HOST's pre-quantized activation so that the
+ * activation quantizer rounding never enters the comparison. */
+__global__ static void matmul_q8_0_exact_row_kernel(
+        float *out,
+        const unsigned char *w,      /* block-major [blocks][out_dim][34] */
+        const int8_t *xq,
+        const float *xscale,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t blocks) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float acc = 0.0f;
+    uint32_t b = 0;
+    for (; b + 4u <= blocks && (in_dim & 31u) == 0u; b += 4u) {
+        const unsigned char *w0 = w + ((uint64_t)b * out_dim + row) * 34u;
+        const unsigned char *w1 = w0 + (uint64_t)out_dim * 34u;
+        const unsigned char *w2 = w1 + (uint64_t)out_dim * 34u;
+        const unsigned char *w3 = w2 + (uint64_t)out_dim * 34u;
+        const float s0 = __fmul_rn(__half2float(*(const __half *)w0), xscale[b]);
+        const float s1 = __fmul_rn(__half2float(*(const __half *)w1), xscale[b + 1u]);
+        const float s2 = __fmul_rn(__half2float(*(const __half *)w2), xscale[b + 2u]);
+        const float s3 = __fmul_rn(__half2float(*(const __half *)w3), xscale[b + 3u]);
+        const float p0 = __fmul_rn(s0, (float)dot_i8_block((const int8_t *)(w0 + 2u), xq + b * 32u, 32u, 1));
+        const float p1 = __fmul_rn(s1, (float)dot_i8_block((const int8_t *)(w1 + 2u), xq + (b + 1u) * 32u, 32u, 1));
+        const float p2 = __fmul_rn(s2, (float)dot_i8_block((const int8_t *)(w2 + 2u), xq + (b + 2u) * 32u, 32u, 1));
+        const float p3 = __fmul_rn(s3, (float)dot_i8_block((const int8_t *)(w3 + 2u), xq + (b + 3u) * 32u, 32u, 1));
+        acc = __fadd_rn(acc, __fadd_rn(__fadd_rn(p0, p1), __fadd_rn(p2, p3)));
+    }
+    for (; b < blocks; b++) {
+        const unsigned char *wb = w + ((uint64_t)b * out_dim + row) * 34u;
+        const uint32_t i0 = b * 32u;
+        const uint32_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const float s = __fmul_rn(__half2float(*(const __half *)wb), xscale[b]);
+        acc = __fadd_rn(acc, __fmul_rn(s, (float)dot_i8_block((const int8_t *)(wb + 2u), xq + i0, bn, 1)));
+    }
+    out[row] = acc;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *xq) {
+    if (!out || !xq || !model_map ||
+        in_dim == 0 || out_dim == 0 || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset ||
+        out->bytes < out_dim * sizeof(float) ||
+        xq->bytes < blocks * 32u + blocks * sizeof(float)) {
+        return 0;
+    }
+    /* Block-major staging for coalesced per-row reads (transposed on first
+     * use from the row-major owned copy). */
+    const char *wptr = cuda_head_transposed_ptr(model_map, weight_offset,
+                                                weight_bytes,
+                                                (uint32_t)out_dim,
+                                                (uint32_t)blocks);
+    if (!wptr) return 0;
+    const float *xscale = (const float *)((const int8_t *)xq->ptr + blocks * 32u);
+    const uint32_t grid = ((uint32_t)out_dim + 255u) / 256u;
+    matmul_q8_0_exact_row_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            (const int8_t *)xq->ptr,
+            xscale,
+            (uint32_t)in_dim,
+            (uint32_t)out_dim,
+            (uint32_t)blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 exact head row launch");
+}
+
+/* Nonzero once the CUDA runtime has been initialized (any engine opened a
+ * device).  Guards the hybrid head bridge against CPU-only CLI processes. */
+extern "C" int ds4_gpu_cuda_ready(void) {
+    return g_n_gpus > 0 ? 1 : 0;
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */

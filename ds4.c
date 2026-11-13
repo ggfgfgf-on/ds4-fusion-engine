@@ -17833,6 +17833,215 @@ static void output_logits_glm_one(
     free(norm);
 }
 
+/* ---- Hybrid GPU head offload (DS4_HYBRID_GPU_HEAD) ----------------------
+ * Offloads the 129280x4096 Q8_0 vocab projection of the CPU decode tail to
+ * the otherwise idle GPU (the hybrid GPU-prefill engine keeps CUDA alive).
+ *
+ *   DS4_HYBRID_GPU_HEAD=1  bit-exact full logits row: uploads the host's own
+ *                          pre-quantized activation and runs a per-row kernel
+ *                          replicating the host float chain, so logits (and
+ *                          therefore greedy tokens) are byte-identical to the
+ *                          pure-CPU path.  Works with any sampling and with
+ *                          MTP verify rows.
+ *   DS4_HYBRID_GPU_HEAD=2  approximate fused top-1 (dp4a + GPU-side
+ *                          requantization): logits values differ from the CPU
+ *                          path and only argmax semantics are preserved
+ *                          (greedy-only; do not combine with stochastic
+ *                          sampling, penalties, or MTP).
+ *
+ * Any failure falls back to the CPU matvec permanently (one log line). */
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+typedef struct {
+    int mode;                 /* 0 off, 1 exact, 2 fused top-1 */
+    int state;                /* 0 uninit, 1 ok, -1 failed */
+    const ds4_model *model;   /* captured for map/size identity */
+    uint64_t weight_offset;
+    uint64_t in_dim, out_dim, blocks;
+    ds4_gpu_tensor *x_t;      /* f32[in_dim]  (mode 2 input) */
+    ds4_gpu_tensor *xq_t;     /* int8[blocks*32] + float[blocks] (mode 1) */
+    ds4_gpu_tensor *out_t;    /* f32[out_dim] (mode 1) */
+    ds4_gpu_tensor *sel_t;    /* u32[1] (mode 2) */
+    ds4_gpu_tensor *val_t;    /* f32[1] (mode 2) */
+    uint8_t *up_buf;          /* host staging for the single H2D upload */
+    bool first_timed;
+} ds4_hybrid_gpu_head;
+static ds4_hybrid_gpu_head g_hybrid_head;
+static int g_hybrid_head_env = -1;
+
+static int ds4_hybrid_gpu_head_mode(void) {
+    if (g_hybrid_head_env >= 0) return g_hybrid_head_env;
+    g_hybrid_head_env = 0;
+    const char *e = getenv("DS4_HYBRID_GPU_HEAD");
+    if (e && e[0]) {
+        const long v = strtol(e, NULL, 10);
+        if (v == 1 || v == 2) g_hybrid_head_env = (int)v;
+    }
+    return g_hybrid_head_env;
+}
+
+/* Returns true when the GPU wrote `logits`; false means use the CPU path. */
+static bool ds4_hybrid_gpu_head_try(
+        float                  *logits,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        ds4_cpu_decode_scratch *scratch) {
+    const int mode = ds4_hybrid_gpu_head_mode();
+    if (mode == 0 || g_hybrid_head.state < 0 || !ds4_gpu_cuda_ready()) {
+        return false;
+    }
+
+    if (g_hybrid_head.state == 0) {
+        /* Lazy one-time init: capture geometry, allocate persistent tensors.
+         * The first kernel call also stages the vocab tensor into VRAM
+         * (~562 MiB, one-time H2D copy). */
+        const ds4_tensor *w = weights->output;
+        const uint64_t in_dim = w ? w->dim[0] : 0;
+        const uint64_t out_dim = w ? w->dim[1] : 0;
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        bool ok = w && w->type == DS4_TENSOR_Q8_0 && w->ndim == 2 &&
+                  in_dim > 0 && in_dim <= UINT32_MAX &&
+                  out_dim > 0 && out_dim <= UINT32_MAX;
+        ds4_gpu_tensor *x_t = NULL, *xq_t = NULL, *out_t = NULL,
+                       *sel_t = NULL, *val_t = NULL;
+        uint8_t *up_buf = NULL;
+        if (ok && mode == 1) {
+            xq_t = ds4_gpu_tensor_alloc(blocks * 32u + blocks * sizeof(float));
+            out_t = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+            up_buf = xmalloc(blocks * 32u + blocks * sizeof(float));
+            ok = xq_t && out_t && up_buf;
+        } else if (ok && mode == 2) {
+            x_t = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
+            sel_t = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+            val_t = ds4_gpu_tensor_alloc(sizeof(float));
+            ok = x_t && sel_t && val_t;
+        }
+        if (ok) {
+            /* One-time VRAM staging of the vocab tensor (~537 MiB): the CPU
+             * engine's model map is a separate mmap, so the generic resolver
+             * would otherwise fall back to mapped host reads over PCIe on
+             * every token. */
+            ok = ds4_gpu_stage_model_range_owned(
+                    model->map, w->abs_offset, out_dim * blocks * 34u);
+        }
+        if (!ok) {
+            ds4_gpu_tensor_free(x_t);
+            ds4_gpu_tensor_free(xq_t);
+            ds4_gpu_tensor_free(out_t);
+            ds4_gpu_tensor_free(sel_t);
+            ds4_gpu_tensor_free(val_t);
+            free(up_buf);
+            g_hybrid_head.state = -1;
+            fprintf(stderr,
+                    "ds4: hybrid GPU head init failed; using CPU head\n");
+            return false;
+        }
+        g_hybrid_head.mode = mode;
+        g_hybrid_head.model = model;
+        g_hybrid_head.weight_offset = w->abs_offset;
+        g_hybrid_head.in_dim = in_dim;
+        g_hybrid_head.out_dim = out_dim;
+        g_hybrid_head.blocks = blocks;
+        g_hybrid_head.x_t = x_t;
+        g_hybrid_head.xq_t = xq_t;
+        g_hybrid_head.out_t = out_t;
+        g_hybrid_head.sel_t = sel_t;
+        g_hybrid_head.val_t = val_t;
+        g_hybrid_head.up_buf = up_buf;
+        g_hybrid_head.state = 1;
+        fprintf(stderr,
+                "ds4: hybrid GPU head enabled (mode %d): %llu x %llu Q8_0 "
+                "(%.1f MiB weights, one-time VRAM staging)\n",
+                mode, (unsigned long long)out_dim, (unsigned long long)in_dim,
+                (double)(out_dim * blocks * 34u) / 1048576.0);
+    }
+    if (g_hybrid_head.state != 1 || g_hybrid_head.model != model) {
+        return false;
+    }
+
+    const double t0 = now_sec();
+    int rc = 0;
+    if (g_hybrid_head.mode == 1) {
+        const bool htm = getenv("DS4_GPU_HEAD_TIMING") != NULL;
+        static double s_up = 0, s_kern = 0, s_dn = 0;
+        static uint32_t s_n = 0;
+        double h0 = htm ? now_sec() : 0.0, h1, h2, h3;
+        cpu_decode_quantize_q8_0(scratch, scratch->output_norm,
+                                 g_hybrid_head.in_dim);
+        memcpy(g_hybrid_head.up_buf, scratch->q8_xq, g_hybrid_head.blocks * 32u);
+        memcpy(g_hybrid_head.up_buf + g_hybrid_head.blocks * 32u,
+               scratch->q8_xscale, g_hybrid_head.blocks * sizeof(float));
+        h1 = htm ? now_sec() : 0.0;
+        const int up_ok = ds4_gpu_tensor_write(
+                g_hybrid_head.xq_t, 0, g_hybrid_head.up_buf,
+                g_hybrid_head.blocks * 32u + g_hybrid_head.blocks * sizeof(float));
+        h2 = htm ? now_sec() : 0.0;
+        const int kern_ok = ds4_gpu_matmul_q8_0_exact_tensor(
+                g_hybrid_head.out_t,
+                model->map, model->size,
+                g_hybrid_head.weight_offset,
+                g_hybrid_head.in_dim, g_hybrid_head.out_dim,
+                g_hybrid_head.xq_t);
+        h3 = htm ? now_sec() : 0.0;
+        const int dn_ok = ds4_gpu_tensor_read(
+                g_hybrid_head.out_t, 0, logits,
+                g_hybrid_head.out_dim * sizeof(float));
+        if (!up_ok || !kern_ok || !dn_ok) {
+            rc = -1;
+        }
+        if (htm) {
+            const double t4 = now_sec();
+            s_up += h2 - h1;
+            s_kern += h3 - h2;
+            s_dn += t4 - h3;
+            s_n++;
+            if ((s_n % 32) == 0) {
+                fprintf(stderr,
+                        "ds4: gpu head split up=%.1f kern=%.1f dn=%.1f us (n=%u)\n",
+                        s_up * 1e6, s_kern * 1e6, s_dn * 1e6, s_n);
+                s_up = s_kern = s_dn = 0.0;
+            }
+            (void)h0;
+        }
+    } else {
+        uint32_t sel = 0;
+        float val = 0.0f;
+        if (!ds4_gpu_tensor_write(g_hybrid_head.x_t, 0, scratch->output_norm,
+                                  g_hybrid_head.in_dim * sizeof(float)) ||
+            !ds4_gpu_matmul_q8_0_top1_tensor(
+                    g_hybrid_head.sel_t, g_hybrid_head.val_t,
+                    model->map, model->size,
+                    g_hybrid_head.weight_offset,
+                    g_hybrid_head.in_dim, g_hybrid_head.out_dim,
+                    g_hybrid_head.x_t, 0) ||
+            !ds4_gpu_tensor_read(g_hybrid_head.sel_t, 0, &sel, sizeof(sel)) ||
+            !ds4_gpu_tensor_read(g_hybrid_head.val_t, 0, &val, sizeof(val)) ||
+            sel >= g_hybrid_head.out_dim) {
+            rc = -1;
+        } else {
+            /* Argmax-only row: the winner at its GPU value, everything else
+             * strictly below (nextafterf guarantees < even at -max). */
+            const float lo = nextafterf(val, -INFINITY);
+            for (uint64_t i = 0; i < g_hybrid_head.out_dim; i++) logits[i] = lo;
+            logits[sel] = val;
+        }
+    }
+    if (rc != 0) {
+        g_hybrid_head.state = -1;
+        fprintf(stderr,
+                "ds4: hybrid GPU head failed; falling back to CPU head\n");
+        return false;
+    }
+    if (!g_hybrid_head.first_timed) {
+        g_hybrid_head.first_timed = true;
+        fprintf(stderr,
+                "ds4: hybrid GPU head first call %.1f ms (includes one-time "
+                "block-major transpose; weight staging ran during init)\n",
+                (now_sec() - t0) * 1e3);
+    }
+    return true;
+}
+#endif
+
 /* Allocation-free logits head for CPU decode. */
 static void output_logits_one_decode_scratch(
         float                  * logits,
@@ -17856,7 +18065,12 @@ static void output_logits_one_decode_scratch(
     rms_norm_weight(scratch->output_norm, scratch->output_embd,
                     tensor_data(model, weights->output_norm),
                     DS4_N_EMBD, DS4_RMS_EPS);
-    matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!ds4_hybrid_gpu_head_try(logits, model, weights, scratch))
+#endif
+    {
+        matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+    }
 }
 
 #ifndef DS4_NO_GPU

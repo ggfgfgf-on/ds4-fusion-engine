@@ -1319,6 +1319,40 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
+/* DS4_REMOE_REUSE dynamic expert-output reuse state (Part 2, ReMoE-style).
+ * The plain decode FFN stores each token's per-expert weighted down
+ * contribution; the next token reuses the stored contribution for experts
+ * that overlap with the previous token's selection instead of recomputing
+ * gate/up/down.  Approximate (changes outputs); env-gated and default off.
+ * Only the plain decode call site passes this state; the MTP verify batch
+ * and draft paths pass NULL, so speculative cycles never pollute it.
+ * NOTE: with --mtp-draft speculation enabled the verify-exact path still
+ * shares this scratch for its target rows; reuse + spec is undefined
+ * quality.  Keep MTP off when the env is on. */
+typedef struct {
+    float *gate;        /* DS4_N_FF_EXP */
+    float *up;          /* DS4_N_FF_EXP */
+    float *mid;         /* DS4_N_FF_EXP */
+    float *down;        /* DS4_N_EMBD */
+    float *swap;        /* 6 x DS4_N_EMBD: stable snapshot for reuse reads */
+    float *prev_down;   /* n_layer x 6 x DS4_N_EMBD */
+    int32_t *prev_sel;  /* n_layer x 6 */
+    float *prev_w;      /* n_layer x 6: router weights of the stored token */
+    uint8_t *prev_valid;/* n_layer */
+    uint32_t last_pos;  /* position of the token whose state is stored */
+    bool have_pos;      /* last_pos initialized */
+    int prev_token;     /* previous position's token id */
+    bool suppress;      /* per-token: reuse disabled (repeat guard) */
+} ds4_remoe_state;
+
+/* Cached DS4_REMOE_REUSE env gate (ReMoE-style dynamic expert-output
+ * reuse, Part 2; approximate, default off). */
+static bool g_remoe_reuse_on(void) {
+    static int s_v = -1;
+    if (s_v < 0) s_v = getenv("DS4_REMOE_REUSE") != NULL ? 1 : 0;
+    return s_v != 0;
+}
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t comp_cap;
@@ -1369,6 +1403,8 @@ typedef struct {
     float *routed_q8_xscale;
     int8_t *routed_q8_midq;
     float *routed_q8_midscale;
+
+    ds4_remoe_state remoe;   /* DS4_REMOE_REUSE (see typedef above) */
 
     int8_t *q8_xq;
     float *q8_xscale;
@@ -13470,7 +13506,8 @@ static void layer_routed_moe_one_prealloc(
         int8_t             * q8_xq,
         float              * q8_xscale,
         int8_t             * q8_midq,
-        float              * q8_midscale) {
+        float              * q8_midscale,
+        ds4_remoe_state    * remoe) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
@@ -13533,7 +13570,114 @@ static void layer_routed_moe_one_prealloc(
     if (!mid_all || !xq || !midq) ds4_die("missing routed decode scratch");
     ds4_quantize_row_q8_K(x, xq, (int64_t)expert_in_dim);
 
-    if (routed_q8_k) {
+    /* DS4_REMOE_REUSE: skip gate/up/down recomputation for experts that the
+     * previous token also selected, reusing the stored weighted per-expert
+     * down contribution instead.  Approximate: the reused output was
+     * computed on the previous token's hidden state. */
+    const bool reuse_on = remoe != NULL && !routed_q8_k &&
+                          !remoe->suppress &&
+                          g_remoe_reuse_on();
+    if (reuse_on) {
+        uint8_t *pv = remoe->prev_valid + il;
+        const bool prev_ok = *pv != 0;
+        float *dst = remoe->prev_down +
+                     (uint64_t)il * DS4_MAX_EXPERT_USED * DS4_N_EMBD;
+        int32_t *psel = remoe->prev_sel +
+                        (uint64_t)il * DS4_MAX_EXPERT_USED;
+        float *pw = remoe->prev_w +
+                    (uint64_t)il * DS4_MAX_EXPERT_USED;
+        /* Reuse gate: the expert must overlap with the previous token AND
+         * carry a close router weight (relative tolerance tau).  Unbounded
+         * overlap reuse collapses greedy decoding into token repetition;
+         * the weight gate keeps only high-confidence reuse, capped at 3
+         * experts per layer. */
+        static float s_tau = -1.0f;
+        if (s_tau < 0.0f) {
+            s_tau = 0.20f;
+            const char *te = getenv("DS4_REMOE_REUSE_TAU");
+            if (te && te[0]) {
+                const float v = (float)strtod(te, NULL);
+                if (v >= 0.0f && v <= 1.0f) s_tau = v;
+            }
+        }
+        const float tau = s_tau;
+        const uint32_t max_reuse = 3u;
+        if (prev_ok) {
+            memcpy(remoe->swap, dst,
+                   (size_t)DS4_MAX_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+        }
+        /* Split into fresh (recompute via the batched fast kernels) and
+         * reused (add the stored prior contribution).  The fresh subset is
+         * kept batched: per-expert trace primitives were measured slower
+         * than the batched kernels even after skipping ~38% of experts. */
+        int fresh_sel[DS4_MAX_EXPERT_USED];
+        float fresh_w[DS4_MAX_EXPERT_USED];
+        int fresh_idx[DS4_MAX_EXPERT_USED];
+        int reuse_from[DS4_MAX_EXPERT_USED];
+        uint32_t n_fresh = 0;
+        uint32_t n_reuse = 0;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            int slot = -1;
+            if (prev_ok) {
+                for (uint32_t p = 0; p < DS4_N_EXPERT_USED; p++) {
+                    if (psel[p] == selected[i]) {
+                        const float wp = pw[p];
+                        const float wc = expert_weight[i];
+                        if (wp > 0.0f && fabsf(wc - wp) <= tau * wp &&
+                            n_reuse < max_reuse) {
+                            slot = (int)p;
+                            n_reuse++;
+                        }
+                        break;
+                    }
+                }
+            }
+            reuse_from[i] = slot;
+            if (slot < 0) {
+                fresh_idx[n_fresh] = (int)i;
+                fresh_sel[n_fresh] = selected[i];
+                fresh_w[n_fresh] = expert_weight[i];
+                n_fresh++;
+            }
+        }
+        if (n_fresh > 0) {
+            matvec_experts_mid_prequant(mid_all, model,
+                                        layer->ffn_gate_exps,
+                                        layer->ffn_up_exps,
+                                        xq, fresh_sel, fresh_w,
+                                        (int)n_fresh, clamp);
+            for (uint32_t k = 0; k < n_fresh; k++) {
+                ds4_quantize_row_q8_K(mid_all + (uint64_t)k * down_in_dim,
+                                      midq + (uint64_t)k * (down_in_dim / QK_K),
+                                      (int64_t)down_in_dim);
+            }
+            for (uint32_t k = 0; k < n_fresh; k++) {
+                const uint32_t i = (uint32_t)fresh_idx[k];
+                memset(remoe->down, 0, (size_t)DS4_N_EMBD * sizeof(float));
+                matvec_experts_down_accum_prequant(
+                        remoe->down, model, layer->ffn_down_exps,
+                        midq + (uint64_t)k * (down_in_dim / QK_K),
+                        &fresh_sel[k], 1);
+                float *fd = dst + (uint64_t)i * DS4_N_EMBD;
+                for (uint32_t j = 0; j < DS4_N_EMBD; j++) {
+                    out[j] += remoe->down[j];
+                    fd[j] = remoe->down[j];
+                }
+            }
+        }
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (reuse_from[i] >= 0) {
+                const float *pd = remoe->swap +
+                                  (uint64_t)reuse_from[i] * DS4_N_EMBD;
+                float *fd = dst + (uint64_t)i * DS4_N_EMBD;
+                for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] += pd[j];
+                memcpy(fd, pd, (size_t)DS4_N_EMBD * sizeof(float));
+            }
+            psel[i] = selected[i];
+            pw[i] = expert_weight[i];
+        }
+        *pv = 1;
+    } else if (routed_q8_k) {
         matvec_q8_k_experts_mid_prequant(mid_all, model,
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
@@ -13547,12 +13691,18 @@ static void layer_routed_moe_one_prealloc(
                                     DS4_N_EXPERT_USED, clamp);
     }
 
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
-                              midq + (uint64_t)i * (down_in_dim / QK_K),
-                              (int64_t)down_in_dim);
+    if (reuse_on) {
+        /* The reuse branch already accumulated its contributions. */
+    } else {
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
+                                  midq + (uint64_t)i * (down_in_dim / QK_K),
+                                  (int64_t)down_in_dim);
+        }
     }
-    if (routed_q8_k) {
+    if (reuse_on) {
+        /* down accumulations already done inside the reuse branch */
+    } else if (routed_q8_k) {
         matvec_q8_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
                                            midq, selected, DS4_N_EXPERT_USED);
     } else {
@@ -14147,6 +14297,7 @@ static void layer_ffn_one_decode_scratch(
         const float            * inp_hc,
         uint32_t                 il,
         int                      token,
+        uint32_t                 pos,
         const float            * steering_dirs,
         float                    steering_scale,
         ds4_cpu_decode_scratch * scratch) {
@@ -14177,6 +14328,24 @@ static void layer_ffn_one_decode_scratch(
     if (profile) t_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
+    /* DS4_REMOE_REUSE: reuse is only valid between strictly consecutive
+     * positions; a new generation (or a spec rollback) invalidates the
+     * stored per-expert contributions.  Runs once per token (il == 0).
+     * A repeated token id is a reuse fixed point (identical routing and
+     * nearly identical hidden state lock greedy decoding into repetition),
+     * so reuse is suppressed for the whole repeat token. */
+    if (il == 0u) {
+        if (scratch->remoe.have_pos &&
+            pos != scratch->remoe.last_pos + 1u) {
+            memset(scratch->remoe.prev_valid, 0,
+                   (size_t)DS4_N_LAYER * sizeof(uint8_t));
+        }
+        scratch->remoe.suppress =
+            scratch->remoe.have_pos && token == scratch->remoe.prev_token;
+        scratch->remoe.prev_token = token;
+        scratch->remoe.have_pos = true;
+        scratch->remoe.last_pos = pos;
+    }
     layer_routed_moe_one_prealloc(scratch->ffn_moe,
                                   model,
                                   layer,
@@ -14190,7 +14359,8 @@ static void layer_ffn_one_decode_scratch(
                                   scratch->routed_q8_xq,
                                   scratch->routed_q8_xscale,
                                   scratch->routed_q8_midq,
-                                  scratch->routed_q8_midscale);
+                                  scratch->routed_q8_midscale,
+                                  &scratch->remoe);
     if (profile) t_routed = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -14331,7 +14501,7 @@ static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
                                       routed_q8_xq,
                                       routed_q8_xscale,
                                       routed_q8_midq,
-                                      routed_q8_midscale);
+                                  routed_q8_midscale, NULL);
     }
 
     free(routed_q8_midscale);
@@ -14467,7 +14637,7 @@ static void layer_ffn_shared_batch(
                                           routed_q8_xq,
                                           routed_q8_xscale,
                                           routed_q8_midq,
-                                          routed_q8_midscale);
+                                  routed_q8_midscale, NULL);
         }
     }
     if (profile) t_routed = now_sec() - t0;
@@ -14774,6 +14944,18 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->routed_q8_midq = xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u);
     scratch->routed_q8_midscale = xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(float));
 
+    /* DS4_REMOE_REUSE state (allocated unconditionally; ~4.2 MiB). */
+    scratch->remoe.gate = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    scratch->remoe.up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    scratch->remoe.mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    scratch->remoe.down = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    scratch->remoe.swap = xmalloc((size_t)DS4_MAX_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    scratch->remoe.prev_down = xmalloc((size_t)DS4_N_LAYER * DS4_MAX_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    scratch->remoe.prev_sel = xmalloc((size_t)DS4_N_LAYER * DS4_MAX_EXPERT_USED * sizeof(int32_t));
+    scratch->remoe.prev_w = xmalloc((size_t)DS4_N_LAYER * DS4_MAX_EXPERT_USED * sizeof(float));
+    scratch->remoe.prev_valid = xmalloc((size_t)DS4_N_LAYER * sizeof(uint8_t));
+    memset(scratch->remoe.prev_valid, 0, (size_t)DS4_N_LAYER * sizeof(uint8_t));
+
     scratch->q8_xq = xmalloc((size_t)q8_blocks * 32u);
     scratch->q8_xscale = xmalloc((size_t)q8_blocks * sizeof(float));
 
@@ -14787,6 +14969,15 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
 
 static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     if (!scratch) return;
+    free(scratch->remoe.prev_valid);
+    free(scratch->remoe.prev_w);
+    free(scratch->remoe.prev_sel);
+    free(scratch->remoe.prev_down);
+    free(scratch->remoe.swap);
+    free(scratch->remoe.down);
+    free(scratch->remoe.mid);
+    free(scratch->remoe.up);
+    free(scratch->remoe.gate);
     free(scratch->output_norm);
     free(scratch->output_embd);
     free(scratch->output_weights);
@@ -16178,7 +16369,7 @@ static void layer_forward_raw_swa_one(
     if (profile) t_post = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
-    layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
+    layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token, pos,
                                  steering_dirs, steering_ffn_scale, scratch);
     if (profile) t_ffn = now_sec() - t0;
 
@@ -30020,7 +30211,7 @@ static void metal_graph_trace_layer_stages(
                                   routed_q8_xq,
                                   routed_q8_xscale,
                                   routed_q8_midq,
-                                  routed_q8_midscale);
+                                  routed_q8_midscale, NULL);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
@@ -30263,7 +30454,7 @@ static int metal_graph_decode_test(
                                   routed_q8_xq,
                                   routed_q8_xscale,
                                   routed_q8_midq,
-                                  routed_q8_midscale);
+                                  routed_q8_midscale, NULL);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);

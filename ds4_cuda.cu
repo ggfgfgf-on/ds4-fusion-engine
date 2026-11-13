@@ -1063,10 +1063,58 @@ static const char *cuda_pinned_register(const void *model_map,
             (double)g_pinned_bytes_total / 1073741824.0);
     return (const char *)dev + ((uintptr_t)host_addr - (uintptr_t)reg_addr);
 }
+static struct {
+    uint64_t offset;
+    uint64_t bytes;
+    char    *dev;
+} g_router_delta[128];
+static int g_router_delta_n = 0;
+
+extern "C" int ds4_gpu_install_router_delta(const void *host_data,
+                                            uint64_t offset,
+                                            uint64_t bytes) {
+    if (!host_data || bytes == 0 || g_router_delta_n >= 128 ||
+        g_n_gpus <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < g_router_delta_n; i++) {
+        if (g_router_delta[i].offset == offset) return 1;
+    }
+    void *dev = NULL;
+    int prev = -1;
+    (void)cudaGetDevice(&prev);
+    if (cudaSetDevice(g_gpu[0].device_id) != cudaSuccess) return 0;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err == cudaSuccess) {
+        err = cudaMemcpy(dev, host_data, (size_t)bytes,
+                         cudaMemcpyHostToDevice);
+    }
+    if (err != cudaSuccess && dev) {
+        (void)cudaFree(dev);
+        dev = NULL;
+    }
+    if (prev >= 0) (void)cudaSetDevice(prev);
+    if (!dev) return 0;
+    g_router_delta[g_router_delta_n].offset = offset;
+    g_router_delta[g_router_delta_n].bytes = bytes;
+    g_router_delta[g_router_delta_n].dev = (char *)dev;
+    g_router_delta_n++;
+    return 1;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const uint64_t end = offset + bytes;
     if (end < offset) return NULL;
+    /* Router-delta override (DS4_ROUTER_DELTA): exact-offset entries win
+     * over the model range cache so prefill routes with the trained
+     * weights. */
+    for (int i = 0; i < g_router_delta_n; i++) {
+        if (g_router_delta[i].offset == offset &&
+            g_router_delta[i].bytes >= bytes) {
+            return g_router_delta[i].dev;
+        }
+    }
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];

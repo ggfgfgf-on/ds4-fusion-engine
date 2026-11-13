@@ -509,6 +509,9 @@ void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t);
 uint64_t ds4_gpu_free_bytes(void);
 /* Windows stage-read LRU: reset the per-prefill page bitmap. */
 void ds4_gpu_stage_lru_reset(void);
+/* DS4_ROUTER_DELTA: install a per-layer router weight override on device. */
+int ds4_gpu_install_router_delta(const void *host_data,
+                                 uint64_t offset, uint64_t bytes);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

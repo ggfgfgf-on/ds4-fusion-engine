@@ -3801,11 +3801,88 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 #endif
 #endif
 
+/* Zero-copy large-page views (DS4_LARGE_PAGES): SEC_LARGE_PAGES file mappings
+ * for the small per-layer tensors, overriding tensor_data with the view
+ * pointers.  Direct-mapped table keyed by the tensor's file offset. */
+#define DS4_LP_SLOTS 2048
+typedef struct { uint64_t off; const uint8_t *data; } ds4_lp_entry;
+static ds4_lp_entry g_lp[DS4_LP_SLOTS];
+
+static void ds4_lp_register(uint64_t off, const uint8_t *data) {
+    ds4_lp_entry *e = &g_lp[(off >> 12) & (DS4_LP_SLOTS - 1)];
+    e->off = off;
+    e->data = data;
+}
+
+/* Router-delta sidecar override (DS4_ROUTER_DELTA, ReMoE Part 1): the
+ * trainer writes per-layer replacement router weights; the loader registers
+ * them keyed by the router tensor's abs_offset so tensor_data returns the
+ * delta buffer instead of the GGUF payload.  Original model file untouched. */
+#define DS4_RD_SLOTS 128
+typedef struct { uint64_t off; const uint8_t *data; } ds4_rd_entry;
+static ds4_rd_entry g_rd[DS4_RD_SLOTS];
+static int g_rd_n = 0;
+
+static void ds4_router_delta_register(uint64_t off, const uint8_t *data) {
+    if (g_rd_n < DS4_RD_SLOTS) {
+        g_rd[g_rd_n].off = off;
+        g_rd[g_rd_n].data = data;
+        g_rd_n++;
+    }
+}
+
 /* Return the in-place tensor payload inside the mapped GGUF. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset)
         ds4_die("tensor is outside the mapped weights; Engram requires disk row reads");
-    return m->map + t->abs_offset;
+    const uint64_t off = t->abs_offset;
+    for (int i = 0; i < g_rd_n; i++) {
+        if (g_rd[i].off == off) return g_rd[i].data;
+    }
+    ds4_lp_entry *e = &g_lp[(off >> 12) & (DS4_LP_SLOTS - 1)];
+    if (e->off == off) return e->data;
+    return m->map + off;
+}
+
+static int ds4_router_delta_load_from_env(ds4_engine *e) {
+    const char *path = getenv("DS4_ROUTER_DELTA");
+    if (!path || !path[0]) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "ds4: router delta open failed: %s\n", path);
+        return -1;
+    }
+    char magic[9] = {0};
+    uint32_t n = 0;
+    if (fread(magic, 1, 8, f) != 8 || strcmp(magic, "DS4RD001") != 0 ||
+        fread(&n, 4, 1, f) != 1 || n == 0 || n > DS4_RD_SLOTS) {
+        fclose(f);
+        fprintf(stderr, "ds4: router delta header invalid: %s\n", path);
+        return -1;
+    }
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t off = 0;
+        uint32_t nf = 0;
+        if (fread(&off, 8, 1, f) != 1 || fread(&nf, 4, 1, f) != 1 ||
+            nf == 0 || nf > (64u << 20) / 4u) {
+            break;
+        }
+        float *buf = xmalloc((size_t)nf * sizeof(float));
+        if (fread(buf, sizeof(float), nf, f) != nf) {
+            free(buf);
+            break;
+        }
+        ds4_router_delta_register(off, (const uint8_t *)buf);
+#ifndef DS4_NO_GPU
+        ds4_gpu_install_router_delta(buf, off, (uint64_t)nf * sizeof(float));
+#endif
+        loaded++;
+    }
+    fclose(f);
+    fprintf(stderr, "ds4: router delta loaded %u/%u entries (%s)\n",
+            loaded, n, path);
+    return loaded == n ? 0 : -1;
 }
 
 /* Optional startup pass that touches tensor pages before timing generation. */
@@ -76323,6 +76400,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (!opt->inspect_only) {
         ds4_engine_print_startup_memory(e, opt->context_size);
     }
+    /* Router-delta sidecar (DS4_ROUTER_DELTA): after backend init so both
+     * the CPU tensor_data override and the GPU weight resolver apply. */
+    if (ds4_router_delta_load_from_env(e) != 0) {
+        fprintf(stderr,
+                "ds4: router delta load failed; continuing with the "
+                "original router\n");
+    }
     *out = e;
     return 0;
 }
@@ -78274,6 +78358,96 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
     }
     return 0;
 #endif
+}
+
+static void ds4_large_pages_setup(const ds4_model *m, const ds4_weights *w) {
+#if defined(_WIN32)
+    HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+        TOKEN_PRIVILEGES tp;
+        LUID luid;
+        if (LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            BOOL adj = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
+            fprintf(stderr, "ds4: AdjustTokenPrivileges=%d err=%lu\n",
+                    (int)adj, (unsigned long)GetLastError());
+        }
+        CloseHandle(tok);
+    }
+
+    const uint64_t page = GetLargePageMinimum();
+    HANDLE hFile = (HANDLE)_get_osfhandle(m->fd);
+    uint64_t mapped = 0, failed = 0, copied = 0;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *tensors[4] = {
+            w->layer[il].attn_compressor_kv,
+            w->layer[il].attn_compressor_gate,
+            w->layer[il].indexer_compressor_kv,
+            w->layer[il].indexer_compressor_gate,
+        };
+        for (uint32_t k = 0; k < 4; k++) {
+            const ds4_tensor *t = tensors[k];
+            if (!t || t->ndim != 2) continue;
+            const uint64_t off = t->abs_offset;
+            const uint64_t size = (uint64_t)t->dim[0] * t->dim[1] * 2u; /* F16 */
+            const uint64_t start = off & ~(page - 1);
+            const uint64_t end = (off + size + page - 1) & ~(page - 1);
+            const uint64_t vlen = end - start;
+            HANDLE hSec = CreateFileMapping(hFile, NULL,
+                                            PAGE_READONLY | SEC_LARGE_PAGES,
+                                            (DWORD)(vlen >> 32), (DWORD)vlen, NULL);
+            if (!hSec) {
+                failed++;
+                if (failed <= 3) {
+                    fprintf(stderr, "ds4: large-page CreateFileMapping err=%lu vlen=%llu off=%llu\n",
+                            (unsigned long)GetLastError(),
+                            (unsigned long long)vlen, (unsigned long long)off);
+                }
+                /* Fallback: the GGUF's size is not a multiple of the large
+                 * page, so SEC_LARGE_PAGES views fail (err 87).  Copy the
+                 * tensor into large-page anonymous memory instead: same
+                 * bytes, same TLB benefit, +one-time locked memory. */
+                void *buf = VirtualAlloc(NULL, (SIZE_T)vlen,
+                                         MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                         PAGE_READWRITE);
+                if (buf) {
+                    memcpy(buf, m->map + off, (size_t)size);
+                    ds4_lp_register(off, (const uint8_t *)buf);
+                    copied++;
+                } else {
+                    if (failed <= 3) {
+                        fprintf(stderr, "ds4: large-page alloc err=%lu vlen=%llu\n",
+                                (unsigned long)GetLastError(), (unsigned long long)vlen);
+                    }
+                }
+                continue;
+            }
+            void *view = MapViewOfFile(hSec, FILE_MAP_READ,
+                                       (DWORD)(start >> 32), (DWORD)start,
+                                       (SIZE_T)vlen);
+            CloseHandle(hSec);
+            if (!view) {
+                failed++;
+                if (failed <= 3) {
+                    fprintf(stderr, "ds4: large-page MapViewOfFile err=%lu start=%llu vlen=%llu\n",
+                            (unsigned long)GetLastError(),
+                            (unsigned long long)start, (unsigned long long)vlen);
+                }
+                continue;
+            }
+            ds4_lp_register(off, (const uint8_t *)view + (off - start));
+            mapped++;
+        }
+    }
+    fprintf(stderr, "ds4: large-page views mapped=%llu copied=%llu failed=%llu page=%llu\n",
+            (unsigned long long)mapped, (unsigned long long)copied,
+            (unsigned long long)failed, (unsigned long long)page);
+#endif
+    (void)m;
+    (void)w;
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -82262,6 +82436,13 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      errlen);
     }
     if (ds4_session_is_cpu(s)) {
+        static bool g_lp_setup_done = false;
+        if (!g_lp_setup_done) {
+            g_lp_setup_done = true;
+            if (getenv("DS4_LARGE_PAGES") != NULL) {
+                ds4_large_pages_setup(&s->engine->model, &s->engine->weights);
+            }
+        }
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,

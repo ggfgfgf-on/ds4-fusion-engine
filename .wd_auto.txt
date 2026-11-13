@@ -1,1 +1,1 @@
-watchdog armed: pid=31764 sharedThreshold=24 GiB totalThreshold=40 GiB maxMinutes=20
+[16:50:43] ENDED process exited; last shared=0 MiB dedicated=0 MiB

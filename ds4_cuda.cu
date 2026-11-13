@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <atomic>
+#include <mutex>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,12 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#include <pdh.h>
+#include <pdhmsg.h> /* PDH_MORE_DATA / PDH_INVALID_DATA (pdh.h does not pull it in) */
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -2559,6 +2566,184 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return gb * 1073741824ull;
 }
 
+/* WDDM shared-pool-aware arena headroom: keep at least this much of the
+ * shared pool free for DWM/OS.  The DXGI NON_LOCAL segment's Budget is
+ * the true shared-pool commit limit and CurrentUsage is the live usage,
+ * so the check is re-evaluated per allocation and other GPU consumers are
+ * accounted for automatically.  (cudaMemGetInfo cannot be used here: on
+ * WDDM it reports the dedicated segment only and the shared pool stays
+ * invisible.)  DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=0 disables the check and
+ * restores the certified unlimited behaviour. */
+static uint64_t cuda_model_arena_headroom_bytes(void) {
+    static uint64_t cached = 0;
+    static int cached_done = 0;
+    if (cached_done) return cached;
+    cached_done = 1;
+    uint64_t headroom = 8ull << 30; /* default 8 GiB */
+    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env) {
+            if (v > 4095ull) v = 4095ull; /* clamp: no <<30 overflow */
+            headroom = (uint64_t)v << 30;
+        }
+    }
+    if (headroom > 0) {
+        fprintf(stderr,
+                "ds4: CUDA weight arena shared-pool cap: keep >= %.1f GiB of "
+                "the WDDM shared pool free for DWM/OS "
+                "(DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=%llu, 0=off)\n",
+                (double)headroom / 1073741824.0,
+                (unsigned long long)(headroom >> 30));
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA weight arena shared-pool cap DISABLED "
+                "(DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=0)\n");
+    }
+    return cached = headroom;
+}
+
+/* WDDM shared-pool (NON_LOCAL segment) budget for the CUDA device's adapter.
+ * Returns 1 and fills budget/usage on success; 0 when the query is
+ * unavailable (then the caller disables the cap = certified behaviour). */
+static int cuda_wddm_shared_pool_info(uint64_t *budget_out, uint64_t *usage_out) {
+#if !defined(_WIN32)
+    (void)budget_out;
+    (void)usage_out;
+    return 0;
+#else
+    static int init_done = 0;
+    static int have_adapter = 0;
+    static IDXGIAdapter3 *g_dxgi_adapter3 = NULL;
+    if (!init_done) {
+        init_done = 1;
+        int dev = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        /* CUDA 13 has no cudaDeviceGetLuid: the WDDM LUID lives in
+         * cudaDeviceProp.luid (8 bytes, zero on non-WDDM adapters). */
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+            return 0;
+        }
+        IDXGIFactory1 *factory = NULL;
+        HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                        (void **)&factory);
+        if (FAILED(hr) || !factory) return 0;
+        IDXGIAdapter1 *adapter = NULL;
+        for (UINT idx = 0;
+             factory->EnumAdapters1(idx, &adapter) != DXGI_ERROR_NOT_FOUND;
+             idx++) {
+            DXGI_ADAPTER_DESC1 desc;
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+                memcmp(prop.luid, &desc.AdapterLuid, 8u) == 0) {
+                IDXGIAdapter3 *a3 = NULL;
+                if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                                      (void **)&a3))) {
+                    g_dxgi_adapter3 = a3;
+                    have_adapter = 1;
+                }
+                adapter->Release();
+                break;
+            }
+            adapter->Release();
+        }
+        factory->Release();
+        if (!have_adapter) {
+            fprintf(stderr,
+                    "ds4: CUDA weight arena shared-pool cap unavailable "
+                    "(no DXGI adapter matched the CUDA device LUID); "
+                    "arena growth uncapped\n");
+        }
+    }
+    if (!have_adapter || !g_dxgi_adapter3) return 0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    memset(&info, 0, sizeof(info));
+    if (FAILED(g_dxgi_adapter3->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+        static int qfail_logged = 0;
+        if (!qfail_logged) {
+            qfail_logged = 1;
+            fprintf(stderr,
+                    "ds4: CUDA weight arena shared-pool query failed "
+                    "(QueryVideoMemoryInfo error); arena growth uncapped\n");
+        }
+        return 0;
+    }
+    if (info.Budget == 0) return 0;
+    static int budget_logged = 0;
+    if (!budget_logged) {
+        budget_logged = 1;
+        fprintf(stderr,
+                "ds4: WDDM shared-pool budget %.2f GiB\n",
+                (double)info.Budget / 1073741824.0);
+    }
+    *budget_out = (uint64_t)info.Budget;
+    *usage_out = (uint64_t)info.CurrentUsage;
+    return 1;
+#endif
+}
+
+/* Global shared-pool (non-local segment) usage across every process and
+ * adapter, read from the KMD perf counter "GPU Non Local Adapter Memory".
+ * This is the number that actually matters for the freeze: CUDA's WDDM spill
+ * shows up here, while DXGI's per-process CurrentUsage (above) stays ~0 for
+ * a CUDA-only process.  Returns 1 and fills usage_out; 0 when the counter is
+ * unavailable (the caller then disables the cap = certified behaviour). */
+static int cuda_wddm_global_shared_usage_bytes(uint64_t *usage_out) {
+#if !defined(_WIN32)
+    (void)usage_out;
+    return 0;
+#else
+    static std::mutex g_pdh_mutex;
+    static PDH_HQUERY g_pdh_query = NULL;
+    static PDH_HCOUNTER g_pdh_counter = NULL;
+    static int g_pdh_state = -1; /* -1 uninitialized, 0 failed, 1 ready */
+    std::lock_guard<std::mutex> lock(g_pdh_mutex);
+    if (g_pdh_state == -1) {
+        PDH_STATUS st = PdhOpenQueryW(NULL, 0, &g_pdh_query);
+        if (st == ERROR_SUCCESS) {
+            st = PdhAddEnglishCounterW(
+                g_pdh_query,
+                L"\\GPU Non Local Adapter Memory(*)\\Non Local Usage",
+                0, &g_pdh_counter);
+        }
+        if (st != ERROR_SUCCESS) {
+            fprintf(stderr,
+                    "ds4: shared-pool usage counter unavailable "
+                    "(Pdh status 0x%lX); arena cap disabled\n",
+                    (unsigned long)st);
+            g_pdh_state = 0;
+            return 0;
+        }
+        g_pdh_state = 1;
+    }
+    if (g_pdh_state != 1) return 0;
+    PDH_STATUS st = PdhCollectQueryData(g_pdh_query);
+    if (st != ERROR_SUCCESS && st != PDH_INVALID_DATA) return 0;
+    Sleep(10);
+    st = PdhCollectQueryData(g_pdh_query);
+    if (st != ERROR_SUCCESS && st != PDH_INVALID_DATA) return 0;
+    DWORD buf_size = 0, item_count = 0;
+    st = PdhGetFormattedCounterArray(g_pdh_counter, PDH_FMT_LARGE,
+                                     &buf_size, &item_count, NULL);
+    if (st != PDH_MORE_DATA || item_count == 0) return 0;
+    std::vector<uint8_t> buf(buf_size);
+    PDH_FMT_COUNTERVALUE_ITEM *items =
+        (PDH_FMT_COUNTERVALUE_ITEM *)buf.data();
+    st = PdhGetFormattedCounterArray(g_pdh_counter, PDH_FMT_LARGE,
+                                     &buf_size, &item_count, items);
+    if (st != ERROR_SUCCESS) return 0;
+    uint64_t total = 0;
+    for (DWORD i = 0; i < item_count; i++) {
+        total += (uint64_t)items[i].FmtValue.largeValue;
+    }
+    *usage_out = total;
+    return 1;
+#endif
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */
@@ -2788,6 +2973,47 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     }
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+
+    /* Shared-pool-aware hard cap: never let an arena chunk eat into the
+     * WDDM shared-pool headroom reserved for DWM/OS.  Budget comes from the
+     * DXGI NON_LOCAL segment; live usage from the KMD global non-local
+     * counter (which is the only source that includes CUDA's spill).
+     * Checked against the real chunk size so chunk granularity cannot
+     * overshoot the reserve. */
+    const uint64_t headroom = cuda_model_arena_headroom_bytes();
+    if (headroom > 0) {
+        uint64_t budget = 0, dxgi_usage = 0;
+        uint64_t shared_used = 0;
+        if (cuda_wddm_shared_pool_info(&budget, &dxgi_usage) &&
+            cuda_wddm_global_shared_usage_bytes(&shared_used)) {
+            if (shared_used > budget ||
+                chunk > budget - shared_used ||
+                budget - shared_used < headroom + chunk) {
+                if ((cuda_model_arena_lru_enabled() || g_arena_prefill_mode) &&
+                    cuda_model_arena_lru_make_room(aligned)) {
+                    char *hole_ptr = cuda_model_arena_hole_carve(aligned);
+                    if (hole_ptr) return hole_ptr;
+                }
+                static int headroom_warned = 0;
+                if (!headroom_warned) {
+                    headroom_warned = 1;
+                    fprintf(stderr,
+                            "ds4: CUDA model arena budget exhausted: shared "
+                            "pool has %.2f GiB free (budget %.2f GiB, used "
+                            "%.2f GiB) but %.1f GiB DWM headroom must stay "
+                            "free (chunk %.2f MiB); arena growth stopped for "
+                            "this run\n",
+                            (double)(budget - shared_used) / 1073741824.0,
+                            (double)budget / 1073741824.0,
+                            (double)shared_used / 1073741824.0,
+                            (double)headroom / 1073741824.0,
+                            (double)chunk / 1048576.0);
+                }
+                g_model_cache_full = 1;
+                return NULL;
+            }
+        }
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {

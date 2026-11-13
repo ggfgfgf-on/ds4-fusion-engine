@@ -535,6 +535,10 @@ int ds4_gpu_matmul_q8_0_exact_tensor(
 int ds4_gpu_cuda_ready(void);
 /* Deferred per-layer sync: join the pending end-commands event. */
 int ds4_gpu_join_pending_commands(void);
+/* DFC lossless sidecar: map <model>.dfc for env-gated decompression and
+ * compress a file into a sidecar (ds4 tool entry). */
+int ds4_gpu_set_model_dfc(const char *model_path);
+int ds4_dfc_compress_file(const char *in_path, const char *out_path);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

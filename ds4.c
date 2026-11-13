@@ -76824,6 +76824,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* DFC sidecar decompression (default OFF; env + sidecar required) */
+        (void)ds4_gpu_set_model_dfc(opt->model_path);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
             !load_slice && !tp_shard && !e->ssd_streaming && !ds4_model_is_qwen4()) {

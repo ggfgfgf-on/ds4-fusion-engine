@@ -644,6 +644,403 @@ static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
 
+/* ================= DFC lossless sidecar compression =================
+ * Block-wise canonical Huffman (byte symbols, 256 KiB blocks). Sidecar
+ * layout: magic(8) | u64 orig_size | u32 block_size | u32 num_blocks |
+ * u32 reserved | per-block entries (u32 packed_size, u8 cflag, payload) |
+ * u64 index[num_blocks+1] of payload offsets. cflag=1: payload =
+ * [256 lens bytes][bitstream]; cflag=0: raw bytes. Blocks that do not
+ * shrink are stored raw, so quantized models pass through untouched.
+ * Decompression is env-gated (DS4_CUDA_MODEL_DECOMPRESS=1, default OFF);
+ * the GGUF file itself is never modified. */
+#define DS4_DFC_MAGIC "DS4DFC1\n"
+#define DS4_DFC_BLOCK (256u * 1024u)
+
+/* Canonical Huffman from 256 code lengths: encoder code_by_sym[] and
+ * decoder slots (slot_sym[] sorted by code, first[]/idx[] per length). */
+static void ds4_dfc_derive(const uint8_t lens[256],
+                           uint32_t code_by_sym[256],
+                           uint32_t first[34], uint32_t idx[34],
+                           uint8_t slot_sym[256], uint32_t *slot_count) {
+    uint32_t bl[33];
+    memset(bl, 0, sizeof(bl));
+    uint32_t maxlen = 0;
+    for (uint32_t s = 0; s < 256; s++) {
+        if (lens[s]) { bl[lens[s]]++; if (lens[s] > maxlen) maxlen = lens[s]; }
+    }
+    uint32_t code = 0;
+    for (uint32_t l = 1; l <= maxlen; l++) {
+        code = (code + bl[l - 1u]) << 1u;
+        first[l] = code;
+    }
+    uint32_t next_code[34];
+    memcpy(next_code, first, sizeof(next_code));
+    memset(idx, 0, sizeof(uint32_t) * 34);
+    uint32_t slot = 0;
+    for (uint32_t l = 1; l <= maxlen; l++) {
+        idx[l] = slot;
+        for (uint32_t s = 0; s < 256; s++) {
+            if (lens[s] == l) {
+                code_by_sym[s] = next_code[l]++;
+                slot_sym[slot++] = (uint8_t)s;
+            }
+        }
+    }
+    /* counts for lengths above maxlen must read back as exactly 0 */
+    for (uint32_t l = maxlen + 1u; l <= 33u; l++) idx[l] = slot;
+    *slot_count = slot;
+}
+
+/* Huffman length assignment from counts: O(n^2) merge, n <= 256. */
+static void ds4_dfc_build_lens(const uint32_t cnt[256], uint8_t lens[256]) {
+    uint32_t freq[511], parent[511];
+    uint8_t sym_of[256];
+    memset(parent, 0, sizeof(parent));
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < 256; s++) {
+        if (cnt[s]) { freq[n] = cnt[s]; sym_of[n] = (uint8_t)s; n++; }
+    }
+    memset(lens, 0, 256);
+    if (n == 0) return;
+    if (n == 1) { lens[sym_of[0]] = 1; return; }
+    const uint32_t nodes = 2u * n - 1u;
+    for (uint32_t i = n; i < nodes; i++) {
+        uint32_t m1 = UINT32_MAX, m2 = UINT32_MAX, i1 = 0, i2 = 0;
+        for (uint32_t j = 0; j < i; j++) {
+            if (parent[j]) continue;
+            if (freq[j] < m1) { m2 = m1; i2 = i1; m1 = freq[j]; i1 = j; }
+            else if (freq[j] < m2) { m2 = freq[j]; i2 = j; }
+        }
+        freq[i] = m1 + m2;
+        parent[i1] = i + 1u;
+        parent[i2] = i + 1u;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t len = 0, node = i;
+        while (parent[node]) { len++; node = parent[node] - 1u; }
+        lens[sym_of[i]] = (uint8_t)len;
+    }
+}
+
+static const uint8_t *g_dfc_map = NULL;
+static uint64_t g_dfc_map_size = 0;
+static uint32_t g_dfc_num_blocks = 0;
+static const uint64_t *g_dfc_index = NULL;
+static const uint8_t *g_dfc_payload = NULL;
+
+/* Decompress the blocks covering [offset, offset+bytes) into dst (dst must
+ * hold `bytes`); returns 1 on success. */
+static int ds4_dfc_read_range(uint8_t *dst, uint64_t offset, uint64_t bytes) {
+    if (!g_dfc_map || bytes == 0) return 0;
+    const uint64_t orig_size = *(const uint64_t *)(g_dfc_map + 8);
+    if (offset > orig_size || bytes > orig_size - offset) return 0;
+    const uint32_t bs = DS4_DFC_BLOCK;
+    uint32_t b0 = (uint32_t)(offset / bs);
+    uint32_t b1 = (uint32_t)((offset + bytes - 1u) / bs);
+    if (b1 >= g_dfc_num_blocks) b1 = g_dfc_num_blocks - 1u;
+    for (uint32_t b = b0; b <= b1; b++) {
+        const uint64_t poff = g_dfc_index[b];
+        const uint64_t nxt = g_dfc_index[b + 1u];
+        if (poff > nxt || nxt > g_dfc_map_size) return 0;
+        const uint8_t *ent = g_dfc_payload + poff;
+        const uint32_t packed = *(const uint32_t *)ent;
+        if (packed < 5u || packed > nxt - poff) return 0;
+        const uint8_t cflag = ent[4];
+        const uint8_t *data = ent + 5;
+        const uint64_t bstart = (uint64_t)b * bs;
+        uint64_t blen = orig_size - bstart;
+        if (blen > bs) blen = bs;
+        uint8_t *bout = dst + (bstart >= offset ? bstart - offset : 0);
+        const uint64_t skip = offset > bstart ? offset - bstart : 0;
+        /* window of this block that belongs to the requested range */
+        const uint64_t rend = (b == b1) ? (offset + bytes - bstart) : blen;
+        if (rend > blen) return 0;
+        if (cflag) {
+            /* decode [256 lens][bitstream] -> block */
+            if (packed < 5u + 256u) return 0;
+            uint32_t code_by_sym[256], first[34], idx[34], slot_count = 0;
+            uint8_t slot_sym[256];
+            uint32_t lens[256];
+            memcpy(lens, data, 256);
+            ds4_dfc_derive((const uint8_t *)lens, code_by_sym, first, idx,
+                           slot_sym, &slot_count);
+            if (slot_count == 0) return 0;
+            const uint8_t *bits = data + 256;
+            const uint32_t bitbytes = packed - 5u - 256u;
+            uint64_t bitbuf = 0;
+            uint32_t bitcnt = 0, bp = 0, out = 0;
+            while (out < blen) {
+                while (bitcnt < 32 && bp < bitbytes) {
+                    bitbuf = (bitbuf << 8) | (uint64_t)bits[bp];
+                    bitcnt += 8;
+                    bp++;
+                }
+                if (bitcnt == 0) return 0;
+                /* MSB-first packing: the next code is the top l bits */
+                uint32_t symbol = 0;
+                int found = 0;
+                for (uint32_t l = 1; l <= 32 && !found; l++) {
+                    const uint32_t cnt_l = idx[l + 1u] - idx[l];
+                    if (cnt_l && bitcnt >= l) {
+                        const uint32_t code_l = (uint32_t)(
+                            (bitbuf >> (bitcnt - l)) & ((1ull << l) - 1ull));
+                        if (code_l >= first[l] && code_l - first[l] < cnt_l) {
+                            symbol = slot_sym[idx[l] + (code_l - first[l])];
+                            bitcnt -= l;
+                            found = 1;
+                        }
+                    }
+                }
+                if (!found) return 0;
+                if (out >= skip && out < rend) {
+                    bout[out - skip] = (uint8_t)symbol;
+                }
+                out++;
+            }
+        } else {
+            if (packed < blen + 5u) return 0;
+            memcpy(bout, data + skip, (size_t)(rend - skip));
+        }
+    }
+    return 1;
+}
+
+static int ds4_dfc_map_sidecar(const char *model_path);
+
+extern "C" int ds4_dfc_compress_file(const char *in_path, const char *out_path) {
+    if (!in_path || !out_path) return 0;
+    FILE *fin = fopen(in_path, "rb");
+    if (!fin) return 0;
+    if (fseeko(fin, 0, SEEK_END) != 0) { fclose(fin); return 0; }
+    const uint64_t orig_size = (uint64_t)ftello(fin);
+    rewind(fin);
+    FILE *fout = fopen(out_path, "wb");
+    if (!fout) { fclose(fin); return 0; }
+    const uint32_t bs = DS4_DFC_BLOCK;
+    const uint32_t num_blocks = (uint32_t)((orig_size + bs - 1u) / bs);
+    uint64_t header[2] = { orig_size, 0 };
+    uint32_t hdr[3] = { bs, num_blocks, 0 };
+    fwrite(DS4_DFC_MAGIC, 1, 8, fout);
+    fwrite(header, sizeof(header), 1, fout);
+    fwrite(hdr, sizeof(hdr), 1, fout);
+    std::vector<uint64_t> index(num_blocks + 1u, 0);
+    uint8_t *raw = (uint8_t *)malloc(bs);
+    uint8_t *packed = (uint8_t *)malloc(bs + bs / 2u + 1024u);
+    if (!raw || !packed) { free(raw); free(packed); fclose(fin); fclose(fout); return 0; }
+    uint64_t saved = 0, incompressible = 0;
+    for (uint32_t b = 0; b < num_blocks; b++) {
+        const uint64_t off = (uint64_t)b * bs;
+        uint64_t len = orig_size - off;
+        if (len > bs) len = bs;
+        if (fread(raw, 1, (size_t)len, fin) != (size_t)len) {
+            free(raw); free(packed); fclose(fin); fclose(fout); return 0;
+        }
+        uint32_t cnt[256];
+        memset(cnt, 0, sizeof(cnt));
+        for (uint64_t i = 0; i < len; i++) cnt[raw[i]]++;
+        uint8_t lens[256];
+        ds4_dfc_build_lens(cnt, lens);
+        uint32_t maxl = 0;
+        for (uint32_t s = 0; s < 256; s++) {
+            if (lens[s] > maxl) maxl = lens[s];
+        }
+        /* pathological tree (needs >32-bit codes): store raw */
+        if (maxl > 32) {
+            *(uint32_t *)packed = (uint32_t)(len + 5u);
+            packed[4] = 0;
+            fwrite(packed, 1, 5, fout);
+            fwrite(raw, 1, (size_t)len, fout);
+            incompressible++;
+            index[b + 1u] = (uint64_t)ftello(fout) - 36u;
+            continue;
+        }
+        uint32_t code_by_sym[256], first[34], idx[34], slot_count = 0;
+        uint8_t slot_sym[256];
+        ds4_dfc_derive(lens, code_by_sym, first, idx, slot_sym, &slot_count);
+        /* bound the encoded size before touching the buffer; encode only
+         * when the block actually shrinks */
+        uint64_t total_bits = 0;
+        for (uint32_t s = 0; s < 256; s++) {
+            total_bits += (uint64_t)cnt[s] * lens[s];
+        }
+        const uint32_t enc_size = 5u + 256u + (uint32_t)((total_bits + 7u) / 8u);
+        if (enc_size >= len) {
+            *(uint32_t *)packed = (uint32_t)(len + 5u);
+            packed[4] = 0;
+            fwrite(packed, 1, 5, fout);
+            fwrite(raw, 1, (size_t)len, fout);
+            incompressible++;
+            index[b + 1u] = (uint64_t)ftello(fout) - 36u;
+            continue;
+        }
+        /* encode (MSB-first canonical packing) */
+        memcpy(packed + 5, lens, 256);
+        uint64_t bitbuf = 0;
+        uint32_t bitcnt = 0;
+        uint32_t ob = 5 + 256;
+        for (uint64_t i = 0; i < len; i++) {
+            const uint32_t c = code_by_sym[raw[i]];
+            const uint32_t l = lens[raw[i]];
+            bitbuf = (bitbuf << l) | c;
+            bitcnt += l;
+            while (bitcnt >= 8) {
+                packed[ob++] = (uint8_t)(bitbuf >> (bitcnt - 8));
+                bitcnt -= 8;
+            }
+        }
+        if (bitcnt) { packed[ob++] = (uint8_t)(bitbuf << (8 - bitcnt)); }
+        const uint32_t packed_size = ob;
+        if (packed_size < len) {
+            *(uint32_t *)packed = packed_size;
+            packed[4] = 1;
+            fwrite(packed, 1, packed_size, fout);
+            saved += len - packed_size;
+        } else {
+            *(uint32_t *)packed = (uint32_t)(len + 5u);
+            packed[4] = 0;
+            fwrite(packed, 1, 5, fout);
+            fwrite(raw, 1, (size_t)len, fout);
+            incompressible++;
+        }
+        /* payload-relative offset (36-byte header excluded) */
+        index[b + 1u] = (uint64_t)ftello(fout) - 36u;
+    }
+    fwrite(index.data(), sizeof(uint64_t), num_blocks + 1u, fout);
+    fclose(fout);
+    /* Optional tool-side roundtrip check (DS4_DFC_VERIFY=1): decode every
+     * block through the same path the engine will use and compare. */
+    int verify_fail = 0;
+    if (getenv("DS4_DFC_VERIFY") != NULL) {
+        uint8_t *check = (uint8_t *)malloc(bs);
+        if (!check || !ds4_dfc_map_sidecar(in_path)) {
+            verify_fail = 1;
+        } else {
+            for (uint32_t b = 0; b < num_blocks; b++) {
+                const uint64_t off = (uint64_t)b * bs;
+                uint64_t len = orig_size - off;
+                if (len > bs) len = bs;
+                if (fseeko(fin, (off_t)off, SEEK_SET) != 0 ||
+                    fread(raw, 1, (size_t)len, fin) != (size_t)len ||
+                    !ds4_dfc_read_range(check, off, len)) {
+                    verify_fail = 1;
+                    fprintf(stderr, "ds4: DFC verify FAIL at block %u (read/decode)\n", b);
+                    break;
+                }
+                const uint8_t *a = check, *e2 = raw;
+                uint64_t d = 0;
+                while (d < len && a[d] == e2[d]) d++;
+                if (d != len) {
+                    verify_fail = 1;
+                    fprintf(stderr,
+                            "ds4: DFC verify MISMATCH block %u off %llu: got 0x%02x want 0x%02x (block cflag=%u)\n",
+                            b, (unsigned long long)d, a[d], e2[d],
+                            g_dfc_payload[g_dfc_index[b] + 4]);
+                    break;
+                }
+            }
+        }
+        free(check);
+        if (!verify_fail) {
+            /* engine-path fidelity: random misaligned, cross-block ranges */
+            uint8_t *cbuf = (uint8_t *)malloc(2u * bs);
+            uint8_t *rbuf = (uint8_t *)malloc(2u * bs);
+            if (!cbuf || !rbuf) {
+                verify_fail = 1;
+            } else {
+                for (uint32_t t = 0; t < 64 && !verify_fail; t++) {
+                    const uint64_t roff = (uint64_t)rand() % orig_size;
+                    const uint64_t rlen =
+                        1u + (uint64_t)rand() % (2u * (uint64_t)bs);
+                    const uint64_t rbytes =
+                        roff + rlen > orig_size ? orig_size - roff : rlen;
+                    if (fseeko(fin, (off_t)roff, SEEK_SET) != 0 ||
+                        fread(rbuf, 1, (size_t)rbytes, fin) != (size_t)rbytes ||
+                        !ds4_dfc_read_range(cbuf, roff, rbytes) ||
+                        memcmp(cbuf, rbuf, (size_t)rbytes) != 0) {
+                        verify_fail = 1;
+                        fprintf(stderr,
+                                "ds4: DFC range verify FAIL off %llu len %llu\n",
+                                (unsigned long long)roff,
+                                (unsigned long long)rbytes);
+                    }
+                }
+            }
+            free(cbuf);
+            free(rbuf);
+            fprintf(stderr, "ds4: DFC range verify %s\n",
+                    verify_fail ? "FAILED" : "OK");
+        }
+        fprintf(stderr, "ds4: DFC verify %s\n", verify_fail ? "FAILED" : "OK");
+    }
+    free(raw); free(packed);
+    fclose(fin);
+    fprintf(stderr,
+            "ds4: DFC sidecar written: %s (%.2f GiB -> %.2f GiB, %.1f%% kept, %u/%u blocks raw)\n",
+            out_path, (double)orig_size / 1073741824.0,
+            (double)index[num_blocks] / 1073741824.0,
+            100.0 * (double)index[num_blocks] / (double)orig_size,
+            incompressible, num_blocks);
+    return verify_fail ? 0 : 1;
+}
+
+/* Map a sidecar and install the decode globals (no env gate; the public
+ * wrapper applies the gate). */
+static int ds4_dfc_map_sidecar(const char *model_path) {
+    char side[4096];
+    if (snprintf(side, sizeof(side), "%s.dfc", model_path) >= (int)sizeof(side)) return 0;
+    FILE *f = fopen(side, "rb");
+    if (!f) return 0;
+    uint8_t magic[8];
+    uint64_t h64[2];
+    uint32_t h32[3];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, DS4_DFC_MAGIC, 8) != 0 ||
+        fread(h64, sizeof(h64), 1, f) != 1 ||
+        fread(h32, sizeof(h32), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    g_dfc_num_blocks = h32[1];
+    if (h32[0] != DS4_DFC_BLOCK || g_dfc_num_blocks == 0) { fclose(f); return 0; }
+    fseeko(f, 0, SEEK_END);
+    const uint64_t fsize = (uint64_t)ftello(f);
+    fclose(f);
+    const uint64_t idx_bytes = (uint64_t)(g_dfc_num_blocks + 1u) * 8u;
+    if (fsize < 36u + idx_bytes) return 0;
+    /* Map the whole sidecar (demand paged, like the model). */
+    int fd = open(side, O_RDONLY);
+    if (fd < 0) return 0;
+    void *m = mmap(NULL, (size_t)fsize, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return 0;
+    g_dfc_map = (const uint8_t *)m;
+    g_dfc_map_size = fsize;
+    g_dfc_index = (const uint64_t *)(g_dfc_map + fsize - idx_bytes);
+    g_dfc_payload = g_dfc_map + 36;
+    /* Validate the index (monotonic, ends at index start). */
+    for (uint32_t i = 0; i <= g_dfc_num_blocks; i++) {
+        if (g_dfc_index[i] > fsize - 36u - idx_bytes) {
+            munmap(m, (size_t)fsize);
+            g_dfc_map = NULL;
+            return 0;
+        }
+        if (i != 0 && g_dfc_index[i] < g_dfc_index[i - 1u]) {
+            munmap(m, (size_t)fsize);
+            g_dfc_map = NULL;
+            return 0;
+        }
+    }
+    fprintf(stderr,
+            "ds4: DFC decompression active (%s, %u blocks, %.2f GiB sidecar)\n",
+            side, g_dfc_num_blocks, (double)fsize / 1073741824.0);
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_model_dfc(const char *model_path) {
+    /* Default OFF: requires DS4_CUDA_MODEL_DECOMPRESS=1 AND the sidecar. */
+    if (getenv("DS4_CUDA_MODEL_DECOMPRESS") == NULL || !model_path) return 0;
+    return ds4_dfc_map_sidecar(model_path);
+}
+
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
 static const char *cuda_model_range_ptr_from_fd(
@@ -2640,6 +3037,16 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
                                      uint64_t file_size, void *stage, uint64_t stage_bytes,
                                      uint64_t offset, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
+    if (g_dfc_map != NULL && g_dfc_num_blocks != 0) {
+        if (ds4_dfc_read_range((uint8_t *)stage, offset, bytes)) {
+            return 1;
+        }
+        /* corrupted sidecar: fall through to the raw file read */
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr, "ds4: DFC read failed at %llu+%llu, falling back to raw\n",
+                    (unsigned long long)offset, (unsigned long long)bytes);
+        }
+    }
 #ifdef _WIN32
     if (g_model_nobuf_fd >= 0 && !cuda_stage_range_recent(offset, bytes)) {
         /* Cold range: sector-aligned read through the no-buffering handle so

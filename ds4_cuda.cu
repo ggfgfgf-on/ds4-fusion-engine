@@ -3204,6 +3204,311 @@ __global__ static void fp8_kv_bitq_store_rows_kernel(
     }
 }
 
+/* Dedicated dequant gather buffers.  The gather temps must NOT live in the
+ * shared tmp slab: decode launches (exact score split) allocate slab temps
+ * AFTER the gather, which would clobber the dequantized rows mid-flight. */
+static void *g_bitq_gather;
+static uint64_t g_bitq_gather_bytes;
+static void *g_bitq_comp_gather;
+static uint64_t g_bitq_comp_gather_bytes;
+static void *g_bitq_idx_gather;
+static uint64_t g_bitq_idx_gather_bytes;
+
+/* Dequant gather of a wrapped raw span [raw_start, raw_start + n_raw) of
+ * the bitq ring into a contiguous FP32 buffer (ascending absolute order:
+ * dst[r] = ring[(raw_start + r) % raw_cap]). Every ring consumer indexes
+ * rows as (raw_start + idx) % raw_cap, so running the existing kernels
+ * with raw_start' = 0, raw_cap' = n_raw over the temp reproduces the same
+ * rows in the same order. */
+__global__ static void attention_raw_gather_window_bitq_kernel(
+        float *dst, const unsigned char *ring,
+        uint32_t raw_cap, uint32_t phys_start, uint32_t n_raw,
+        uint32_t head_dim, int bits) {
+    const uint32_t n = n_raw * head_dim;
+    const uint32_t row_bytes = kv_bitq_row_bytes(head_dim, bits);
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const uint32_t row = i / head_dim;
+        const uint32_t col = i % head_dim;
+        const uint32_t phys = (phys_start + row) % raw_cap;
+        dst[i] = kv_bitq_unpack_elem(
+                ring + (uint64_t)phys * row_bytes, head_dim, col, bits);
+    }
+}
+
+static float *attention_bitq_gather_span(const ds4_gpu_tensor *ring,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_raw,
+        uint32_t head_dim, int logical_tier, const char *tag) {
+    (void)logical_tier;
+    const uint64_t bytes = (uint64_t)n_raw * head_dim * sizeof(float);
+    if (g_bitq_gather_bytes < bytes) {
+        if (g_bitq_gather) {
+            if (!cuda_ok(cudaDeviceSynchronize(),
+                         "synchronize bitq gather growth")) return NULL;
+            (void)cudaFree(g_bitq_gather);
+            g_bitq_gather = NULL;
+            g_bitq_gather_bytes = 0;
+        }
+        void *p = NULL;
+        if (cudaMalloc(&p, (size_t)bytes) != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA bitq gather alloc failed for %s (%.2f MiB)\n",
+                    tag ? tag : "?", (double)bytes / 1048576.0);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        g_bitq_gather = p;
+        g_bitq_gather_bytes = bytes;
+    }
+    float *kv = (float *)g_bitq_gather;
+    const uint32_t n = n_raw * head_dim;
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+            kv, (const unsigned char *)ring->ptr, raw_cap, raw_start, n_raw,
+            head_dim, kv_bitq_raw_bits());
+    if (!cuda_ok(cudaGetLastError(), "attention bitq span gather")) return NULL;
+    return kv;
+}
+
+/* DS4_CUDA_KV_BITQ: checkpoint payload dump.  The session payload's stable
+ * external format is FP32 raw rows in logical order; the bitq ring holds
+ * packed rows at row_bytes stride, so dequant rows [first_row,
+ * first_row + n_rows) (wrapped) into a host FP32 buffer. */
+extern "C" int ds4_gpu_bitq_dequant_rows_dump(
+        const ds4_gpu_tensor *ring, uint32_t raw_cap, uint32_t first_row,
+        uint32_t n_rows, uint32_t head_dim, int bits, float *dst) {
+    if (!ring || !dst || n_rows == 0u || raw_cap == 0u || head_dim == 0u ||
+        bits < 2 || bits > 8) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(ring);
+    const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    float *dev = (float *)cuda_tmp_alloc_on(logical_tier, bytes,
+                                            "bitq dequant dump");
+    if (!dev) return 0;
+    const uint32_t n = n_rows * head_dim;
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+            dev, (const unsigned char *)ring->ptr, raw_cap, first_row, n_rows,
+            head_dim, bits);
+    if (!cuda_ok(cudaGetLastError(), "bitq dequant dump gather")) return 0;
+    if (cudaMemcpy(dst, dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return 0;
+    }
+    return 1;
+}
+
+/* DS4_CUDA_KV_BITQ: checkpoint payload load mirror.  Pack FP32 host rows
+ * [first_row, first_row + n_rows) (logical order) into the packed ring
+ * (wrapped, row_bytes stride) -- the inverse of the payload dump. */
+extern "C" int ds4_gpu_bitq_pack_rows_upload(
+        ds4_gpu_tensor *ring, uint32_t raw_cap, uint32_t first_row,
+        uint32_t n_rows, uint32_t head_dim, int bits, const float *src) {
+    if (!ring || !src || n_rows == 0u || raw_cap == 0u || head_dim == 0u ||
+        bits < 2 || bits > 8) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(ring);
+    const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    float *dev = (float *)cuda_tmp_alloc_on(logical_tier, bytes,
+                                            "bitq pack upload");
+    if (!dev) return 0;
+    if (cudaMemcpy(dev, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return 0;
+    }
+    store_raw_kv_bitq_batch_kernel<<<(n_rows + 255u) / 256u, 256u>>>(
+            (unsigned char *)ring->ptr, dev, raw_cap, first_row, n_rows,
+            head_dim, bits);
+    return cuda_ok(cudaGetLastError(), "bitq pack upload");
+}
+
+/* When a paging table is installed (DS4_CUDA_INDEXER_PAGING), comp rows are
+ * translated logical page -> resident physical page before the unpack. */
+static const uint32_t *g_indexer_paging_table = NULL;
+
+extern "C" void ds4_gpu_indexer_paging_table_set(const ds4_gpu_tensor *table) {
+    if (getenv("DS4_CUDA_INDEXER_PAGING_NO_GATHER") != NULL) return;
+    g_indexer_paging_table =
+        table ? (const uint32_t *)table->ptr : NULL;
+}
+
+/* Router near-miss ids (ranks 6..14 per token) feeding the expert
+ * prefetcher's registration (DS4_CUDA_PREFETCH_PREDICT).  Set once at graph
+ * init; the slot-cache recording appends them to the predicted set. */
+static const ds4_gpu_tensor *g_router_prefetch_ids = NULL;
+
+extern "C" void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t) {
+    g_router_prefetch_ids = t;
+}
+
+__global__ static void attention_bitq_comp_gather_paged_kernel(
+        float *dst, const unsigned char *ring,
+        const uint32_t *table, uint32_t n_rows, uint32_t head_dim, int bits) {
+    const uint32_t n = n_rows * head_dim;
+    const uint32_t row_bytes = kv_bitq_row_bytes(head_dim, bits);
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const uint32_t row = i / head_dim;
+        const uint32_t col = i % head_dim;
+        const uint32_t page = row >> 9u;
+        const uint32_t phys = table[page];
+        if (phys == UINT32_MAX) {
+            /* evicted page: the read-prepare guarantees every SELECTED page
+             * is resident, so these positions are never read by the indexed
+             * attention kernels (they touch topk rows only). */
+            dst[i] = 0.0f;
+            continue;
+        }
+        const uint32_t src_row = (phys << 9u) + (row & 511u);
+        dst[i] = kv_bitq_unpack_elem(
+                ring + (uint64_t)src_row * row_bytes, head_dim, col, bits);
+    }
+}
+
+static float *attention_bitq_comp_gather(const ds4_gpu_tensor *cache,
+        uint32_t n_rows, uint32_t head_dim, int logical_tier, const char *tag) {
+    (void)logical_tier;
+    const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    if (g_bitq_comp_gather_bytes < bytes) {
+        if (g_bitq_comp_gather) {
+            if (!cuda_ok(cudaDeviceSynchronize(),
+                         "synchronize bitq comp gather growth")) return NULL;
+            (void)cudaFree(g_bitq_comp_gather);
+            g_bitq_comp_gather = NULL;
+            g_bitq_comp_gather_bytes = 0;
+        }
+        void *p = NULL;
+        if (cudaMalloc(&p, (size_t)bytes) != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA bitq comp gather alloc failed for %s (%.2f MiB)\n",
+                    tag ? tag : "?", (double)bytes / 1048576.0);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        g_bitq_comp_gather = p;
+        g_bitq_comp_gather_bytes = bytes;
+    }
+    float *kv = (float *)g_bitq_comp_gather;
+    const uint32_t n = n_rows * head_dim;
+    if (g_indexer_paging_table) {
+        attention_bitq_comp_gather_paged_kernel<<<(n + 255u) / 256u, 256u>>>(
+                kv, (const unsigned char *)cache->ptr, g_indexer_paging_table,
+                n_rows, head_dim, kv_bitq_comp_bits());
+        if (!cuda_ok(cudaGetLastError(), "attention bitq comp paged gather")) return NULL;
+        /* Consumed: the kernel received its pointer copy; clear so gathers of
+         * OTHER layers (ratio-1, non-paged) never reuse a stale table. */
+        g_indexer_paging_table = NULL;
+        return kv;
+    }
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+            kv, (const unsigned char *)cache->ptr, n_rows, 0u, n_rows,
+            head_dim, kv_bitq_comp_bits());
+    if (!cuda_ok(cudaGetLastError(), "attention bitq comp gather")) return NULL;
+    return kv;
+}
+
+/* Pack staged f32 comp rows into the packed cache at [first_row,
+ * first_row + rows).  The packed cache cannot receive f32 writes in place,
+ * so the driver stages through attn_comp_stage and commits here. */
+extern "C" int ds4_gpu_comp_cache_bitq_pack_stage_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache, uint32_t cap,
+        uint32_t first_row, uint32_t rows, uint32_t head_dim) {
+    if (!stage || !cache || cap == 0u || rows == 0u ||
+        first_row + rows > cap) {
+        return 0;
+    }
+    if (!kv_bitq_comp_on()) return 1;
+    if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
+    if (!kv_comp_bytes_ok(cache, cap, head_dim)) return 0;
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+            (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
+            first_row, rows, head_dim, kv_bitq_comp_bits());
+    return cuda_ok(cudaGetLastError(), "comp bitq pack stage launch");
+}
+
+/* Paging: pack ONE page's row span [stage_row, stage_row+rows) of the staged
+ * f32 batch into the resident ring at the page's physical slot.  The stage
+ * rows are batch-relative; the ring rows are slot-relative (cap=512). */
+extern "C" int ds4_gpu_comp_cache_bitq_pack_page_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache,
+        uint32_t phys_slot, uint32_t page_row, uint32_t stage_row,
+        uint32_t rows, uint32_t head_dim) {
+    if (!stage || !cache || rows == 0u || head_dim == 0u ||
+        rows > 512u || page_row + rows > 512u) {
+        return 0;
+    }
+    if (!kv_bitq_comp_on()) return 1;
+    if (stage->bytes <
+        (uint64_t)(stage_row + rows) * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const int bits = kv_bitq_comp_bits();
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+            (unsigned char *)cache->ptr +
+                    (uint64_t)phys_slot * 512u * kv_bitq_row_bytes(head_dim, bits),
+            (const float *)stage->ptr + (uint64_t)stage_row * head_dim,
+            512u, page_row, rows, head_dim, bits);
+    return cuda_ok(cudaGetLastError(), "comp bitq pack page launch");
+}
+
+static inline bool kv_idx_bytes_ok(const ds4_gpu_tensor *t,
+        uint32_t cap, uint32_t head_dim) {
+    if (!t) return false;
+    if (kv_bitq_idx_on()) {
+        return t->bytes >=
+               (uint64_t)cap * kv_bitq_row_bytes(head_dim, kv_bitq_idx_bits());
+    }
+    return t->bytes >= (uint64_t)cap * head_dim * sizeof(float);
+}
+
+/* Dedicated indexer-cache dequant gather buffer (same aliasing rationale as
+ * the other dedicated gather buffers). */
+static float *attention_bitq_idx_gather(const ds4_gpu_tensor *cache,
+        uint32_t n_rows, uint32_t head_dim, int logical_tier, const char *tag) {
+    (void)logical_tier;
+    const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    if (g_bitq_idx_gather_bytes < bytes) {
+        if (g_bitq_idx_gather) {
+            if (!cuda_ok(cudaDeviceSynchronize(),
+                         "synchronize bitq idx gather growth")) return NULL;
+            (void)cudaFree(g_bitq_idx_gather);
+            g_bitq_idx_gather = NULL;
+            g_bitq_idx_gather_bytes = 0;
+        }
+        void *p = NULL;
+        if (cudaMalloc(&p, (size_t)bytes) != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA bitq idx gather alloc failed for %s (%.2f MiB)\n",
+                    tag ? tag : "?", (double)bytes / 1048576.0);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        g_bitq_idx_gather = p;
+        g_bitq_idx_gather_bytes = bytes;
+    }
+    float *kv = (float *)g_bitq_idx_gather;
+    const uint32_t n = n_rows * head_dim;
+    attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+            kv, (const unsigned char *)cache->ptr, n_rows, 0u, n_rows,
+            head_dim, kv_bitq_idx_bits());
+    if (!cuda_ok(cudaGetLastError(), "attention bitq idx gather")) return NULL;
+    return kv;
+}
+
+/* Pack staged f32 index rows into the packed indexer cache (mirrors the
+ * comp-cache stage pack; the indexer writers stage through attn_comp_stage
+ * under the env, then commit here). */
+extern "C" int ds4_gpu_index_cache_bitq_pack_stage_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache, uint32_t cap,
+        uint32_t first_row, uint32_t rows, uint32_t head_dim) {
+    if (!stage || !cache || cap == 0u || rows == 0u ||
+        first_row + rows > cap) {
+        return 0;
+    }
+    if (!kv_bitq_idx_on()) return 1;
+    if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
+    if (!kv_idx_bytes_ok(cache, cap, head_dim)) return 0;
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+            (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
+            first_row, rows, head_dim, kv_bitq_idx_bits());
+    return cuda_ok(cudaGetLastError(), "idx bitq pack stage launch");
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */

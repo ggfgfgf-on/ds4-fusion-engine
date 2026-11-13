@@ -4656,6 +4656,103 @@ extern "C" int ds4_gpu_cuda_ready(void) {
     return g_n_gpus > 0 ? 1 : 0;
 }
 
+__global__ static void attention_raw_gather_window_kernel(
+        float *dst, const float *ring,
+        uint32_t raw_cap, uint32_t phys_start, uint32_t n_raw,
+        uint32_t head_dim) {
+    const uint32_t n = n_raw * head_dim;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const uint32_t row = i / head_dim;
+        const uint32_t col = i % head_dim;
+        const uint32_t phys = (phys_start + row) % raw_cap;
+        dst[i] = ring[(uint64_t)phys * head_dim + col];
+    }
+}
+
+/* DS4_CUDA_KV_BITQ: the gather is the dequant boundary for the window paths
+ * (the downstream online kernel keeps reading the contiguous FP32 temp).
+ * attention_raw_gather_window_bitq_kernel lives beside the pack kernel. */
+
+/* Band-fused heads8 kernel (defined later in this file); the window-attention
+ * routing below splices before the definition. */
+__global__ static void attention_static_mixed_heads8_online_kernel(
+        float *heads, const float *sinks, const float *q, const float *raw_kv,
+        const float *comp_kv, uint32_t n_tokens, uint32_t n_comp,
+        uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_keys, uint32_t band, int64_t band_offset, int64_t comp_offset);
+__global__ static void attention_raw_gather_window_kernel(
+        float *dst, const float *ring, uint32_t raw_cap, uint32_t phys_start,
+        uint32_t n_raw, uint32_t head_dim);
+
+extern "C" int ds4_gpu_attention_prefill_raw_heads_window_tensor(
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_ring,
+        uint32_t raw_cap,
+        uint32_t phys_start,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t window,
+        int64_t band_offset,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    if (!heads || !q || !raw_kv_ring || !model_map ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        !kv_ring_bytes_ok(raw_kv_ring, raw_cap, head_dim) ||
+        n_raw < n_tokens || n_raw > raw_cap ||
+        (int64_t)(n_tokens - 1) + band_offset + (int64_t)window > (int64_t)n_raw ||
+        band_offset + (int64_t)window <= 0 ||
+        n_tokens == 0 || window == 0 || window > 256 || head_dim != 512) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+            logical_tier, "attn_sinks_window");
+    if (!sinks) return 0;
+    const uint64_t kv_bytes = (uint64_t)n_raw * head_dim * sizeof(float);
+    float *kv = (float *)cuda_tmp_alloc_on(logical_tier, kv_bytes,
+                                           "attention raw window gather");
+    if (!kv) return 0;
+    const uint32_t n = n_raw * head_dim;
+    if (kv_bitq_on()) {
+        attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+                kv, (const unsigned char *)raw_kv_ring->ptr, raw_cap,
+                phys_start, n_raw, head_dim, kv_bitq_raw_bits());
+        if (!cuda_ok(cudaGetLastError(), "attention raw window bitq gather")) return 0;
+    } else {
+        attention_raw_gather_window_kernel<<<(n + 255u) / 256u, 256u>>>(
+                kv, (const float *)raw_kv_ring->ptr, raw_cap, phys_start, n_raw,
+                head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention raw window gather")) return 0;
+    }
+    dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+    attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            kv,
+            kv,
+            n_tokens,
+            0,
+            window,
+            1,
+            n_head,
+            head_dim,
+            n_raw,
+            1,
+            band_offset,
+            0);
+    return cuda_ok(cudaGetLastError(), "attention raw window band launch");
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */
@@ -13996,7 +14093,16 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t n_keys,   /* band mode: total raw rows in raw_kv (>= n_tokens) */
+        uint32_t band,     /* 1 = band mode (rows [max(0,t+band_offset),
+                            *              t+band_offset+window) of the gathered
+                            *              buffer), 0 = causal mode over the batch */
+        int64_t band_offset,
+        int64_t comp_offset) {  /* comp_count = (t + 1 + comp_offset) / ratio:
+                                 * 0 for the zero-prefix batch, pos0 for a
+                                 * nonzero-prefix chunk whose compressed rows
+                                 * [0, (pos0+t+1)/ratio) mirror the whole batch */
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -14007,11 +14113,30 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 
     __shared__ float4 kv_shared[4 * 128];
 
-    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
-    const uint32_t raw_start = t + 1u - raw_count;
+    /* Band mode: query t attends the PREFIX window rows
+     * [max(0, t+band_offset), t+band_offset+window) of a contiguous buffer
+     * gathered from the ring (nonzero-prefix chunks).  band_offset = 0
+     * reproduces the late-window band [t, t+window); a negative offset
+     * clips the span at buffer row 0 for early chunks whose prefix is
+     * shorter than the SWA window (p0 < win-1): the span start = 0 and the
+     * clipped rows are exactly the causal prefix, so the row set is still
+     * causal and matches the whole-batch numerics row for row.  Causal
+     * mode: query t attends [max(0, t-window+1), t] of the batch KV. */
+    uint32_t raw_count, raw_start;
+    if (band) {
+        const int64_t start64 = (int64_t)t + band_offset;
+        const int64_t end64 = start64 + (int64_t)window;   /* exclusive */
+        raw_start = start64 > 0 ? (uint32_t)start64 : 0u;
+        const uint32_t end = end64 > (int64_t)n_keys ? n_keys : (uint32_t)end64;
+        raw_count = end > raw_start ? end - raw_start : 0u;
+    } else {
+        raw_count = window != 0u && t + 1u > window ? window : t + 1u;
+        raw_start = t + 1u - raw_count;
+    }
     uint32_t comp_count = 0;
     if (n_comp != 0u && ratio != 0u) {
-        comp_count = (t + 1u) / ratio;
+        const int64_t cc64 = (int64_t)(t + 1u) + comp_offset;
+        comp_count = cc64 > 0 ? (uint32_t)cc64 / ratio : 0u;
         if (comp_count > n_comp) comp_count = n_comp;
     }
     const uint32_t n_score = raw_count + comp_count;
@@ -14108,6 +14233,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
 
 /* -------------------------------------------------------------------------
  * DS4_ATTN_TOKENTILE: token-tile HMMA indexed attention (opt-in).
@@ -23384,7 +23510,11 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    window,
                                                                    1,
                                                                    n_head,
-                                                                   head_dim);
+                                                                   head_dim,
+                                                                   n_tokens,
+                                                                   0,
+                                                                   0,
+                                                                   0);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
@@ -24111,7 +24241,11 @@ static int attention_prefill_mixed_launch(
                                                                    window,
                                                                    ratio,
                                                                    n_head,
-                                                                   head_dim);
+                                                                   head_dim,
+                                                                   n_tokens + n_comp,
+                                                                   0,
+                                                                   0,
+                                                                   0);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&

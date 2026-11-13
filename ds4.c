@@ -26965,6 +26965,7 @@ static bool metal_graph_encode_decode_layer_phase(
          * The updates below then stop after the pool (and the state shift). */
         const bool comp_finalize_fuse =
             ok && emit && ratio == 4u && DS4_GPU_ATTN_COMP_CACHE_F16 &&
+            !ds4_kv_bitq_idx_enabled() &&
             phase == METAL_DECODE_LAYER_FULL &&
             !g->ssd_streaming && !g->ssd_streaming_cold &&
             DS4_N_HEAD_DIM == 512u && DS4_N_INDEXER_HEAD_DIM == 128u &&
@@ -33637,6 +33638,37 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     g->raw_window,
                                                                     attn_heads,
                                                                     DS4_N_HEAD_DIM) != 0;
+        } else if (ds4_kv_bitq_enabled()) {
+            /* DS4_CUDA_KV_BITQ: the zero-prefix whole batch must read the
+             * SAME quantized ring the split window path reads, so route it
+             * through the band-fused window gather over span [0, n_tokens).
+             * band_offset = 1 - win reproduces the direct whole-batch causal
+             * window mask exactly (the certified split early-chunk band
+             * configuration). */
+            const uint32_t win = g->raw_window != 0u ? g->raw_window : n_tokens;
+            if (win <= 256u && n_tokens <= g->raw_cap) {
+                ok = ds4_gpu_attention_prefill_raw_heads_window_tensor(
+                        metal_graph_batch_heads(g),
+                        model->map,
+                        model->size,
+                        sinks_offset,
+                        metal_graph_batch_q(g),
+                        g->layer_raw_cache[il],
+                        g->raw_cap,
+                        0u,
+                        n_tokens,
+                        n_tokens,
+                        win,
+                        1 - (int64_t)win,
+                        attn_heads,
+                        DS4_N_HEAD_DIM) != 0;
+            } else {
+                fprintf(stderr,
+                        "ds4: DS4_CUDA_KV_BITQ cannot route whole raw attention"
+                        " (win %u tokens %u cap %u)\n",
+                        win, n_tokens, g->raw_cap);
+                ok = false;
+            }
         } else {
             ok = ds4_gpu_attention_prefill_raw_heads_tensor(metal_graph_batch_heads(g),
                                                               model->map,
@@ -34750,6 +34782,33 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         g->raw_window,
                                                                         attn_heads,
                                                                         DS4_N_HEAD_DIM) != 0;
+            } else if (ds4_kv_bitq_enabled()) {
+                /* DS4_CUDA_KV_BITQ: raw-prefix rows of a zero-prefix mixed
+                 * chunk read the quantized ring span [0, prefix). */
+                const uint32_t win = g->raw_window != 0u ? g->raw_window : raw_prefix_tokens;
+                if (win <= 256u && raw_prefix_tokens <= g->raw_cap) {
+                    ok = ds4_gpu_attention_prefill_raw_heads_window_tensor(
+                            metal_graph_batch_heads(g),
+                            model->map,
+                            model->size,
+                            sinks_offset,
+                            metal_graph_batch_q(g),
+                            g->layer_raw_cache[il],
+                            g->raw_cap,
+                            0u,
+                            raw_prefix_tokens,
+                            raw_prefix_tokens,
+                            win,
+                            1 - (int64_t)win,
+                            attn_heads,
+                            DS4_N_HEAD_DIM) != 0;
+                } else {
+                    fprintf(stderr,
+                            "ds4: DS4_CUDA_KV_BITQ cannot route raw-prefix"
+                            " attention (win %u prefix %u cap %u)\n",
+                            win, raw_prefix_tokens, g->raw_cap);
+                    ok = false;
+                }
             } else {
                 ok = ds4_gpu_attention_prefill_raw_heads_tensor(metal_graph_batch_heads(g),
                                                                   model->map,
@@ -42094,7 +42153,14 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
     if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
     if (wanted == 0) wanted = 1;
     wanted = align_up(wanted, 256u);
-    if (wanted > 8192u) wanted = 8192u;
+    /* DS4_CUDA_KV_BITQ_AUTO: settle the profile (idempotent) so the 8192
+     * cap below already reflects the scheduler's decision — under auto A/B
+     * the packed ring lifts the cap, under auto OFF it stays. */
+    ds4_kv_bitq_scheduler_settle((uint32_t)ctx_size, prefill_cap);
+    /* The 8192 hard cap protects the FP32 ring (16 MiB/layer at 8k rows).
+     * DS4_CUDA_KV_BITQ packs rows to 384B, so the cap lifts to the context
+     * size under the env. */
+    if (!ds4_kv_bitq_enabled() && wanted > 8192u) wanted = 8192u;
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
@@ -42106,7 +42172,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
         if (endp != env && v > 0) {
             raw_cap = (uint32_t)v;
             if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
-            if (raw_cap > 8192u) raw_cap = 8192u;
+            if (!ds4_kv_bitq_enabled() && raw_cap > 8192u) raw_cap = 8192u;
             if (raw_cap < raw_window) raw_cap = raw_window;
         }
     }
@@ -64639,7 +64705,7 @@ static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     /* align_up to 256 — inline since align_up is defined upstream. */
     const uint64_t align = 256u;
     wanted = (wanted + align - 1u) & ~(align - 1u);
-    if (wanted > 8192u) wanted = 8192u;
+    if (!ds4_kv_bitq_enabled() && wanted > 8192u) wanted = 8192u;
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
@@ -64651,7 +64717,7 @@ static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
         if (endp != env && v > 0) {
             raw_cap = (uint32_t)v;
             if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
-            if (raw_cap > 8192u) raw_cap = 8192u;
+            if (!ds4_kv_bitq_enabled() && raw_cap > 8192u) raw_cap = 8192u;
             if (raw_cap < raw_window) raw_cap = raw_window;
         }
     }

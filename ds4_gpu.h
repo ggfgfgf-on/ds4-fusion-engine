@@ -558,6 +558,40 @@ int ds4_gpu_sliminfer_gather_forward_tensor(ds4_gpu_tensor *x,
 int ds4_gpu_sliminfer_scatter_active_tensor(ds4_gpu_tensor *next_hc,
                                             ds4_gpu_tensor *active_idx,
                                             uint32_t n_active, uint32_t row_elems);
+/* DS4_CUDA_KV_BITQ zero-prefix/raw-prefix routing: band-fused window
+ * attention over the quantized raw ring. */
+int ds4_gpu_attention_prefill_raw_heads_window_tensor(
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_ring,
+        uint32_t raw_cap,
+        uint32_t phys_start,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t window,
+        int64_t band_offset,
+        uint32_t n_head,
+        uint32_t head_dim);
+/* DS4_CUDA_KV_BITQ zero-prefix/raw-prefix routing: band-fused window
+ * attention over the quantized raw ring. */
+int ds4_gpu_attention_prefill_raw_heads_window_tensor(
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_ring,
+        uint32_t raw_cap,
+        uint32_t phys_start,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t window,
+        int64_t band_offset,
+        uint32_t n_head,
+        uint32_t head_dim);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

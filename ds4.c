@@ -676,6 +676,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_QWEN35    = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -686,6 +687,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_QWEN35 = 7,
 } ds4_variant;
 
 typedef struct {
@@ -1026,6 +1028,49 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Qwen3.8-27B (qwen35): the dense deployment-friendly sibling of the
+ * Flash-Next family.  Same GDN (ssm 128/16/48/inner 6144) + gated GQA
+ * (24/4 heads, 256 dims), NO MoE (dense FFN 17408), no hyper-connections,
+ * no PLE n-gram layer, no QSA indexer.  64 trunk layers + 1 MTP. */
+static const ds4_shape DS4_SHAPE_QWEN35 = {
+    .name = "Qwen3.8 27B",
+    .family = DS4_MODEL_FAMILY_QWEN35,
+    .variant = DS4_VARIANT_QWEN35,
+    .n_layer = 65,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 0,
+    .n_expert_used = 0,
+    .n_expert_shared = 0,
+    .n_ff_exp = 0,
+    .n_ff_dense = 17408,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_lowrank = 0,
+    .n_nextn_predict = 1,
+    .n_lin_k_head = 16,
+    .n_lin_v_head = 48,
+    .n_lin_head_dim = 128,
+    .n_lin_conv = 4,
+    .n_full_attn_interval = 4,
+    .n_ple_layer = 0,
+    .n_ple_ngram = 0,
+    .n_ple_heads_per_ngram = 0,
+    .n_ple_conv = 0,
+    .n_ple_head_dim = 0,
+    .ple_eos_id = 248044,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -1157,7 +1202,8 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
 }
 
 static bool ds4_model_is_qwen4(void) {
-    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP ||
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -7626,6 +7672,50 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Qwen3.8-27B (qwen35): the dense sibling of the Flash-Next family.  Same
+ * GDN + gated GQA, dense FFN, no MoE/hyper-connections/PLE/indexer. */
+static void config_validate_qwen35_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN35;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(&g_ds4_qwen4_ple, 0, sizeof(g_ds4_qwen4_ple));
+    g_ds4_shape.n_layer -= DS4_N_NEXTN_PREDICT - required_u32(m, "qwen35.nextn_predict_layers");
+    config_expect_u32("block_count", required_u32(m, "qwen35.block_count"), DS4_N_LAYER);
+    config_expect_u32("embedding_length",
+                      required_u32(m, "qwen35.embedding_length"), DS4_N_EMBD);
+    config_expect_u32("feed_forward_length",
+                      required_u32(m, "qwen35.feed_forward_length"), DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count",
+                      required_u32(m, "qwen35.attention.head_count"), DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv",
+                      required_u32(m, "qwen35.attention.head_count_kv"), DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length",
+                      required_u32(m, "qwen35.attention.key_length"), DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length",
+                      required_u32(m, "qwen35.attention.value_length"), DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count",
+                      required_u32(m, "qwen35.rope.dimension_count"), DS4_N_ROT);
+    config_expect_f32("rope.freq_base",
+                      required_f32(m, "qwen35.rope.freq_base"), DS4_ROPE_FREQ_BASE);
+    qwen4_rope_configure(required_u32(m, "qwen35.context_length"));
+    config_expect_epsilon("attention.layer_norm_rms_epsilon",
+                          required_f32(m, "qwen35.attention.layer_norm_rms_epsilon"),
+                          DS4_RMS_EPS);
+    config_expect_u32("ssm.conv_kernel",
+                      required_u32(m, "qwen35.ssm.conv_kernel"), DS4_N_LIN_CONV);
+    config_expect_u32("ssm.state_size",
+                      required_u32(m, "qwen35.ssm.state_size"), DS4_N_LIN_HEAD_DIM);
+    config_expect_u32("ssm.group_count",
+                      required_u32(m, "qwen35.ssm.group_count"), DS4_N_LIN_K_HEAD);
+    config_expect_u32("ssm.time_step_rank",
+                      required_u32(m, "qwen35.ssm.time_step_rank"), DS4_N_LIN_V_HEAD);
+    config_expect_u32("ssm.inner_size",
+                      required_u32(m, "qwen35.ssm.inner_size"),
+                      DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM);
+    config_expect_u32("full_attention_interval",
+                      required_u32(m, "qwen35.full_attention_interval"),
+                      DS4_N_FULL_ATTN_INTERVAL);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7644,6 +7734,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "qwen35")) {
+            config_validate_qwen35_model(m);
             return;
         }
     }

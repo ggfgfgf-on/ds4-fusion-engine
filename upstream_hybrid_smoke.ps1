@@ -1,7 +1,7 @@
 # upstream_hybrid_smoke.ps1 - hybrid dual-engine smoke: GPU prefill -> CPU decode.
 $ErrorActionPreference = 'Continue'
 $root = 'D:\DSHwork\ds4-upstream'
-$model = 'D:\DSHwork\models\DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'
+$model = 'D:\DSHwork\models\Qwen3-8B-Instruct-Q4_K_M.gguf'
 Set-Location $root
 foreach ($v in 'http_proxy','https_proxy','no_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY','ALL_PROXY') { Remove-Item Env:\$v -ErrorAction SilentlyContinue }
 $env:DS4_THREADS = '28'; $env:DS4_POOL_SPIN_US = '500'; $env:DS4_POOL_PIN = '1'
@@ -25,7 +25,7 @@ try {
     }
     if (-not $ready) { 'HYBRID SERVER_NOT_READY' } else {
         $prompt = "Write a comprehensive technical analysis of solar energy storage systems, comparing lithium-ion battery installations, pumped hydro storage, compressed air energy storage, and molten salt thermal storage in terms of round-trip efficiency, capital cost per kilowatt-hour, expected cycle life, land use requirements, and grid-scale deployment examples from California, Texas, Australia, and China, then discuss how each technology performs during peak evening demand periods, seasonal variations in solar output, and extreme weather events, and finally recommend an optimal storage portfolio for a utility aiming to reach ninety percent renewable penetration by 2040."
-        $body = @{ model = 'deepseek-chat'; messages = @(@{ role = 'user'; content = $prompt }); max_tokens = 64; temperature = 0; stream = $false } | ConvertTo-Json -Depth 5
+        $body = @{ model = 'deepseek-chat'; messages = @(@{ role = 'user'; content = $prompt }); max_tokens = 32; temperature = 0; stream = $false } | ConvertTo-Json -Depth 5
         $t0 = Get-Date
         $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method POST -ContentType 'application/json' -Body $body -TimeoutSec 1800 -UseBasicParsing
         $wall = ((Get-Date) - $t0).TotalSeconds

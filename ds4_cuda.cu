@@ -443,12 +443,18 @@ struct cuda_model_range {
     int host_registered;
     int arena_allocated;
     int borrowed;
+    /* LRU (DS4_CUDA_WEIGHT_ARENA_LRU / prefill scheduler): monotonic tick
+     * of the last resolve hit.  Zero until the first hit; the evictor picks
+     * the smallest. */
+    uint64_t last_use;
 };
 
 struct cuda_model_arena {
     char *device_ptr;
     uint64_t bytes;
     uint64_t used;
+    /* Holes reclaimed by the LRU evictor (offset,size pairs, merged). */
+    std::vector<std::pair<uint64_t, uint64_t>> holes;
 };
 
 struct cuda_q8_f16_range {
@@ -504,6 +510,83 @@ struct cuda_derived_range {
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+static uint64_t g_model_lru_tick;
+static uint64_t g_model_lru_dead;
+/* Prefill-phase LRU scheduling (DS4_CUDA_WEIGHT_ARENA_PREFILL_LRU, default
+ * on).  See cuda_model_arena_lru_make_room for the reclaim protocol. */
+static int g_arena_prefill_mode;
+static uint64_t g_arena_prefill_floor;
+
+static int cuda_arena_prefill_lru_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_PREFILL_LRU");
+        cached = (env && env[0] && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+/* Decode-phase weight-arena LRU eviction (DS4_CUDA_WEIGHT_ARENA_LRU,
+ * default off): evicts small transient ranges (<= LRU_MAX_MB, default 1 MiB)
+ * outside the model tail.  Weights are identical bytes wherever they live,
+ * so eviction never changes numerics. */
+static int cuda_model_arena_lru_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_LRU");
+        cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static uint64_t cuda_model_arena_lru_max_bytes(void) {
+    static uint64_t cached = UINT64_MAX;
+    if (cached == UINT64_MAX) {
+        uint64_t mb = 1;
+        const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_LRU_MAX_MB");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end != env && v > 0) mb = (uint64_t)v;
+        }
+        cached = mb * 1048576ull;
+    }
+    return cached;
+}
+
+static uint64_t cuda_arena_prefill_lru_max_bytes(void) {
+    static uint64_t cached = 0;
+    static int cached_done = 0;
+    if (cached_done) return cached;
+    cached_done = 1;
+    uint64_t mb = 0;
+    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_PREFILL_LRU_MAX_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env) mb = (uint64_t)v;
+    }
+    cached = mb * 1048576ull;
+    return cached;
+}
+
+extern "C" void ds4_gpu_arena_prefill_begin(void) {
+    if (!cuda_arena_prefill_lru_enabled()) return;
+    const cudaError_t serr = cudaDeviceSynchronize();
+    if (serr != cudaSuccess) (void)cudaGetLastError();
+    g_arena_prefill_mode = 1;
+    g_arena_prefill_floor = g_model_lru_tick;
+}
+
+extern "C" void ds4_gpu_arena_prefill_chunk_boundary(void) {
+    if (!cuda_arena_prefill_lru_enabled() || !g_arena_prefill_mode) return;
+    g_arena_prefill_floor = g_model_lru_tick;
+}
+
+extern "C" void ds4_gpu_arena_prefill_end(void) {
+    g_arena_prefill_mode = 0;
+    g_arena_prefill_floor = 0;
+}
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
@@ -826,11 +909,22 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && bytes <= r.bytes) {
+            if ((cuda_model_arena_lru_enabled() || g_arena_prefill_mode) &&
+                r.arena_allocated) {
+                g_model_ranges[exact->second].last_use = ++g_model_lru_tick;
+            }
+            return r.device_ptr;
+        }
     }
-    for (const cuda_model_range &r : g_model_ranges) {
+    for (size_t ri = 0; ri < g_model_ranges.size(); ri++) {
+        const cuda_model_range &r = g_model_ranges[ri];
         if (r.host_base == model_map && offset >= r.offset &&
             end <= r.offset + r.bytes) {
+            if ((cuda_model_arena_lru_enabled() || g_arena_prefill_mode) &&
+                r.arena_allocated) {
+                g_model_ranges[ri].last_use = ++g_model_lru_tick;
+            }
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered &&
@@ -926,6 +1020,9 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    /* Fresh ranges must never look older than the prefill chunk-boundary
+     * floor (a 0 last_use would make them reclaim candidates immediately). */
+    g_model_ranges.back().last_use = ++g_model_lru_tick;
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {

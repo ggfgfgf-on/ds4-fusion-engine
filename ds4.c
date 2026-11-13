@@ -38625,6 +38625,12 @@ static bool metal_graph_prefill_layer_major(
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
+            /* Prefill-safe arena scheduling: advance the reclaim floor past
+             * this layer so the NEXT layer's weight resolves may recycle its
+             * ranges under arena pressure (the evictor syncs before freeing). */
+            if (ok && g->ssd_streaming) {
+                ds4_gpu_arena_prefill_chunk_boundary();
+            }
 #ifdef DS4_ROCM_BUILD
             if (ok) {
                 ok = rocm_graph_stream_seed_full_layer_selected(g,
@@ -38935,7 +38941,11 @@ static bool metal_graph_prefill_raw_swa(
     (void)cancel;
     (void)cancel_ud;
     (void)cancelled;
-    return metal_graph_prefill_layer_major(g,
+    /* Prefill-safe arena scheduling: bracket the layer-major fallback so
+     * its per-layer boundaries may recycle completed layers' weight ranges
+     * under arena pressure. */
+    if (g->ssd_streaming) ds4_gpu_arena_prefill_begin();
+    const bool ok = metal_graph_prefill_layer_major(g,
                                            model,
                                            weights,
                                            prompt,
@@ -38946,6 +38956,8 @@ static bool metal_graph_prefill_raw_swa(
                                            NULL,
                                            display_progress,
                                            display_progress_ud);
+    if (g->ssd_streaming) ds4_gpu_arena_prefill_end();
+    return ok;
 }
 
 static uint32_t metal_graph_visual_prefill_chunk(
@@ -39022,6 +39034,7 @@ static bool metal_graph_prefill_chunked_range(
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
+    if (g->ssd_streaming) ds4_gpu_arena_prefill_begin();
 
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
@@ -39092,7 +39105,14 @@ static bool metal_graph_prefill_chunked_range(
             return true;
         }
         pos0 = chunk_end;
+        /* Chunk completed: advance the reclaim floor so the arena may
+         * recycle this chunk's now-dead ranges under pressure (the evictor
+         * drains the device itself before freeing). */
+        if (g->ssd_streaming && pos0 < end) {
+            ds4_gpu_arena_prefill_chunk_boundary();
+        }
     }
+    if (g->ssd_streaming) ds4_gpu_arena_prefill_end();
     if (show_progress) fputc('\n', stderr);
     if (profile) {
         const double t_read = now_sec();

@@ -486,6 +486,12 @@ void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+/* Prefill-safe weight-arena eviction protocol: enter/exit bracket one
+ * SSD-streamed chunked prefill; each chunk boundary lets the arena reclaim
+ * ranges resolved by earlier chunks that are already past the device. */
+void ds4_gpu_arena_prefill_begin(void);
+void ds4_gpu_arena_prefill_chunk_boundary(void);
+void ds4_gpu_arena_prefill_end(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

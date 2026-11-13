@@ -8,13 +8,13 @@ ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool 
 ds4: WDDM shared-pool budget 44.93 GiB
 ds4: CUDA model arena allocated 1010.00 MiB (arenas 0.99 GiB)
 ds4: CUDA fd-cached tensor-span:0 1010.00 MiB (total 0.99 GiB)
-ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.532s
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.567s
 ds4: cuda backend initialized for graph diagnostics
 ds4: memory: KV 0.78 GiB (raw 0.67 + compressed 0.11) + buffers 0.13 GiB + resident model 2.81 GiB + expert cache 1.62 GiB + prefill expert reserve 3.38 GiB = 8.71 GiB planned
 ds4: memory detail: ctx=8192 prefill_cap=8192 raw_kv_rows=8192 compressed_kv_rows=2050 backend=cuda
-1114 00:46:33 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
-1114 00:46:33 ds4-server: listening on http://127.0.0.1:8000
-1114 00:46:34 ds4-server: chat ctx=0..2954:2954 prompt start
+1114 06:57:53 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
+1114 06:57:53 ds4-server: listening on http://127.0.0.1:8000
+1114 06:57:55 ds4-server: chat ctx=0..2954:2954 prompt start
 ds4: CUDA model arena allocated 1792.00 MiB (arenas 2.74 GiB)
 ds4: CUDA fd-cached f16 rms fold 0.75 MiB (total 0.99 GiB)
 ds4: CUDA fd-cached hc_scale 0.00 MiB (total 0.99 GiB)

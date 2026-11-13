@@ -5,20 +5,19 @@ ds4: CUDA preparing model tensor mappings
 ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool free for DWM/OS (DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=8, 0=off)
 ds4: WDDM shared-pool budget 44.93 GiB
 ds4: CUDA loading model tensors into device cache
-ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.546s
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.542s
 ds4: cuda backend initialized for graph diagnostics
 ds4: memory: KV 0.78 GiB (raw 0.67 + compressed 0.11) + buffers 0.13 GiB + resident model 2.81 GiB + expert cache 0.11 GiB = 3.82 GiB planned
 ds4: memory detail: ctx=8192 prefill_cap=8192 raw_kv_rows=8192 compressed_kv_rows=2050 backend=cuda
-1114 01:05:28 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
-1114 01:05:28 ds4-server: listening on http://127.0.0.1:8000
-1114 01:05:29 ds4-server: chat ctx=0..118:118 prompt start
+1114 06:28:08 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
+1114 06:28:08 ds4-server: listening on http://127.0.0.1:8000
+1114 06:28:09 ds4-server: chat ctx=0..118:118 prompt start
 ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=64.00 MiB cached=0.00 GiB free=0.00 GiB reserve=0.75 GiB total=7.93 GiB)
 ds4: CUDA SSD expert cache: 227 slots, 1.50 GiB
 ds4: CUDA SSD expert cache: 228 slots, 1.50 GiB
-ds4: CUDA loading model tensors 1.75 GiB cached
-ds4: CUDA loading model tensors 3.92 GiB cached
-ds4: CUDA loading model tensors 5.93 GiB cached
-1114 01:06:07 ds4-server: chat ctx=0..118:118 prompt done 38.308s
+ds4: CUDA loading model tensors 2.49 GiB cached
+ds4: CUDA loading model tensors 5.43 GiB cached
+1114 06:28:37 ds4-server: chat ctx=0..118:118 prompt done 28.192s
 ds4: CUDA loading model tensors 8.20 GiB cached
-1114 01:08:11 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.39 t/s avg=0.39 t/s 124.032s
-1114 01:08:11 ds4-server: chat ctx=0..118:118 gen=48 finish=length 162.342s
+1114 06:30:08 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.53 t/s avg=0.53 t/s 91.123s
+1114 06:30:08 ds4-server: chat ctx=0..118:118 gen=48 finish=length 119.317s

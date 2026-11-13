@@ -10161,6 +10161,10 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     ds4_tp *tp_leader;
+    /* hybrid mode: GPU engine prefills, CPU engine decodes */
+    ds4_engine *prefill_engine;
+    ds4_session *prefill_session;
+    int hybrid_mode;
     server_slot *slots;
     int slot_count;
     int ctx_size;
@@ -11313,6 +11317,32 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
                                            NULL, 0, NULL);
+}
+
+/* Hybrid handoff: store the KV of an arbitrary engine session (the GPU
+ * prefill session) under the prompt-text key, mirroring the slot store but
+ * without a slot. */
+static bool kv_cache_store_engine_session(server *s, ds4_engine *eng,
+                                          ds4_session *ss,
+                                          const ds4_tokens *tokens,
+                                          int store_len,
+                                          const char *reason) {
+    if (!s || !eng || !ss || !tokens) return false;
+    char err[160] = {0};
+    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pthread_mutex_lock(&s->inference_mu);
+    if (ds4_session_has_vision_state(ss)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return false;
+    }
+    pthread_mutex_lock(&s->kv_mu);
+    bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, eng, ss, tokens,
+                                                 store_len, reason,
+                                                 NULL, 0, NULL, &hooks,
+                                                 err, sizeof(err));
+    pthread_mutex_unlock(&s->kv_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+    return ok;
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
@@ -13640,6 +13670,60 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    if (!multimodal && cached == 0 && s->hybrid_mode &&
+        s->prefill_session && s->prefill_engine && s->kv.enabled &&
+        !s->batched_mode) {
+        /* Hybrid handoff: the GPU session prefills the prompt, its KV is
+         * checkpointed, and the CPU slot session loads it through the same
+         * path as a disk hit. */
+        char hybrid_err[160] = {0};
+        server_prefill_enter(s, slot);
+        ds4_session_rewind(s->prefill_session, 0);
+        const double prefill_t0 = now_sec();
+        int rc = ds4_session_sync(s->prefill_session, &j->req.prompt,
+                                  hybrid_err, sizeof(hybrid_err));
+        const double prefill_elapsed = now_sec() - prefill_t0;
+        server_prefill_leave(s);
+        if (rc == 0) {
+            const ds4_tokens *gtoks = ds4_session_tokens(s->prefill_session);
+            if (gtoks &&
+                kv_cache_store_engine_session(s, s->prefill_engine,
+                                              s->prefill_session, gtoks,
+                                              j->req.prompt.len, "hybrid")) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: hybrid GPU prefill done tokens=%d prefill=%.3f s (%.2f tok/s); loading into CPU session",
+                           j->req.prompt.len,
+                           prefill_elapsed,
+                           prefill_elapsed > 0.0 ?
+                               (double)j->req.prompt.len / prefill_elapsed : 0.0);
+                disk_cached = kv_cache_try_load(s, slot, &j->req,
+                                                &effective_prompt,
+                                                &disk_cache_path,
+                                                &disk_cache_ext_flags);
+                if (disk_cached > 0) {
+                    cached = disk_cached;
+                    cache_source = "hybrid";
+                    prompt_for_sync = &effective_prompt;
+                } else {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: hybrid handoff load failed; "
+                               "falling back to CPU prefill");
+                }
+            } else {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: hybrid GPU prefill failed (%s); "
+                           "falling back to CPU prefill (output family may differ)",
+                           hybrid_err[0] ? hybrid_err : "store failed");
+            }
+        } else {
+            /* Fail-loud: a failed GPU prefill used to fall through to the CPU
+             * prefill with NO log.  Keep the CPU fallback but always log. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: hybrid GPU prefill failed (%s); "
+                       "falling back to CPU prefill (output family may differ)",
+                       hybrid_err[0] ? hybrid_err : "sync failed");
+        }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -15464,6 +15548,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool hybrid_mode;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15810,6 +15895,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--hybrid")) {
+            c.hybrid_mode = true;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr, NULL);
@@ -15894,6 +15981,17 @@ int main(int argc, char **argv) {
     cfg.engine.placement_session_count_hint =
         cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+    if (cfg.hybrid_mode) {
+        /* hybrid: GPU engine prefills (opened below), CPU engine decodes.
+         * The KV disk store is the handoff medium, so force it on. */
+        cfg.engine.backend = DS4_BACKEND_CPU;
+        if (!cfg.kv_disk_dir) cfg.kv_disk_dir = ".cache/server-kv-hybrid";
+        cfg.kv_cache.min_tokens = 8;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: hybrid mode: GPU prefill + CPU decode "
+                   "(handoff via %s)",
+                   cfg.kv_disk_dir);
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -15923,6 +16021,34 @@ int main(int argc, char **argv) {
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
+    }
+
+    ds4_engine *prefill_engine = NULL;
+    if (cfg.hybrid_mode) {
+        /* The GPU prefill engine: SSD-streamed expert cache (chunk 16,
+         * 4 GiB) so the long-prompt prefill stays ~8-9 t/s under shared-pool
+         * pressure.  DS4_HYBRID_PREFILL_CHUNK=0 sizes the graph for the
+         * whole prompt (one batch per layer). */
+        ds4_engine_options prefill_opt = cfg.engine;
+        prefill_opt.backend = DS4_BACKEND_CUDA;
+        prefill_opt.context_size = cfg.ctx_size;
+        prefill_opt.ssd_streaming = true;
+        prefill_opt.ssd_streaming_cold = false;
+        prefill_opt.ssd_streaming_cache_experts = 16;
+        if (prefill_opt.ssd_streaming_cache_bytes == 0) {
+            prefill_opt.ssd_streaming_cache_bytes = 4ull << 30;
+        }
+        {
+            const char *pc = getenv("DS4_HYBRID_PREFILL_CHUNK");
+            prefill_opt.prefill_chunk =
+                pc && pc[0] ? (uint32_t)atoi(pc) : 16u;
+        }
+        if (ds4_engine_open(&prefill_engine, &prefill_opt) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to open the GPU prefill engine");
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -15976,6 +16102,8 @@ int main(int argc, char **argv) {
             cfg.engine.backend, cfg.ctx_size, ds4_engine_prefill_chunk(engine),
             cfg.engine.ssd_streaming).prefill_cap;
     s.tp_leader = tp_leader;
+    s.hybrid_mode = cfg.hybrid_mode;
+    s.prefill_engine = prefill_engine;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
@@ -16016,6 +16144,15 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
                        ds4_backend_name(cfg.engine.backend), i + 1, slot_count);
+            server_close_resources(&s);
+            return 1;
+        }
+    }
+    if (s.hybrid_mode && s.prefill_engine) {
+        if (ds4_session_create(&s.prefill_session, s.prefill_engine,
+                               cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create GPU prefill session");
             server_close_resources(&s);
             return 1;
         }

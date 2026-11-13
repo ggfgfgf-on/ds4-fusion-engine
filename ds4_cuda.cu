@@ -6531,20 +6531,19 @@ static cudaEvent_t g_end_decode_event = NULL;
 int g_end_batch_pending = 0;
 
 extern "C" int ds4_gpu_begin_commands(void) {
-    /* Deferred barrier: wait the previous layer's end-commands events on
-     * BOTH streams before the next layer's kernels launch.  The upstream
-     * base splits kernels across the default stream (compressor/pack) and
+    /* Deferred barrier: host-synchronize the previous layer's end-commands
+     * events before the next layer's kernels launch.  The upstream base
+     * splits kernels across the default stream (compressor/pack) and
      * cuda_decode_stream() (attention/gather); the per-layer device sync
-     * used to be the only ordering between them.  Waiting here instead of
-     * inside end_commands keeps the -4.5% overlap while restoring the
-     * barrier. */
+     * used to be the only ordering between them.  The host sync stays
+     * deferred until the next layer's begin, so the staging overlap between
+     * end and begin still absorbs the GPU tail.  (Stream-side waits would
+     * re-record the same event object while a wait is pending — UB.) */
     if (g_end_batch_pending && g_end_batch_event) {
         g_end_batch_pending = 0;
-        if (cudaStreamWaitEvent((cudaStream_t)0, g_end_batch_event, 0) !=
-            cudaSuccess) return 0;
+        if (cudaEventSynchronize(g_end_batch_event) != cudaSuccess) return 0;
         if (g_end_decode_event &&
-            cudaStreamWaitEvent(cuda_decode_stream(), g_end_decode_event, 0) !=
-                cudaSuccess) return 0;
+            cudaEventSynchronize(g_end_decode_event) != cudaSuccess) return 0;
     }
     return 1;
 }

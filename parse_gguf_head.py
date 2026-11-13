@@ -65,8 +65,5 @@ def main(path):
         ttype = struct.unpack_from('<I', f, off)[0]; off += 4
         toff = struct.unpack_from('<Q', f, off)[0]; off += 8
         print(f"  {name}: dims={dims} type={ttype} off={toff}")
-        if i >= 8:
-            print("  ...(truncated)")
-            break
 
 main(sys.argv[1])

@@ -5230,6 +5230,8 @@ typedef struct {
     ds4_tensor *nextn_hc_head_norm;
     ds4_tensor *nextn_hc_head_down;
     ds4_tensor *nextn_hc_head_up;
+    /* Qwen3.8-27B (qwen35) */
+    ds4_tensor *post_attn_norm;
 } ds4_layer_weights;
 
 typedef struct {
@@ -8392,7 +8394,45 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+/* Qwen3.8-27B (qwen35): same GDN/gated-GQA bones as the Flash-Next, but
+ * dense FFN, no hyper-connections, no PLE, no QSA indexer. */
+static void weights_bind_qwen35_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (ds4_qwen4_layer_is_linear(il)) {
+        l->lin_qkv     = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+        l->lin_gate    = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+        l->lin_conv    = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+        l->lin_dt_bias = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->lin_a       = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->lin_beta    = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+        l->lin_alpha   = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+        l->lin_norm    = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+        l->lin_out     = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+    } else {
+        l->attn_q         = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->attn_k         = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->attn_v         = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->attn_q_norm    = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm    = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+        l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    }
+    l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->post_attn_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
+    l->ffn_gate       = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+    l->ffn_up         = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+    l->ffn_down       = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    if (ds4_qwen4_layer_is_nextn(il)) {
+        l->nextn_eh_proj          = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm            = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm            = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm = required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        weights_bind_qwen35_layer(l, m, il);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
         return;

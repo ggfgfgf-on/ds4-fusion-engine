@@ -3074,7 +3074,14 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = -1;
     m->ngram_fd = -1;
 
-    int fd = open(path, O_RDONLY);
+    int fd =
+#ifdef _WIN32
+        getenv("DS4_CUDA_MODEL_SEQ_SCAN") != NULL
+            ? open(path, O_RDONLY | O_SEQUENTIAL)
+            : open(path, O_RDONLY);
+#else
+        open(path, O_RDONLY);
+#endif
     if (fd == -1) ds4_die_errno("cannot open model", path);
 
     struct stat st;
@@ -24167,6 +24174,45 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
     if (ok) {
+        /* DS4_CUDA_SLOT_BUDGET_MB: the batch compact table must fit the
+         * slot budget; an oversized layer falls back to the pinned full
+         * table instead of thrashing the resident compact cache. */
+        {
+            bool seen[DS4_MAX_EXPERT] = {0};
+            uint32_t unique = 0;
+            for (uint64_t i = 0; i < n_ids64; i++) {
+                const int32_t e = selected_ids[i];
+                if (e >= 0 && (uint32_t)e < DS4_MAX_EXPERT && !seen[e]) {
+                    seen[e] = true;
+                    unique++;
+                }
+            }
+            const uint64_t compact_bytes =
+                (uint64_t)unique * (gate_expert_bytes * 2u + down_expert_bytes);
+            uint64_t slot_budget = 2048ull * 1024ull * 1024ull; /* 2 GiB */
+            const char *budget_env = getenv("DS4_CUDA_SLOT_BUDGET_MB");
+            if (budget_env && budget_env[0]) {
+                char *end = NULL;
+                const unsigned long mb = strtoul(budget_env, &end, 10);
+                if (end != budget_env && mb > 0) {
+                    slot_budget = (uint64_t)mb * 1024ull * 1024ull;
+                }
+            }
+            if (compact_bytes > slot_budget) {
+                fprintf(stderr,
+                        "ds4: batch compact %.2f MiB exceeds slot budget %.2f MiB "
+                        "at layer %u; using pinned full table\n",
+                        (double)compact_bytes / 1048576.0,
+                        (double)slot_budget / 1048576.0,
+                        il);
+                /* The compact table now persists across layers (incremental
+                 * residency); drop it so the mmq tier cannot reuse a stale
+                 * table for this oversized layer. */
+                ds4_gpu_stream_expert_cache_release_resident();
+                free(selected_ids);
+                return true;
+            }
+        }
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
                                            layer,
@@ -39974,6 +40020,9 @@ static bool metal_graph_prefill_chunked_range(
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
+    /* Fresh prefill pass: the stage-read LRU bitmap tracks "already read"
+     * pages for this pass (repeats use the buffered cache path). */
+    ds4_gpu_stage_lru_reset();
     if (g->ssd_streaming && start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }

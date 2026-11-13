@@ -2381,10 +2381,70 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return 1;
 }
 
+/* ---- Windows stage-read LRU (DS4_CUDA_STAGE_LRU=1) -----------------
+ * Cold (first-touch) expert ranges bypass the page cache through a
+ * FILE_FLAG_NO_BUFFERING handle; recent repeats use the buffered fd so
+ * cross-chunk re-reads still hit the cache.  The system cache then holds
+ * only the recent window instead of the whole model sweep. */
+static int g_model_nobuf_fd = -1;
+/* Bitmap LRU: one bit per 4 KiB model page.  First touch of a page in the
+ * current prefill goes through the no-buffering handle (never enters the
+ * page cache); any later touch is a repeat and uses the buffered fd (cache
+ * hit).  O(1) lookup, covers the whole model, reset per prefill. */
+static uint8_t *g_stage_lru_map = NULL;
+static uint64_t g_stage_lru_map_bits = 0;
+
+static int cuda_stage_range_recent(uint64_t off, uint64_t bytes) {
+    if (!g_stage_lru_map) return 1;
+    uint64_t p0 = off >> 12;
+    uint64_t p1 = (off + bytes + 4095u) >> 12;
+    if (p1 > g_stage_lru_map_bits) p1 = g_stage_lru_map_bits;
+    for (uint64_t p = p0; p < p1; p++) {
+        if (!(g_stage_lru_map[p >> 3] & (uint8_t)(1u << (p & 7u)))) return 0;
+    }
+    return 1;
+}
+
+static void cuda_stage_range_record(uint64_t off, uint64_t bytes) {
+    if (!g_stage_lru_map) return;
+    uint64_t p0 = off >> 12;
+    uint64_t p1 = (off + bytes + 4095u) >> 12;
+    if (p1 > g_stage_lru_map_bits) p1 = g_stage_lru_map_bits;
+    for (uint64_t p = p0; p < p1; p++) {
+        g_stage_lru_map[p >> 3] |= (uint8_t)(1u << (p & 7u));
+    }
+}
+
+extern "C" void ds4_gpu_stage_lru_reset(void) {
+    if (g_stage_lru_map && g_stage_lru_map_bits) {
+        memset(g_stage_lru_map, 0, (size_t)((g_stage_lru_map_bits + 7u) >> 3));
+    }
+}
+
 static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
                                      uint64_t file_size, void *stage, uint64_t stage_bytes,
                                      uint64_t offset, uint64_t bytes, const char **payload) {
     *payload = (const char *)stage;
+#ifdef _WIN32
+    if (g_model_nobuf_fd >= 0 && !cuda_stage_range_recent(offset, bytes)) {
+        /* Cold range: sector-aligned read through the no-buffering handle so
+         * the page cache never sees it.  Recent repeats fall through to the
+         * buffered fd below and keep their cache hits. */
+        const uint64_t walign = 4096;
+        const uint64_t aligned_off = cuda_round_down(offset, walign);
+        const uint64_t delta = offset - aligned_off;
+        const uint64_t read_size = cuda_round_up(delta + bytes, walign);
+        if (aligned_off <= file_size &&
+            read_size <= stage_bytes &&
+            read_size <= file_size - aligned_off &&
+            cuda_pread_full(g_model_nobuf_fd, stage, read_size, aligned_off)) {
+            *payload = (const char *)stage + delta;
+            cuda_stage_range_record(offset, bytes);
+            return 1;
+        }
+        /* fall through to the buffered read */
+    }
+#endif
 #if defined(__linux__) && defined(O_DIRECT)
     if (*direct_fd >= 0 && align > 1 && file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, align);
@@ -4386,6 +4446,13 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
     }
+    if (g_model_nobuf_fd >= 0) {
+        (void)close(g_model_nobuf_fd);
+        g_model_nobuf_fd = -1;
+    }
+    free(g_stage_lru_map);
+    g_stage_lru_map = NULL;
+    g_stage_lru_map_bits = 0;
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
@@ -6014,6 +6081,46 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
                 }
             } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                 fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+            }
+        }
+#endif
+#ifdef _WIN32
+        /* Stage-read LRU: open a FILE_FLAG_NO_BUFFERING handle so cold
+         * expert ranges can bypass the page cache (aligned reads). */
+        if (getenv("DS4_CUDA_STAGE_LRU") != NULL) {
+            char pathbuf[4096];
+            const DWORD n = GetFinalPathNameByHandleA(
+                    (HANDLE)_get_osfhandle(fd),
+                    pathbuf, (DWORD)sizeof(pathbuf) - 1u, 0);
+            if (n > 0 && n < (DWORD)sizeof(pathbuf)) {
+                HANDLE h = CreateFileA(pathbuf, GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                           FILE_SHARE_DELETE,
+                                       NULL, OPEN_EXISTING,
+                                       FILE_FLAG_NO_BUFFERING, NULL);
+                if (h != INVALID_HANDLE_VALUE) {
+                    g_model_nobuf_fd = _open_osfhandle((intptr_t)h, _O_RDONLY);
+                    if (g_model_nobuf_fd >= 0) {
+                        g_stage_lru_map_bits =
+                            ((uint64_t)st.st_size + 4095u) >> 12;
+                        free(g_stage_lru_map);
+                        g_stage_lru_map = (uint8_t *)calloc(
+                                1, (size_t)((g_stage_lru_map_bits + 7u) >> 3));
+                        if (g_stage_lru_map) {
+                            fprintf(stderr,
+                                    "ds4: CUDA stage LRU enabled (cold reads bypass page cache, %.2f MiB bitmap)\n",
+                                    (double)((g_stage_lru_map_bits + 7u) >> 3) /
+                                        1048576.0);
+                        } else {
+                            g_stage_lru_map_bits = 0;
+                        }
+                    } else {
+                        (void)CloseHandle(h);
+                    }
+                }
+            }
+            if (g_model_nobuf_fd < 0) {
+                fprintf(stderr, "ds4: CUDA stage LRU direct handle unavailable\n");
             }
         }
 #endif

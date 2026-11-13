@@ -911,6 +911,158 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* ---- zero-copy pinned host-RAM registry (full expert tables) ----
+ * Large weight ranges (>= 64 MiB, e.g. a layer's full 256-expert table)
+ * home in pinned system RAM: the GPU reads them directly over PCIe, so the
+ * 8 GiB VRAM slot cache stays reserved for the compact decode/small-chunk
+ * path.  Rolling pin limit keeps the pinned working set bounded. */
+typedef struct {
+    const char *host_base;    /* 4KB-aligned registered base     */
+    uint64_t    host_bytes;   /* registered byte count           */
+    char       *device_base;  /* mapped device pointer           */
+    uint64_t    model_offset; /* requested range offset          */
+    uint64_t    model_bytes;  /* requested range bytes           */
+} cuda_pinned_range;
+
+static std::vector<cuda_pinned_range> g_pinned_ranges;
+static uint64_t g_pinned_bytes_total = 0;
+
+static uint64_t cuda_pinned_limit_bytes(void) {
+    static uint64_t cached = 0;
+    static int cached_done = 0;
+    if (cached_done) return cached;
+    cached_done = 1;
+
+    uint64_t limit = 0;
+    const char *env = getenv("DS4_CUDA_PINNED_LIMIT_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        const long v = strtol(env, &end, 10);
+        if (end != env && v > 0) limit = (uint64_t)v << 30;
+    }
+    if (limit == 0) {
+        /* ds4 host budget (④): derive the rolling pinned-RAM cap from the
+         * machine's physical memory — total/4 clamped to [2 GiB, 12 GiB].
+         * Small-host machines (which lean on the pinned expert tables
+         * hardest) get a proportional cap instead of the flat 12 GiB that
+         * can exhaust them; large hosts keep the historical 12 GiB. */
+        const long pg_l = sysconf(_SC_PAGESIZE);
+        const uint64_t pg = pg_l > 0 ? (uint64_t)pg_l : 4096u;
+        const long np_l = sysconf(_SC_PHYS_PAGES);
+        uint64_t total = 0;
+        if (np_l > 0 && (uint64_t)np_l <= UINT64_MAX / pg) {
+            total = (uint64_t)np_l * pg;
+        }
+        uint64_t derived = total / 4u;
+        if (derived < (2ull << 30)) derived = 2ull << 30;
+        if (derived > (12ull << 30)) derived = 12ull << 30;
+        limit = derived;
+        fprintf(stderr,
+                "ds4: CUDA pinned host-RAM budget derived: %.1f GiB (total %.1f GiB / 4, clamped [2,12] GiB)\n",
+                (double)limit / 1073741824.0,
+                (double)total / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA pinned host-RAM budget from env DS4_CUDA_PINNED_LIMIT_GB: %.1f GiB\n",
+                (double)limit / 1073741824.0);
+    }
+    cached = limit;
+    return cached;
+}
+
+static void cuda_pinned_evict_one(void) {
+    if (g_pinned_ranges.empty()) return;
+    cuda_pinned_range &r = g_pinned_ranges[0];
+    (void)cudaHostUnregister((void *)r.host_base);
+    g_pinned_bytes_total -= r.host_bytes;
+    g_pinned_ranges.erase(g_pinned_ranges.begin());
+}
+
+static const char *cuda_pinned_find(uint64_t offset, uint64_t bytes) {
+    for (const cuda_pinned_range &r : g_pinned_ranges) {
+        if (offset < r.model_offset) continue;
+        const uint64_t into = offset - r.model_offset;
+        if (into > r.model_bytes) continue;
+        if (bytes <= r.model_bytes - into) {
+            return r.device_base + into;
+        }
+    }
+    return NULL;
+}
+
+static const char *cuda_pinned_register(const void *model_map,
+                                        uint64_t offset, uint64_t bytes,
+                                        const char *what) {
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
+    const uintptr_t reg_addr0 = host_addr & ~(uintptr_t)(page_sz - 1u);
+    const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr0);
+    uintptr_t reg_addr = reg_addr0;
+    uint64_t  reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+    uint64_t  merged_off = offset, merged_end = offset + bytes;
+
+    /* Adjacent expert tables share page-aligned window boundaries, so a
+     * naive per-table cudaHostRegister fails with cudaErrorAlreadyMapped.
+     * Merge with every overlapping pinned window first: the whole layer
+     * block becomes one registration and eviction cannot unmap a
+     * neighbour's pages. */
+    for (size_t i = 0; i < g_pinned_ranges.size();) {
+        cuda_pinned_range &r = g_pinned_ranges[i];
+        const uintptr_t a0 = (uintptr_t)r.host_base;
+        const uintptr_t a1 = a0 + r.host_bytes;
+        if ((uintptr_t)reg_addr < a1 && a0 < (uintptr_t)reg_addr + reg_bytes) {
+            if (a0 < (uintptr_t)reg_addr) reg_addr = a0;
+            const uintptr_t hi = a1 > (uintptr_t)reg_addr + reg_bytes ?
+                                 a1 : (uintptr_t)reg_addr + reg_bytes;
+            reg_bytes = hi - reg_addr;
+            if (r.model_offset < merged_off) merged_off = r.model_offset;
+            const uint64_t re = r.model_offset + r.model_bytes;
+            if (re > merged_end) merged_end = re;
+            (void)cudaHostUnregister((void *)r.host_base);
+            g_pinned_bytes_total -= r.host_bytes;
+            g_pinned_ranges.erase(g_pinned_ranges.begin() + (ptrdiff_t)i);
+            i = 0; /* merged window may overlap further entries */
+            continue;
+        }
+        i++;
+    }
+
+    void *dev = NULL;
+    cudaError_t err = cudaHostRegister((void *)reg_addr, (size_t)reg_bytes,
+                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA pinned register failed for %s (%.2f MiB): %s\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    err = cudaHostGetDevicePointer(&dev, (void *)reg_addr, 0);
+    if (err != cudaSuccess || !dev) {
+        fprintf(stderr,
+                "ds4: CUDA pinned pointer lookup failed for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+        (void)cudaHostUnregister((void *)reg_addr);
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_pinned_ranges.push_back({(const char *)reg_addr, reg_bytes, (char *)dev,
+                               merged_off, merged_end - merged_off});
+    g_pinned_bytes_total += reg_bytes;
+    const uint64_t limit = cuda_pinned_limit_bytes();
+    while (g_pinned_bytes_total > limit && g_pinned_ranges.size() > 1) {
+        cuda_pinned_evict_one();
+    }
+    fprintf(stderr,
+            "ds4: CUDA pinned %s %.2f MiB zero-copy (pinned total %.2f GiB)\n",
+            what ? what : "weights",
+            (double)bytes / 1048576.0,
+            (double)g_pinned_bytes_total / 1073741824.0);
+    return (const char *)dev + ((uintptr_t)host_addr - (uintptr_t)reg_addr);
+}
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const uint64_t end = offset + bytes;
@@ -960,6 +1112,21 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (model_map == g_model_host_base && direct_env && direct_env[0]) {
         return cuda_model_ptr(model_map, offset);
+    }
+
+    /* Large ranges (full expert tables) home in pinned host RAM: try the
+     * zero-copy registry before the arena so the mmq tier can stream them
+     * directly over PCIe without VRAM residency.  Opt-in via
+     * DS4_CUDA_PINNED_ZEROCOPY=1 only; default keeps the VRAM slot path
+     * (WDDM's locked-page pool is limited). */
+    if (bytes >= 64ull * 1024ull * 1024ull &&
+        what && strncmp(what, "moe ", 4) == 0 &&
+        getenv("DS4_CUDA_PINNED_ZEROCOPY") != NULL) {
+        const char *pin = cuda_pinned_find(offset, bytes);
+        if (pin) return pin;
+        const char *reg = cuda_pinned_register(model_map, offset, bytes, what);
+        if (reg) return reg;
+        /* registration failed: fall through to the arena/copy paths */
     }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {

@@ -507,6 +507,45 @@ void ds4_gpu_indexer_paging_table_set(const ds4_gpu_tensor *table);
 void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t);
 /* Free dedicated-VRAM bytes (cudaMemGetInfo); 0 = unknown/non-CUDA. */
 uint64_t ds4_gpu_free_bytes(void);
+/* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
+ * norm of each packed index row (dequantized values), env-gated. */
+int ds4_gpu_index_norm_capture(
+        const ds4_gpu_tensor *cache,
+        ds4_gpu_tensor       *norm_cache,
+        uint32_t              cap,
+        uint32_t              first_row,
+        uint32_t              rows,
+        uint32_t              head_dim);
+/* Layer-2 stage 3 (DS4_CUDA_INDEXER_2STAGE=2): incremental MacQueen
+ * clustering capture at row-append time — nearest-centroid assignment
+ * (deterministic, lowest-id tie-break) + serial centroid/radius update with
+ * f64 round-up radius stores.  One radius per cluster. */
+int ds4_gpu_index_cluster_capture(
+        const ds4_gpu_tensor *cache,
+        ds4_gpu_tensor       *cent,
+        ds4_gpu_tensor       *radius,
+        ds4_gpu_tensor       *dmax,
+        ds4_gpu_tensor       *counts,
+        ds4_gpu_tensor       *assign,
+        uint32_t              cap,
+        uint32_t              first_row,
+        uint32_t              rows,
+        uint32_t              head_dim);
+/* Deterministic Lloyd re-cluster over the current ring content. */
+int ds4_gpu_index_cluster_recluster(
+        const ds4_gpu_tensor *cache,
+        ds4_gpu_tensor       *cent,
+        ds4_gpu_tensor       *radius,
+        ds4_gpu_tensor       *dmax,
+        ds4_gpu_tensor       *counts,
+        ds4_gpu_tensor       *assign,
+        uint32_t              cap,
+        uint32_t              n_comp,
+        uint32_t              head_dim,
+        uint32_t              rounds);
+/* Tensor-wide zero via the kernel memset (NOT cudaMemset: the driver fill
+ * engine corrupts WDDM-evicted pages). */
+int ds4_gpu_memset_zero_tensor(const ds4_gpu_tensor *t, void *stream);
 /* Prefill-safe weight-arena eviction protocol: enter/exit bracket one
  * SSD-streamed chunked prefill; each chunk boundary lets the arena reclaim
  * ranges resolved by earlier chunks that are already past the device. */
@@ -716,15 +755,22 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd);
 
+/* Single-token indexer scoring with the 2STAGE cluster/norm state. */
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *index_comp,
+        const ds4_gpu_tensor *norm2,
+        const ds4_gpu_tensor *clusters,
+        const ds4_gpu_tensor *cluster_radius,
+        const ds4_gpu_tensor *cluster_dmax,
+        const ds4_gpu_tensor *cluster_assign,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
-        float                   scale);
+        float                   scale,
+        uint32_t                top_k);
 
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,

@@ -1062,6 +1062,7 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
 #define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
 #define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
+#define DS4_N_INDEXER_CLUSTER         1024u
 #define DS4_N_HC                      (g_ds4_shape.n_hc)
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
 #define DS4_N_NEXTN_PREDICT           (g_ds4_shape.n_nextn_predict)
@@ -19355,6 +19356,161 @@ static const char *ds4_kv_bitq_profile_name(int prof) {
     }
 }
 
+static bool metal_graph_index_capture_after_pack(
+        ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows,
+        int reset) {
+    const char *st = getenv("DS4_CUDA_INDEXER_2STAGE");
+    if (!st || !st[0]) return true;
+    if (!g || il >= DS4_N_LAYER || rows == 0) return true;
+    if (!g->layer_index_comp_cache[il]) return true;
+    if (strcmp(st, "2") == 0) {
+        if (!g->layer_index_cluster_cent[il]) {
+            g->layer_index_cluster_cent[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)DS4_N_INDEXER_CLUSTER * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            g->layer_index_cluster_radius[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)DS4_N_INDEXER_CLUSTER * sizeof(float));
+            g->layer_index_cluster_dmax[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)DS4_N_INDEXER_CLUSTER * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            g->layer_index_cluster_count[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)DS4_N_INDEXER_CLUSTER * sizeof(uint32_t));
+            g->layer_index_cluster_assign[il] = ds4_gpu_tensor_alloc(
+                    (uint64_t)g->layer_comp_cap[il] * sizeof(uint32_t));
+            if (!g->layer_index_cluster_cent[il] ||
+                !g->layer_index_cluster_radius[il] ||
+                !g->layer_index_cluster_dmax[il] ||
+                !g->layer_index_cluster_count[il] ||
+                !g->layer_index_cluster_assign[il]) {
+                fprintf(stderr, "ds4: indexer cluster alloc failed layer=%u\n", il);
+                return false;
+            }
+            /* zero-init: unseeded clusters must read as empty (bound ~1e-12)
+             * and counts must start at 0 for MacQueen seeding. */
+            if (!ds4_gpu_memset_zero_tensor(g->layer_index_cluster_cent[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_radius[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_dmax[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_count[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_assign[il], NULL)) {
+                return false;
+            }
+        } else if (reset) {
+            /* Whole-ring rebuild (zero-prefix refresh / snapshot restore):
+             * the cluster stats are append-only, so re-capturing rows that
+             * are already in the running means/counts would double-count
+             * them.  Zero the stats first; the capture below re-folds the
+             * ring content in row order. */
+            if (!ds4_gpu_memset_zero_tensor(g->layer_index_cluster_cent[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_radius[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_dmax[il], NULL) ||
+                !ds4_gpu_memset_zero_tensor(g->layer_index_cluster_count[il], NULL)) {
+                return false;
+            }
+        }
+        bool cap_ok;
+        if (reset && rows > DS4_N_INDEXER_CLUSTER) {
+            /* Two passes after the zero above: the first M rows seed their
+             * slots, then the rest take the nearest-centroid path against
+             * the seeded centroids (a single pass would leave the nearest
+             * path with only zero centroids to compare). */
+            cap_ok = ds4_gpu_index_cluster_capture(
+                    g->layer_index_comp_cache[il],
+                    g->layer_index_cluster_cent[il],
+                    g->layer_index_cluster_radius[il],
+                    g->layer_index_cluster_dmax[il],
+                    g->layer_index_cluster_count[il],
+                    g->layer_index_cluster_assign[il],
+                    g->layer_comp_cap[il], first_row, DS4_N_INDEXER_CLUSTER,
+                    DS4_N_INDEXER_HEAD_DIM) != 0 &&
+                     ds4_gpu_index_cluster_capture(
+                    g->layer_index_comp_cache[il],
+                    g->layer_index_cluster_cent[il],
+                    g->layer_index_cluster_radius[il],
+                    g->layer_index_cluster_dmax[il],
+                    g->layer_index_cluster_count[il],
+                    g->layer_index_cluster_assign[il],
+                    g->layer_comp_cap[il],
+                    first_row + DS4_N_INDEXER_CLUSTER,
+                    rows - DS4_N_INDEXER_CLUSTER,
+                    DS4_N_INDEXER_HEAD_DIM) != 0;
+        } else {
+            cap_ok = ds4_gpu_index_cluster_capture(
+                    g->layer_index_comp_cache[il],
+                    g->layer_index_cluster_cent[il],
+                    g->layer_index_cluster_radius[il],
+                    g->layer_index_cluster_dmax[il],
+                    g->layer_index_cluster_count[il],
+                    g->layer_index_cluster_assign[il],
+                    g->layer_comp_cap[il], first_row, rows,
+                    DS4_N_INDEXER_HEAD_DIM) != 0;
+        }
+        if (!cap_ok) return false;
+        /* Periodic deterministic Lloyd re-cluster (env-gated): the online
+         * MacQueen state accumulates large radii that keep the cluster bound
+         * from pruning; a full re-cluster every N appended rows recenters
+         * the centroids and shrinks the radii. */
+        const char *rn = getenv("DS4_CUDA_INDEXER_2STAGE_RECLUSTER");
+        long N = 0;
+        if (rn && rn[0]) {
+            N = strtol(rn, NULL, 10);
+            if (N < 0) N = 0;
+        }
+        if (N > 0) {
+            g->layer_index_cluster_age[il] += rows;
+            if (g->layer_index_cluster_age[il] >= (uint32_t)N &&
+                g->layer_n_index_comp[il] != 0u) {
+                long it = 3;
+                const char *it_env =
+                    getenv("DS4_CUDA_INDEXER_2STAGE_RECLUSTER_ITER");
+                if (it_env && it_env[0]) {
+                    it = strtol(it_env, NULL, 10);
+                    if (it < 1) it = 1;
+                    if (it > 16) it = 16;
+                }
+                if (ds4_gpu_index_cluster_recluster(
+                        g->layer_index_comp_cache[il],
+                        g->layer_index_cluster_cent[il],
+                        g->layer_index_cluster_radius[il],
+                        g->layer_index_cluster_dmax[il],
+                        g->layer_index_cluster_count[il],
+                        g->layer_index_cluster_assign[il],
+                        g->layer_comp_cap[il],
+                        g->layer_n_index_comp[il],
+                        DS4_N_INDEXER_HEAD_DIM,
+                        (uint32_t)it) == 0) {
+                    return false;
+                }
+                g->layer_index_cluster_age[il] = 0u;
+            }
+        }
+        return true;
+    }
+    /* Row-bound mode (existing) below */
+    if (!g->layer_index_norm_cache[il]) {
+        g->layer_index_norm_cache[il] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->layer_comp_cap[il] * sizeof(float));
+        if (!g->layer_index_norm_cache[il]) {
+            fprintf(stderr, "ds4: indexer norm cache alloc failed layer=%u\n", il);
+            return false;
+        }
+    }
+    return ds4_gpu_index_norm_capture(
+            g->layer_index_comp_cache[il],
+            g->layer_index_norm_cache[il],
+            g->layer_comp_cap[il],
+            first_row, rows,
+            DS4_N_INDEXER_HEAD_DIM) != 0;
+}
+
+/* ---- ④ 阶段2 KV paging (DS4_CUDA_INDEXER_PAGING, default OFF) ----
+ * 512-row pages over the attn comp cache; a resident ring of physical
+ * slots plus an SSD backing file.  Every eviction is bit-verified
+ * (write -> readback -> memcmp, a mismatch aborts the run, never silent);
+ * every pull restores the exact evicted bytes.  The .cu paged gather
+ * translates logical page -> physical slot via the device table.
+ *
+ * v1 constraints (documented): requires DS4_CUDA_KV_BITQ_COMP and the
+ * indexed-attention path (the shrink changes the ring layout, so non-gather
+ * readers are unsupported while the env is on); no CUDA TP cache dup; the
+ * session-restore path refuses to run under paging. */
 static bool ds4_indexer_paging_enabled(void);
 static bool metal_graph_indexer_paging_init_layer(
         ds4_gpu_graph *g, uint32_t il);
@@ -26085,6 +26241,10 @@ static bool metal_graph_encode_decode_layer_phase(
                         g->layer_index_comp_cache[il],
                         g->layer_comp_cap[il],
                         index_row, 1u, DS4_N_INDEXER_HEAD_DIM) != 0;
+                if (ok) {
+                    ok = metal_graph_index_capture_after_pack(
+                            g, il, index_row, 1u, 0);
+                }
                 DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_pack");
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
@@ -26147,10 +26307,16 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                 metal_graph_indexer_q(g),
                                                                 metal_graph_indexer_weights(g),
                                                                 g->layer_index_comp_cache[il],
+                                                                g->layer_index_norm_cache[il],
+                                                                g->layer_index_cluster_cent[il],
+                                                                g->layer_index_cluster_radius[il],
+                                                                g->layer_index_cluster_dmax[il],
+                                                                g->layer_index_cluster_assign[il],
                                                                 g->layer_n_index_comp[il],
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
+                                                                index_scale,
+                                                                DS4_N_INDEXER_TOP_K) != 0;
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -33007,6 +33173,10 @@ static bool metal_graph_encode_layer_attention_batch(
                             g->layer_index_comp_cache[il],
                             g->layer_comp_cap[il],
                             0u, n_comp, DS4_N_INDEXER_HEAD_DIM) != 0;
+                    if (ok) {
+                        ok = metal_graph_index_capture_after_pack(
+                                g, il, 0u, n_comp, 1);
+                    }
                 }
                 if (ok) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -33112,6 +33282,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                 g->layer_comp_cap[il],
                                 index_before, index_chunk,
                                 DS4_N_INDEXER_HEAD_DIM) != 0;
+                        if (ok) {
+                            ok = metal_graph_index_capture_after_pack(
+                                    g, il, index_before, index_chunk, 0);
+                        }
                     }
                     if (ok) {
                         ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -33661,10 +33835,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             indexer_q_view,
                                                             indexer_w_view,
                                                             g->layer_index_comp_cache[il],
+                                                            g->layer_index_norm_cache[il],
+                                                            g->layer_index_cluster_cent[il],
+                                                            g->layer_index_cluster_radius[il],
+                                                            g->layer_index_cluster_dmax[il],
+                                                            g->layer_index_cluster_assign[il],
                                                             cur_index,
                                                             DS4_N_INDEXER_HEAD,
                                                             DS4_N_INDEXER_HEAD_DIM,
-                                                            index_scale) != 0 &&
+                                                            index_scale,
+                                                            DS4_N_INDEXER_TOP_K) != 0 &&
                          ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
                                                        metal_graph_indexer_scores(g),
                                                        cur_index,

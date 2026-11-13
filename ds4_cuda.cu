@@ -17324,14 +17324,20 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *index_comp,
+        const ds4_gpu_tensor *norm2,
+        const ds4_gpu_tensor *clusters,
+        const ds4_gpu_tensor *cluster_radius,
+        const ds4_gpu_tensor *cluster_dmax,
+        const ds4_gpu_tensor *cluster_assign,
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
-        float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, NULL,
-                                 NULL, NULL, NULL, NULL,
+        float                   scale,
+        uint32_t                top_k) {
+    return indexer_scores_launch(scores, q, weights, index_comp, norm2,
+                                 clusters, cluster_radius, cluster_dmax, cluster_assign,
                                  n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0, 0);
+                                 n_head, head_dim, 1, scale, 0, top_k);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(

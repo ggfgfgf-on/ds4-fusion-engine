@@ -1,0 +1,9 @@
+__global__ static void store_raw_kv_bitq_batch_kernel(
+        unsigned char *raw, const float *kv, uint32_t raw_cap,
+        uint32_t pos0, uint32_t n_tokens, uint32_t head_dim, int bits) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens) return;
+    const uint32_t row = (pos0 + t) % raw_cap;
+    kv_bitq_pack_row(raw + (uint64_t)row * kv_bitq_row_bytes(head_dim, bits),
+                     kv + (uint64_t)t * head_dim, head_dim, bits);
+}

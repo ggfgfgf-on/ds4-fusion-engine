@@ -5,21 +5,21 @@ ds4: CUDA preparing model tensor mappings
 ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool free for DWM/OS (DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=8, 0=off)
 ds4: WDDM shared-pool budget 44.93 GiB
 ds4: CUDA loading model tensors into device cache
-ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.534s
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.559s
 ds4: cuda backend initialized for graph diagnostics
 ds4: memory: KV 0.20 GiB (raw 0.17 + compressed 0.04) + buffers 0.13 GiB + resident model 2.81 GiB + expert cache 0.11 GiB = 3.25 GiB planned
 ds4: memory detail: ctx=8192 prefill_cap=8192 raw_kv_rows=8192 compressed_kv_rows=2050 backend=cuda
-1114 00:40:09 ds4-server: context buffers 341.40 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
-1114 00:40:10 ds4-server: listening on http://127.0.0.1:8000
-1114 00:40:11 ds4-server: chat ctx=0..118:118 prompt start
+1114 05:57:07 ds4-server: context buffers 341.40 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
+1114 05:57:07 ds4-server: listening on http://127.0.0.1:8000
+1114 05:57:08 ds4-server: chat ctx=0..118:118 prompt start
 ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=64.00 MiB cached=0.00 GiB free=0.00 GiB reserve=0.75 GiB total=7.93 GiB)
 ds4: CUDA SSD expert cache: 227 slots, 1.50 GiB
 ds4: CUDA SSD expert cache: 228 slots, 1.50 GiB
-ds4: CUDA loading model tensors 1.73 GiB cached
-ds4: CUDA loading model tensors 3.43 GiB cached
-ds4: CUDA loading model tensors 5.30 GiB cached
-ds4: CUDA loading model tensors 7.13 GiB cached
-1114 00:40:54 ds4-server: chat ctx=0..118:118 prompt done 43.149s
+ds4: CUDA loading model tensors 1.79 GiB cached
+ds4: CUDA loading model tensors 3.75 GiB cached
+ds4: CUDA loading model tensors 5.78 GiB cached
+ds4: CUDA loading model tensors 7.66 GiB cached
+1114 05:57:48 ds4-server: chat ctx=0..118:118 prompt done 40.010s
 ds4: CUDA loading model tensors 8.20 GiB cached
-1114 00:43:14 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.34 t/s avg=0.34 t/s 139.683s
-1114 00:43:14 ds4-server: chat ctx=0..118:118 gen=48 finish=length 182.834s
+1114 06:03:28 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.14 t/s avg=0.14 t/s 339.659s
+1114 06:03:28 ds4-server: chat ctx=0..118:118 gen=48 finish=length 379.671s

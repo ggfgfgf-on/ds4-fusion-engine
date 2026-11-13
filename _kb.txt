@@ -1,0 +1,20 @@
+__global__ static void fp8_kv_bitq_store_rows_kernel(
+        float                           *x,
+        cuda_attention_decode_row_table  rows,
+        uint32_t                         n_rows,
+        uint32_t                         head_dim,
+        uint32_t                         n_rot,
+        int                              bits) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    __shared__ float scratch[64];
+    float *xr = x + (uint64_t)row * head_dim;
+    fp8_kv_quantize_row(xr, head_dim, n_rot, scratch);
+
+    const ds4_gpu_attention_decode_row dsc = rows.row[row];
+    unsigned char *raw = (unsigned char *)(uintptr_t)dsc.raw_kv;
+    if (threadIdx.x == 0u) {
+        kv_bitq_pack_row_f16(raw + (uint64_t)dsc.raw_start *
+                kv_bitq_row_bytes(head_dim, bits), xr, head_dim, bits);
+    }
+}

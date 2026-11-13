@@ -4098,7 +4098,7 @@ extern "C" int ds4_gpu_comp_cache_bitq_pack_stage_tensor(
     if (!kv_bitq_comp_on()) return 1;
     if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
     if (!kv_comp_bytes_ok(cache, cap, head_dim)) return 0;
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
             (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
             first_row, rows, head_dim, kv_bitq_comp_bits());
     return cuda_ok(cudaGetLastError(), "comp bitq pack stage launch");
@@ -4121,7 +4121,7 @@ extern "C" int ds4_gpu_comp_cache_bitq_pack_page_tensor(
         return 0;
     }
     const int bits = kv_bitq_comp_bits();
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
             (unsigned char *)cache->ptr +
                     (uint64_t)phys_slot * 512u * kv_bitq_row_bytes(head_dim, bits),
             (const float *)stage->ptr + (uint64_t)stage_row * head_dim,
@@ -4185,7 +4185,7 @@ extern "C" int ds4_gpu_index_cache_bitq_pack_stage_tensor(
     if (!kv_bitq_idx_on()) return 1;
     if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
     if (!kv_idx_bytes_ok(cache, cap, head_dim)) return 0;
-    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u, 0, cuda_decode_stream()>>>(
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
             (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
             first_row, rows, head_dim, kv_bitq_idx_bits());
     return cuda_ok(cudaGetLastError(), "idx bitq pack stage launch");
@@ -6429,11 +6429,29 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
     return cuda_ok(cudaGetLastError(), "pack_slot_rows_f32 launch");
 }
 
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 static cudaEvent_t g_end_batch_event = NULL;
 static cudaEvent_t g_end_decode_event = NULL;
 int g_end_batch_pending = 0;
+
+extern "C" int ds4_gpu_begin_commands(void) {
+    /* Deferred barrier: wait the previous layer's end-commands events on
+     * BOTH streams before the next layer's kernels launch.  The upstream
+     * base splits kernels across the default stream (compressor/pack) and
+     * cuda_decode_stream() (attention/gather); the per-layer device sync
+     * used to be the only ordering between them.  Waiting here instead of
+     * inside end_commands keeps the -4.5% overlap while restoring the
+     * barrier. */
+    if (g_end_batch_pending && g_end_batch_event) {
+        g_end_batch_pending = 0;
+        if (cudaStreamWaitEvent((cudaStream_t)0, g_end_batch_event, 0) !=
+            cudaSuccess) return 0;
+        if (g_end_decode_event &&
+            cudaStreamWaitEvent(cuda_decode_stream(), g_end_decode_event, 0) !=
+                cudaSuccess) return 0;
+    }
+    return 1;
+}
+extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 
 /* Optimized per-layer sync (deferred by default): the barrier stays, but
  * the wait is deferred until the host is about to overwrite buffers the

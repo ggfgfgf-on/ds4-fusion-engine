@@ -5,9 +5,9 @@ ds4: CUDA preparing model tensor mappings
 ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool free for DWM/OS (DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=8, 0=off)
 ds4: WDDM shared-pool budget 44.93 GiB
 ds4: CUDA loading model tensors into device cache
-ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.556s
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.560s
 ds4: cuda backend initialized for graph diagnostics
 ds4: memory: KV 0.27 GiB (raw 0.17 + compressed 0.11) + buffers 0.13 GiB + resident model 2.81 GiB + expert cache 0.11 GiB = 3.32 GiB planned
 ds4: memory detail: ctx=8192 prefill_cap=8192 raw_kv_rows=8192 compressed_kv_rows=2050 backend=cuda
-1114 00:36:49 ds4-server: context buffers 411.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
-1114 00:36:50 ds4-server: listening on http://127.0.0.1:8000
+1114 01:30:26 ds4-server: context buffers 411.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
+1114 01:30:26 ds4-server: listening on http://127.0.0.1:8000

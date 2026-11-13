@@ -1,0 +1,20 @@
+}
+
+/* Pack staged f32 comp rows into the packed cache at [first_row,
+ * first_row + rows).  The packed cache cannot receive f32 writes in place,
+ * so the driver stages through attn_comp_stage and commits here. */
+extern "C" int ds4_gpu_comp_cache_bitq_pack_stage_tensor(
+        const ds4_gpu_tensor *stage, ds4_gpu_tensor *cache, uint32_t cap,
+        uint32_t first_row, uint32_t rows, uint32_t head_dim) {
+    if (!stage || !cache || cap == 0u || rows == 0u ||
+        first_row + rows > cap) {
+        return 0;
+    }
+    if (!kv_bitq_comp_on()) return 1;
+    if (stage->bytes < (uint64_t)rows * head_dim * sizeof(float)) return 0;
+    if (!kv_comp_bytes_ok(cache, cap, head_dim)) return 0;
+    store_raw_kv_bitq_batch_kernel<<<(rows + 255u) / 256u, 256u>>>(
+            (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
+            first_row, rows, head_dim, kv_bitq_comp_bits());
+    return cuda_ok(cudaGetLastError(), "comp bitq pack stage launch");
+}

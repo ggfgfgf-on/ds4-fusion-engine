@@ -23845,7 +23845,8 @@ static bool metal_graph_store_attn_comp_stage(
 static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16
+    (void)il;
+    return (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_bitq_comp_enabled())
         ? metal_graph_attn_comp_stage(g)
         : g->layer_attn_comp_cache[il];
 }

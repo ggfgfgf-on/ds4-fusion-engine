@@ -14631,6 +14631,48 @@ static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
     return cuda_tensor_parallel ? DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK : 0;
 }
 
+/* VRAM-aware prefill-cap budget: binary-search the largest cap whose
+ * raw ring + attention scratch + batch workspace fits half the free VRAM.
+ * The fixed 4096 clamp remains the fallback when the VRAM query is
+ * unavailable (non-CUDA backends). */
+static uint32_t ds4_prefill_cap_budget(int prompt_len) {
+    if (prompt_len <= 0) return 1;
+    const uint64_t free_b = ds4_gpu_free_bytes();
+    if (free_b == 0) {
+        return prompt_len > 4096
+                   ? (DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u)
+                   : (uint32_t)prompt_len;
+    }
+    /* Headroom: half the free VRAM for the transient consumers. */
+    const uint64_t budget = free_b / 2u;
+    uint32_t lo = 128u, hi = (uint32_t)prompt_len;
+    const uint64_t comp_cap = (uint64_t)(prompt_len / 4u) + 2u;
+    /* DS4_CUDA_KV_BITQ: the packed ring costs row_bytes per row, so the
+     * budget cap can be larger under the env. */
+    const uint64_t raw_row_bytes = ds4_kv_bitq_enabled()
+            ? ds4_kv_bitq_row_bytes(DS4_N_HEAD_DIM)
+            : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo + 1u) / 2u;
+        const uint64_t raw_cap = (uint64_t)mid + DS4_N_SWA;
+        const uint64_t kv_bytes =
+            (uint64_t)DS4_N_LAYER * raw_cap * raw_row_bytes;
+        const uint64_t scratch =
+            2ull * comp_cap * mid * sizeof(float) +
+            ((uint64_t)mid / 4u + 2u) * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t batch = (uint64_t)mid * 16384ull;
+        if (kv_bytes + scratch + batch <= budget) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint32_t cap = lo;
+    if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
+    if (cap == 0) cap = 1;
+    return cap;
+}
+
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
@@ -14648,7 +14690,7 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 cap = (uint32_t)v;
             }
         } else if (prompt_len > 4096) {
-            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+            cap = ds4_prefill_cap_budget(prompt_len);
         }
     }
 

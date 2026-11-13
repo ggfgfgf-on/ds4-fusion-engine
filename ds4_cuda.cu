@@ -22039,6 +22039,203 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
+/* SlimInfer APIA: export attention scores of the LAST token of a batch, reduced
+ * over heads. Matches the math of the dense raw-heads GEMM exactly:
+ *   scores[h][t][i] = Q[t,h,:] . K[i,:] * rsqrt(head_dim)   (K shared across heads)
+ * then  score_out[i] = sum_h scores[h][last][i]
+ * The caller passes the same q / raw_kv tensors used for the dense attention,
+ * so whatever dtype the attention consumed (float after in-place fp8-quantize
+ * round-trip) is what we read here. */
+__global__ void last_token_score_reduce_kernel(const float *scores, float *score_out,
+                                               uint32_t n_keys, uint32_t n_head)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_keys) return;
+    float s = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) s += scores[(uint64_t)h * n_keys + i];
+    score_out[i] = s;
+}
+
+extern "C" int ds4_gpu_prefill_last_token_scores_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *raw_kv,
+                                                        ds4_gpu_tensor *score_out, uint32_t n_tokens,
+                                                        uint32_t n_head, uint32_t head_dim)
+{
+    if (!q || !raw_kv || !score_out || n_tokens == 0 || n_head == 0 || head_dim == 0) return 0;
+    if (q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float)) return 0;
+    if (raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+    if (score_out->bytes < (uint64_t)n_tokens * sizeof(float)) return 0;
+    if (!g_cublas_ready) return 0;
+
+    const int logical_tier = ds4_tensor_device_idx(q);
+    const uint64_t score_bytes = (uint64_t)n_head * n_tokens * sizeof(float);
+    float *scores = (float *)cuda_tmp_alloc_on(logical_tier, score_bytes, "sliminfer last-token scores");
+    if (!scores) return 0;
+
+    /* C[h][1][n_keys] = K^T[n_keys x head_dim] * Q_last[h][head_dim x 1]
+     * Same strides as the dense raw-heads GEMM: K shared (strideA=0),
+     * B per-head rows (strideB=head_dim), scores [h][n_keys] (strideC=n_keys). */
+    const float alpha = rsqrtf((float)head_dim);
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasSgemmStridedBatched(
+        cuda_cublas_for_tier(logical_tier),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)n_tokens /*n_keys*/, 1, (int)head_dim,
+        &alpha,
+        (const float *)raw_kv->ptr, (int)head_dim, 0,
+        (const float *)q->ptr + (uint64_t)(n_tokens - 1) * n_head * head_dim,
+        (int)head_dim, (long long)head_dim,
+        &beta,
+        scores, (int)n_tokens, (long long)n_tokens,
+        (int)n_head);
+    if (!cublas_ok(st, "sliminfer last-token score gemm")) return 0;
+
+    uint32_t blocks = (n_tokens + 255) / 256;
+    last_token_score_reduce_kernel<<<blocks, 256>>>(
+        scores, (float *)score_out->ptr, n_tokens, n_head);
+    return cuda_ok(cudaGetLastError(), "sliminfer last-token score reduce launch");
+}
+
+/* SlimInfer FFN-skip row plumbing. The layer-major prefill keeps every token
+ * at its original position (KV is position-addressed), so pruned rows are
+ * compacted only for the FFN encode and scattered back afterwards:
+ *   1. pruned-identity: next_hc[p] = after_attn[p]   (skip FFN for pruned rows)
+ *   2. gather-forward:   after_attn[c] = after_attn[active_idx[c]]
+ *                        in-place, safe because active_idx is strictly
+ *                        increasing with active_idx[c] >= c.
+ *   3. (FFN encode runs on rows [0, n_active))
+ *   4. scatter-active:   next_hc[active_idx[c]] = next_hc[c], c decreasing —
+ *                        safe because every write target active_idx[c] >= c is
+ *                        never a later copy's source or target. */
+__global__ void sliminfer_pruned_identity_kernel(float *next_hc, const float *after_attn,
+                                                 const uint8_t *prune_mask,
+                                                 uint32_t n_tokens, uint32_t row_elems)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_tokens || !prune_mask[row]) return;
+    const float *s = after_attn + (uint64_t)row * row_elems;
+    float *d = next_hc + (uint64_t)row * row_elems;
+    for (uint32_t i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = s[i];
+}
+
+__global__ void sliminfer_gather_forward_kernel(float *x, const uint32_t *active_idx,
+                                                uint32_t n_active, uint32_t row_elems)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_active) return;
+    const float *s = x + (uint64_t)active_idx[row] * row_elems;
+    float *d = x + (uint64_t)row * row_elems;
+    for (uint32_t i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = s[i];
+}
+
+__global__ void sliminfer_scatter_active_kernel(float *next_hc, const uint32_t *active_idx,
+                                                uint32_t n_active, uint32_t row_elems)
+{
+    uint32_t c = n_active - 1u - blockIdx.x;
+    if (c >= n_active) return;
+    const float *s = next_hc + (uint64_t)c * row_elems;
+    float *d = next_hc + (uint64_t)active_idx[c] * row_elems;
+    for (uint32_t i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = s[i];
+}
+
+/* Pruned rows below n_active (the compact region) lose their after-attention
+ * state to the in-place gather and their next_hc slot to the compact FFN;
+ * save them before the gather and restore them after the scatter. */
+__global__ void sliminfer_pruned_save_kernel(float *save, const float *after_attn,
+                                             const uint8_t *prune_mask,
+                                             uint32_t n_rows, uint32_t row_elems)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows || !prune_mask[row]) return;
+    const float *s = after_attn + (uint64_t)row * row_elems;
+    float *d = save + (uint64_t)row * row_elems;
+    for (uint32_t i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = s[i];
+}
+
+__global__ void sliminfer_pruned_restore_kernel(float *next_hc, const float *save,
+                                                const uint8_t *prune_mask,
+                                                uint32_t n_rows, uint32_t row_elems)
+{
+    uint32_t row = blockIdx.x;
+    if (row >= n_rows || !prune_mask[row]) return;
+    const float *s = save + (uint64_t)row * row_elems;
+    float *d = next_hc + (uint64_t)row * row_elems;
+    for (uint32_t i = threadIdx.x; i < row_elems; i += blockDim.x) d[i] = s[i];
+}
+
+extern "C" int ds4_gpu_sliminfer_pruned_save_tensor(ds4_gpu_tensor *save,
+                                                    ds4_gpu_tensor *after_attn,
+                                                    ds4_gpu_tensor *prune_mask,
+                                                    uint32_t n_rows,
+                                                    uint32_t row_elems)
+{
+    if (!save || !after_attn || !prune_mask || n_rows == 0 || row_elems == 0) return 0;
+    if (save->bytes < (uint64_t)n_rows * row_elems * sizeof(float)) return 0;
+    if (after_attn->bytes < (uint64_t)n_rows * row_elems * sizeof(float)) return 0;
+    if (prune_mask->bytes < (uint64_t)n_rows) return 0;
+    sliminfer_pruned_save_kernel<<<n_rows, 256>>>(
+        (float *)save->ptr, (const float *)after_attn->ptr,
+        (const uint8_t *)prune_mask->ptr, n_rows, row_elems);
+    return cuda_ok(cudaGetLastError(), "sliminfer pruned save launch");
+}
+
+extern "C" int ds4_gpu_sliminfer_pruned_restore_tensor(ds4_gpu_tensor *next_hc,
+                                                       ds4_gpu_tensor *save,
+                                                       ds4_gpu_tensor *prune_mask,
+                                                       uint32_t n_rows,
+                                                       uint32_t row_elems)
+{
+    if (!next_hc || !save || !prune_mask || n_rows == 0 || row_elems == 0) return 0;
+    if (next_hc->bytes < (uint64_t)n_rows * row_elems * sizeof(float)) return 0;
+    if (save->bytes < (uint64_t)n_rows * row_elems * sizeof(float)) return 0;
+    if (prune_mask->bytes < (uint64_t)n_rows) return 0;
+    sliminfer_pruned_restore_kernel<<<n_rows, 256>>>(
+        (float *)next_hc->ptr, (const float *)save->ptr,
+        (const uint8_t *)prune_mask->ptr, n_rows, row_elems);
+    return cuda_ok(cudaGetLastError(), "sliminfer pruned restore launch");
+}
+
+extern "C" int ds4_gpu_sliminfer_pruned_identity_tensor(ds4_gpu_tensor *next_hc,
+                                                        ds4_gpu_tensor *after_attn,
+                                                        ds4_gpu_tensor *prune_mask,
+                                                        uint32_t n_tokens,
+                                                        uint32_t row_elems)
+{
+    if (!next_hc || !after_attn || !prune_mask || n_tokens == 0 || row_elems == 0) return 0;
+    if (next_hc->bytes < (uint64_t)n_tokens * row_elems * sizeof(float)) return 0;
+    if (after_attn->bytes < (uint64_t)n_tokens * row_elems * sizeof(float)) return 0;
+    if (prune_mask->bytes < (uint64_t)n_tokens) return 0;
+    sliminfer_pruned_identity_kernel<<<n_tokens, 256>>>(
+        (float *)next_hc->ptr, (const float *)after_attn->ptr,
+        (const uint8_t *)prune_mask->ptr, n_tokens, row_elems);
+    return cuda_ok(cudaGetLastError(), "sliminfer pruned identity launch");
+}
+
+extern "C" int ds4_gpu_sliminfer_gather_forward_tensor(ds4_gpu_tensor *x,
+                                                       ds4_gpu_tensor *active_idx,
+                                                       uint32_t n_active,
+                                                       uint32_t row_elems)
+{
+    if (!x || !active_idx || n_active == 0 || row_elems == 0) return 0;
+    if (x->bytes < (uint64_t)n_active * row_elems * sizeof(float)) return 0;
+    if (active_idx->bytes < (uint64_t)n_active * sizeof(uint32_t)) return 0;
+    sliminfer_gather_forward_kernel<<<n_active, 256>>>(
+        (float *)x->ptr, (const uint32_t *)active_idx->ptr, n_active, row_elems);
+    return cuda_ok(cudaGetLastError(), "sliminfer gather forward launch");
+}
+
+extern "C" int ds4_gpu_sliminfer_scatter_active_tensor(ds4_gpu_tensor *next_hc,
+                                                       ds4_gpu_tensor *active_idx,
+                                                       uint32_t n_active,
+                                                       uint32_t row_elems)
+{
+    if (!next_hc || !active_idx || n_active == 0 || row_elems == 0) return 0;
+    if (next_hc->bytes < (uint64_t)n_active * row_elems * sizeof(float)) return 0;
+    if (active_idx->bytes < (uint64_t)n_active * sizeof(uint32_t)) return 0;
+    sliminfer_scatter_active_kernel<<<n_active, 256>>>(
+        (float *)next_hc->ptr, (const uint32_t *)active_idx->ptr, n_active, row_elems);
+    return cuda_ok(cudaGetLastError(), "sliminfer scatter active launch");
+}
+
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64, 0, cuda_decode_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot);

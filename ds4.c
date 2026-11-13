@@ -18424,6 +18424,10 @@ typedef struct {
     ds4_gpu_tensor *batch_shared_up_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_shared_mid_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_shared_out_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *batch_prune_save_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *batch_prune_mask_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *batch_prune_active_idx_by_tier[DS4_MAX_GPUS];
+    ds4_gpu_tensor *batch_scores_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_router_logits_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_router_probs_by_tier[DS4_MAX_GPUS];
     ds4_gpu_tensor *batch_router_selected_by_tier[DS4_MAX_GPUS];
@@ -18477,6 +18481,19 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    /* SlimInfer APIA token pruning (Windows/8GB fusion port).  Uses the
+     * last-token attention scores at the pruning layer, host-side keep/prune
+     * decision, and position-preserving FFN skip for pruned rows. */
+#define DS4_SLIMINFER_MAX_TOKENS 2048
+    bool sliminfer_active;
+    float sliminfer_ratio;         /* fraction of tokens to prune (0..1) */
+    uint32_t sliminfer_prune_layer; /* dense layer whose attention exports scores */
+    uint32_t sliminfer_start_pos;   /* minimum absolute token position to prune */
+    uint32_t sliminfer_n_active;    /* per-chunk active rows after decide */
+    uint8_t  sliminfer_mask_host[DS4_SLIMINFER_MAX_TOKENS]; /* per-chunk prune mask (host) */
+    bool     sliminfer_pruned_batch;/* true while the current chunk has pruned rows */
+    uint32_t sliminfer_kept_rows;   /* stats: rows kept across the prefill */
+    uint32_t sliminfer_total_rows;  /* stats: rows seen */
     /* Metal-only prefill helpers retained alongside the CUDA tiered workspace. */
     ds4_gpu_tensor *batch_q_half;
     ds4_gpu_tensor *prefill_seed_router_selected;
@@ -18549,6 +18566,10 @@ typedef struct {
     X(batch_shared_mid)                     \
     X(batch_shared_up)                      \
     X(batch_shared_gate)                    \
+    X(batch_prune_save)                     \
+    X(batch_prune_mask)                     \
+    X(batch_prune_active_idx)               \
+    X(batch_scores)                         \
     X(batch_ffn_norm)                       \
     X(batch_ffn_cur)                        \
     X(batch_after_attn_hc)                  \
@@ -18688,6 +18709,10 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_shared_gate)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_shared_up)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_shared_mid)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_shared_out)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_prune_save)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_prune_mask)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_prune_active_idx)
+DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_scores)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_router_logits)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_router_probs)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(batch_router_selected)
@@ -20583,6 +20608,51 @@ static bool metal_graph_alloc_raw_cap(
                 "(half-resident decode and prefill)\n");
     }
     g->mtp_enabled = enable_mtp;
+    /* SlimInfer APIA token pruning (Windows/8GB fusion port). Off unless
+     * DS4_SLIMINFER_RATIO is set. Pruning is wired for the layer-major
+     * batch prefill dense-path attention export. */
+    {
+        const char *si_env = getenv("DS4_SLIMINFER_RATIO");
+        g->sliminfer_active = false;
+        g->sliminfer_ratio = 0.0f;
+        g->sliminfer_prune_layer = 1;
+        g->sliminfer_start_pos = 0;
+        g->sliminfer_kept_rows = 0;
+        g->sliminfer_total_rows = 0;
+        if (si_env && si_env[0]) {
+            char *end = NULL;
+            double v = strtod(si_env, &end);
+            if (end != si_env && v > 0.0 && v < 1.0) {
+                g->sliminfer_active = true;
+                g->sliminfer_ratio = (float)v;
+            }
+        }
+        if (g->sliminfer_active) {
+            const char *pl = getenv("DS4_SLIMINFER_PRUNE_LAYER");
+            if (pl && pl[0]) {
+                char *end = NULL;
+                unsigned long v = strtoul(pl, &end, 10);
+                /* Any layer works: the unified score export covers dense,
+                 * ratio-4 and ratio-128 attention paths (batch Q/KV hold
+                 * the chunk's keys on every path). */
+                if (end != pl && v < DS4_N_LAYER) {
+                    g->sliminfer_prune_layer = (uint32_t)v;
+                }
+            }
+            const char *sp = getenv("DS4_SLIMINFER_START_POS");
+            if (sp && sp[0]) {
+                char *end = NULL;
+                unsigned long v = strtoul(sp, &end, 10);
+                if (end != sp) g->sliminfer_start_pos = (uint32_t)v;
+            }
+            fprintf(stderr,
+                    "ds4: SlimInfer APIA pruning enabled "
+                    "(ratio=%.3f prune_layer=%u start_pos=%u)\n",
+                    (double)g->sliminfer_ratio,
+                    g->sliminfer_prune_layer,
+                    g->sliminfer_start_pos);
+        }
+    }
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -21094,6 +21164,10 @@ static bool metal_graph_alloc_raw_cap(
             g->batch_shared_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
             g->batch_shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
             g->batch_shared_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
+            g->batch_prune_save_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
+            g->batch_prune_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_SLIMINFER_MAX_TOKENS);
+            g->batch_prune_active_idx_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_SLIMINFER_MAX_TOKENS * sizeof(uint32_t));
+            g->batch_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_SLIMINFER_MAX_TOKENS * sizeof(float));
             g->batch_router_logits_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
             g->batch_router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
             g->batch_router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * sizeof(int));
@@ -40022,6 +40096,93 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
+static bool metal_graph_sliminfer_decide(
+        ds4_gpu_graph *g,
+        uint32_t       n_tokens,
+        uint32_t       start_pos,
+        float         *scores_buf,
+        uint32_t      *active_idx_buf,
+        uint8_t       *mask_buf,
+        uint32_t      *n_active_p) {
+    if (!g || !scores_buf || !active_idx_buf || !mask_buf || !n_active_p) return false;
+    if (ds4_gpu_tensor_read(metal_graph_batch_scores(g), 0, scores_buf,
+                            (uint64_t)n_tokens * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: sliminfer score read failed\n");
+        return false;
+    }
+
+    /* Eligible = not the logits row, not before start_pos. */
+    uint8_t eligible[DS4_SLIMINFER_MAX_TOKENS];
+    if (n_tokens > DS4_SLIMINFER_MAX_TOKENS) {
+        fprintf(stderr, "ds4: sliminfer chunk %u exceeds max %u\n",
+                n_tokens, (uint32_t)DS4_SLIMINFER_MAX_TOKENS);
+        return false;
+    }
+    uint32_t n_eligible = 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        eligible[i] = (i != n_tokens - 1u &&
+                       start_pos + i >= g->sliminfer_start_pos) ? 1 : 0;
+        n_eligible += eligible[i];
+    }
+    uint32_t n_prune = (uint32_t)((double)g->sliminfer_ratio * (double)n_tokens);
+    if (n_prune > n_eligible) n_prune = n_eligible;
+
+    memset(mask_buf, 0, n_tokens);
+    uint32_t n_active = n_tokens;
+    if (n_prune != 0) {
+        /* Keep the n_prune lowest-score eligible tokens (insertion-sorted
+         * ascending; chunks are small). */
+        uint32_t pruned[DS4_SLIMINFER_MAX_TOKENS];
+        uint32_t pn = 0;
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (!eligible[i]) continue;
+            if (pn < n_prune) {
+                uint32_t pos = pn;
+                while (pos > 0 && scores_buf[i] < scores_buf[pruned[pos - 1u]]) pos--;
+                for (uint32_t j = pn; j > pos; j--) pruned[j] = pruned[j - 1u];
+                pruned[pos] = i;
+                pn++;
+            } else if (scores_buf[i] < scores_buf[pruned[n_prune - 1u]]) {
+                uint32_t pos = n_prune - 1u;
+                while (pos > 0 && scores_buf[i] < scores_buf[pruned[pos - 1u]]) pos--;
+                for (uint32_t j = n_prune - 1u; j > pos; j--) pruned[j] = pruned[j - 1u];
+                pruned[pos] = i;
+            }
+        }
+        for (uint32_t k = 0; k < pn; k++) mask_buf[pruned[k]] = 1;
+        n_active = n_tokens - pn;
+        if (getenv("DS4_SLIMINFER_DEBUG")) {
+            fprintf(stderr, "ds4: sliminfer pos0=%u keep=%u/%u prune:", start_pos, n_active, n_tokens);
+            for (uint32_t k = 0; k < pn; k++) fprintf(stderr, " %u(%.2f)", pruned[k], (double)scores_buf[pruned[k]]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    uint32_t c = 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (!mask_buf[i]) active_idx_buf[c++] = i;
+    }
+    g->sliminfer_kept_rows += n_active;
+    g->sliminfer_total_rows += n_tokens;
+    g->sliminfer_n_active = n_active;
+    g->sliminfer_pruned_batch = (n_active != n_tokens);
+    memcpy(g->sliminfer_mask_host, mask_buf, n_tokens);
+    if (n_tokens < DS4_SLIMINFER_MAX_TOKENS) {
+        g->sliminfer_mask_host[n_tokens] = 0;
+    }
+
+    if (ds4_gpu_tensor_write(metal_graph_batch_prune_active_idx(g), 0,
+                             active_idx_buf,
+                             (uint64_t)n_active * sizeof(uint32_t)) == 0 ||
+        ds4_gpu_tensor_write(metal_graph_batch_prune_mask(g), 0,
+                             mask_buf, (uint64_t)n_tokens) == 0) {
+        fprintf(stderr, "ds4: sliminfer mask upload failed\n");
+        return false;
+    }
+    *n_active_p = n_active;
+    return true;
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -40113,6 +40274,11 @@ static bool metal_graph_prefill_layer_major(
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
+    float sliminfer_scores[DS4_SLIMINFER_MAX_TOKENS];
+    uint32_t sliminfer_active_idx[DS4_SLIMINFER_MAX_TOKENS];
+    uint8_t sliminfer_mask[DS4_SLIMINFER_MAX_TOKENS];
+    uint32_t sliminfer_n_active = 0;
+    bool sliminfer_decided = false;
 
     const uint32_t pipeline_mb = metal_graph_cuda_prefill_pipeline_microbatch();
     if (!split_commands &&
@@ -40536,6 +40702,109 @@ static bool metal_graph_prefill_layer_major(
                     (t_attn_done - t_attn_encoded) * 1000.0,
                     (t_ffn_encoded - t_ffn0) * 1000.0,
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
+        } else if (g->sliminfer_active && sliminfer_decided &&
+                   sliminfer_n_active < n_tokens &&
+                   il > g->sliminfer_prune_layer &&
+                   imatrix == NULL && !g->prefill_has_visual &&
+                   weights->layer[il].ffn_gate_tid2eid == NULL &&
+                   weights->layer[il].ffn_exp_probs_b == NULL) {
+            /* SlimInfer APIA pruned layer: attention runs on the full set so
+             * positions and KV stay unchanged; only the FFN runs on the
+             * compacted active rows. Pruned rows keep their post-attention
+             * hidden state (the APIA approximation). */
+            const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+            const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
+            if (g->placement) {
+                const int this_tier = g->placement[il + 1];
+                if (!metal_graph_set_active_tier_batch(g, this_tier, (uint32_t)n_tokens)) {
+                    ok = false;
+                }
+            }
+            if (ok) ok = metal_graph_layer_stage_profile_start(il);
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_layer_attention_batch(g,
+                                                                  model,
+                                                                  &weights->layer[il],
+                                                                  il,
+                                                                  start,
+                                                                  n_tokens);
+            if (!ok) {
+                fprintf(stderr, "ds4: gpu layer-major prefill layer %u attention encode failed\n", il);
+            }
+            if (ok) ok = ds4_gpu_sliminfer_pruned_save_tensor(
+                    metal_graph_batch_prune_save(g),
+                    metal_graph_batch_after_attn_hc(g),
+                    metal_graph_batch_prune_mask(g),
+                    sliminfer_n_active,
+                    (uint32_t)hc_dim) != 0;
+            if (ok) ok = ds4_gpu_sliminfer_pruned_identity_tensor(
+                    metal_graph_batch_next_hc(g),
+                    metal_graph_batch_after_attn_hc(g),
+                    metal_graph_batch_prune_mask(g),
+                    n_tokens,
+                    (uint32_t)hc_dim) != 0;
+            if (ok) ok = ds4_gpu_sliminfer_gather_forward_tensor(
+                    metal_graph_batch_after_attn_hc(g),
+                    metal_graph_batch_prune_active_idx(g),
+                    sliminfer_n_active,
+                    (uint32_t)hc_dim) != 0;
+            if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
+                                                            model,
+                                                            &weights->layer[il],
+                                                            il,
+                                                            start,
+                                                            sliminfer_n_active,
+                                                            NULL,
+                                                            0);
+            if (!ok) {
+                fprintf(stderr, "ds4: gpu layer-major prefill layer %u ffn encode failed\n", il);
+            }
+            if (ok) ok = ds4_gpu_sliminfer_scatter_active_tensor(
+                    metal_graph_batch_next_hc(g),
+                    metal_graph_batch_prune_active_idx(g),
+                    sliminfer_n_active,
+                    (uint32_t)hc_dim) != 0;
+            if (ok) ok = ds4_gpu_sliminfer_pruned_restore_tensor(
+                    metal_graph_batch_next_hc(g),
+                    metal_graph_batch_prune_save(g),
+                    metal_graph_batch_prune_mask(g),
+                    sliminfer_n_active,
+                    (uint32_t)hc_dim) != 0;
+            if (ok) {
+                ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);
+                g->batch_cur_hc_by_tier[g->active_tier] = metal_graph_batch_next_hc(g);
+                g->batch_next_hc_by_tier[g->active_tier] = tmp;
+            }
+            if (ok) ok = metal_graph_dspark_capture_prefill_layer(g,
+                                                                  il,
+                                                                  start,
+                                                                  n_tokens);
+            if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
+                                                                          il,
+                                                                          sliminfer_n_active);
+            const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            const double t_done = (profile || throttle) ? now_sec() : 0.0;
+            if (ok && g->ssd_streaming) {
+                ds4_gpu_arena_prefill_chunk_boundary();
+            }
+            if (ok) {
+                ok = metal_graph_stream_prefill_selected_profile_layer(
+                        g,
+                        &weights->layer[il],
+                        il,
+                        sliminfer_n_active);
+            }
+            layer_elapsed = t_done - t_chunk0;
+            if (profile) {
+                encode_s += t_encoded - t_chunk0;
+                execute_s += t_done - t_encoded;
+                fprintf(stderr,
+                        "ds4: gpu layer-major prefill layer %u sliminfer encode=%.3f execute=%.3f ms\n",
+                        il,
+                        (t_encoded - t_chunk0) * 1000.0,
+                        (t_done - t_encoded) * 1000.0);
+            }
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
             ok = layer_overlap && (il & 1u) ?
@@ -40590,6 +40859,21 @@ static bool metal_graph_prefill_layer_major(
                         n_tokens);
             }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
+            /* SlimInfer decision after the pruning layer executed. The score
+             * read forces a sync; the mask/idx uploads are consumed by the
+             * pruned-layer flow above from the next layer on. */
+            if (ok && g->sliminfer_active &&
+                il == g->sliminfer_prune_layer &&
+                n_tokens <= DS4_SLIMINFER_MAX_TOKENS) {
+                ok = metal_graph_sliminfer_decide(g,
+                                                  n_tokens,
+                                                  start,
+                                                  sliminfer_scores,
+                                                  sliminfer_active_idx,
+                                                  sliminfer_mask,
+                                                  &sliminfer_n_active);
+                sliminfer_decided = ok;
+            }
             layer_elapsed = t_done - t_chunk0;
             if (profile) {
                 encode_s += t_encoded - t_chunk0;

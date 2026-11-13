@@ -539,6 +539,25 @@ int ds4_gpu_join_pending_commands(void);
  * compress a file into a sidecar (ds4 tool entry). */
 int ds4_gpu_set_model_dfc(const char *model_path);
 int ds4_dfc_compress_file(const char *in_path, const char *out_path);
+/* SlimInfer APIA v2: attention Q-row pruning kernels. */
+int ds4_gpu_sliminfer_pruned_save_tensor(ds4_gpu_tensor *save,
+                                         ds4_gpu_tensor *next_hc,
+                                         ds4_gpu_tensor *mask,
+                                         uint32_t n_active, uint32_t row_elems);
+int ds4_gpu_sliminfer_pruned_restore_tensor(ds4_gpu_tensor *next_hc,
+                                            ds4_gpu_tensor *save,
+                                            ds4_gpu_tensor *mask,
+                                            uint32_t n_active, uint32_t row_elems);
+int ds4_gpu_sliminfer_pruned_identity_tensor(ds4_gpu_tensor *next_hc,
+                                             ds4_gpu_tensor *cur_hc,
+                                             ds4_gpu_tensor *mask,
+                                             uint32_t n_tokens, uint32_t row_elems);
+int ds4_gpu_sliminfer_gather_forward_tensor(ds4_gpu_tensor *x,
+                                            ds4_gpu_tensor *active_idx,
+                                            uint32_t n_active, uint32_t row_elems);
+int ds4_gpu_sliminfer_scatter_active_tensor(ds4_gpu_tensor *next_hc,
+                                            ds4_gpu_tensor *active_idx,
+                                            uint32_t n_active, uint32_t row_elems);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

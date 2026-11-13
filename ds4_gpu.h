@@ -533,6 +533,8 @@ int ds4_gpu_matmul_q8_0_exact_tensor(
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *xq);
 int ds4_gpu_cuda_ready(void);
+/* Deferred per-layer sync: join the pending end-commands event. */
+int ds4_gpu_join_pending_commands(void);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

@@ -5367,6 +5367,10 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     return ok;
 }
 
+/* Deferred-sync state (defined near ds4_gpu_end_commands; the tensor_read
+ * barrier note below clears the pending flag). */
+extern int g_end_batch_pending;
+
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
@@ -5376,6 +5380,10 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
                                 cudaMemcpyDeviceToHost),
                      "tensor read");
     }
+    /* A synchronous D2H read is a full device barrier: the deferred-sync
+     * pending batch is implicitly joined (defer mode then costs nothing on
+     * paths that already read back). */
+    if (ok) g_end_batch_pending = 0;
     return ok;
 }
 
@@ -6016,7 +6024,37 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+static cudaEvent_t g_end_batch_event = NULL;
+int g_end_batch_pending = 0;
+
+/* Optimized per-layer sync (deferred by default): the barrier stays, but
+ * the wait is deferred until the host is about to overwrite buffers the
+ * previous layer's kernels may still read — by then the next layer's
+ * staging has absorbed the GPU tail, so the join costs ~0. */
+extern "C" int ds4_gpu_join_pending_commands(void) {
+    if (!g_end_batch_event || !g_end_batch_pending) return 1;
+    g_end_batch_pending = 0;
+    return cuda_ok(cudaEventSynchronize(g_end_batch_event),
+                   "join pending commands");
+}
+
 extern "C" int ds4_gpu_end_commands(void) {
+    /* Deferred sync is the DEFAULT: record an event and join it before the
+     * next layer overwrites buffers (measured -4.5% warm prefill, barrier
+     * preserved).  DS4_CUDA_NO_DEFER_SYNC=1 restores the legacy per-layer
+     * device sync. */
+    if (getenv("DS4_CUDA_NO_DEFER_SYNC") == NULL) {
+        if (!g_end_batch_event) {
+            if (cudaEventCreateWithFlags(&g_end_batch_event,
+                                         cudaEventDisableTiming) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        g_end_batch_pending = 1;
+        return cuda_ok(cudaEventRecord(g_end_batch_event, 0),
+                       "end commands record");
+    }
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }

@@ -22428,6 +22428,15 @@ static bool metal_graph_stream_prefill_selected_pagein_start(
     if (n_ids > SIZE_MAX / sizeof(int32_t)) return false;
     int32_t *selected = xmalloc((size_t)n_ids * sizeof(selected[0]));
 
+    /* The batch router tensor is written by GPU kernels on the encode
+     * stream; join the deferred-sync event before reading so a prepare
+     * worker can never observe a half-written or stale tensor (same
+     * ordering as a device sync, without a whole-device barrier). */
+    if (ds4_gpu_join_pending_commands() == 0) {
+        free(selected);
+        return false;
+    }
+
     const double t_read0 = job->profile ? now_sec() : 0.0;
     bool ok = ds4_gpu_tensor_read(metal_graph_batch_router_selected(g),
                                   0,

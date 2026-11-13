@@ -20,6 +20,8 @@
 #include <pthread.h>
 #include <atomic>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
@@ -1704,11 +1706,20 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
         return hi_pct_reserve > hi_min_reserve ? hi_pct_reserve : hi_min_reserve;
     }
 
-    /* Smaller cards (< 40 GiB): keep the conservative reserve.  The expanded
-     * Q8->F16 cache is only an acceleration path; on a small card a sub-GiB
-     * reserve would be a large fraction of total VRAM, so keep enough free for
-     * cuBLAS workspaces, transient graph buffers, and driver bookkeeping. */
-    const uint64_t min_reserve = 4096ull * 1048576ull;
+    /* Smaller cards (< 40 GiB): 8GB laptop cards used to keep a 4 GiB
+     * reserve here — half the card — which starved the selective Q8->F16
+     * cache and forced the q8 kernels. WDDM eviction of device pages is
+     * verified correct on this port (test_pinned probe series + the
+     * slot-table root-cause fix), so overflow allocations are safely paged
+     * to shared GPU memory; keep only a modest floor for cuBLAS workspaces
+     * and driver bookkeeping. DS4_CUDA_Q8_F16_CACHE_RESERVE_MB overrides.
+     * Budget coordination: the prefill graph capture (pg) registers a
+     * deterministic headroom charge — the q8 cache yields for the graph
+     * state instead of leaving the layer-major encode on the VRAM cliff. */
+    uint64_t min_reserve = 768ull * 1048576ull;
+    if (getenv("DS4_CUDA_PREFILL_GRAPH") != NULL) {
+        min_reserve += 128ull * 1048576ull;
+    }
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
 }
@@ -2414,7 +2425,202 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
         g_model_direct_align, g_model_file_size, stage, stage_bytes, offset, bytes, payload);
 }
 
+/* ---------------- Predictive expert prefetch (pinned-page registration) ----
+ * The expert staging pipeline is HOST-MEMCPY bound (page cache -> pinned
+ * stage -> H2D). Prediction: the previous chunk's routed expert set for a
+ * layer approximates this chunk's set, so a worker thread pins (cudaHost-
+ * Register) the predicted rows of the NEXT layer's mmap pages while the
+ * current layer's copies run. A hit in the registered set then goes
+ * DIRECTLY to the copy engine (full DMA bandwidth, no host memcpy), hiding
+ * ~40-60% of the staging cost. Pinning is page-table work: it runs in
+ * parallel with the main thread's memcpy without stealing its bandwidth.
+ * DS4_CUDA_PREFETCH_PREDICT=1 enables; DS4_CUDA_PREFETCH_PREDICT_EXPERTS
+ * sets the registered-row budget (default 40). */
+#define DS4_PF_MAX_LAYERS 256
+#define DS4_PF_MAX_IDS 96
+#define DS4_PF_REG_EXPERTS 40
+
+typedef struct {
+    uint64_t gate_offset, up_offset, down_offset;
+    uint64_t gate_expert_bytes, down_expert_bytes;
+} ds4_pf_table_info;
+
+static ds4_pf_table_info g_pf_table[DS4_PF_MAX_LAYERS];
+static int32_t g_pf_prev_ids[DS4_PF_MAX_LAYERS][DS4_PF_MAX_IDS];
+static uint32_t g_pf_prev_count[DS4_PF_MAX_LAYERS];
+static uint32_t g_pf_reg_layer = UINT32_MAX;   /* layer the registered set targets */
+static uint32_t g_pf_reg_count;
+static int32_t  g_pf_reg_ids[DS4_PF_REG_EXPERTS * 3];
+static uint64_t g_pf_reg_offs[DS4_PF_REG_EXPERTS * 3];
+static uint64_t g_pf_reg_bytes[DS4_PF_REG_EXPERTS * 3];
+
+static std::mutex g_pf_mu;
+static std::condition_variable g_pf_cv;
+static std::thread g_pf_thread;
+static bool g_pf_quit = false;
+static uint32_t g_pf_job_layer = UINT32_MAX;   /* pending prefetch target */
+static std::atomic<uint32_t> g_pf_hit_count{0};    /* registered-range H2D hits */
+static std::atomic<uint32_t> g_pf_miss_count{0};   /* staged-path copies */
+
+static bool ds4_pf_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_CUDA_PREFETCH_PREDICT") != NULL ? 1 : 0;
+    return cached == 1;
+}
+
+static uint32_t ds4_pf_expert_budget(void) {
+    const char *env = getenv("DS4_CUDA_PREFETCH_PREDICT_EXPERTS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v > 0 && v <= DS4_PF_REG_EXPERTS) return (uint32_t)v;
+    }
+    return DS4_PF_REG_EXPERTS;
+}
+
+static void ds4_pf_unregister_all(void) {
+    std::lock_guard<std::mutex> lk(g_pf_mu);
+    for (uint32_t i = 0; i < g_pf_reg_count; i++) {
+        (void)cudaHostUnregister(
+                (void *)((const char *)g_model_fd_host_base + g_pf_reg_offs[i]));
+    }
+    g_pf_reg_count = 0;
+}
+
+static void ds4_pf_thread_main(void) {
+    int32_t loc_ids[DS4_PF_REG_EXPERTS * 3];
+    uint64_t loc_offs[DS4_PF_REG_EXPERTS * 3];
+    uint64_t loc_bytes[DS4_PF_REG_EXPERTS * 3];
+    for (;;) {
+        uint32_t layer;
+        {
+            std::unique_lock<std::mutex> lk(g_pf_mu);
+            g_pf_cv.wait(lk, [] {
+                return g_pf_job_layer != UINT32_MAX || g_pf_quit;
+            });
+            if (g_pf_quit) return;
+            layer = g_pf_job_layer;
+            g_pf_job_layer = UINT32_MAX;
+        }
+        if (layer >= DS4_PF_MAX_LAYERS || g_pf_prev_count[layer] == 0 ||
+            g_model_fd_host_base == NULL) {
+            continue;
+        }
+        /* Drain uploads before unregistering ranges a DMA may still read. */
+        if (g_stream_selected_upload_stream != NULL) {
+            (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            (void)cudaGetLastError();
+        }
+        ds4_pf_unregister_all();
+        const ds4_pf_table_info *t = &g_pf_table[layer];
+        if (t->gate_expert_bytes == 0 || t->down_expert_bytes == 0) continue;
+        const uint32_t budget = ds4_pf_expert_budget();
+        uint32_t n = 0;
+        for (uint32_t i = 0;
+             i < g_pf_prev_count[layer] && n < budget; i++) {
+            const int32_t eu = g_pf_prev_ids[layer][i];
+            if (eu < 0) continue;
+            bool dup = false;
+            for (uint32_t j = 0; j < n; j++) {
+                if (loc_ids[j * 3u] == eu) { dup = true; break; }
+            }
+            if (dup) continue;
+            const uint64_t gate_src =
+                t->gate_offset + (uint64_t)eu * t->gate_expert_bytes;
+            const uint64_t up_src =
+                t->up_offset + (uint64_t)eu * t->gate_expert_bytes;
+            const uint64_t down_src =
+                t->down_offset + (uint64_t)eu * t->down_expert_bytes;
+            const char *base = (const char *)g_model_fd_host_base;
+            const cudaError_t e1 = cudaHostRegister(
+                    (void *)(base + gate_src), (size_t)t->gate_expert_bytes,
+                    cudaHostRegisterDefault);
+            const cudaError_t e2 = cudaHostRegister(
+                    (void *)(base + up_src), (size_t)t->gate_expert_bytes,
+                    cudaHostRegisterDefault);
+            const cudaError_t e3 = cudaHostRegister(
+                    (void *)(base + down_src), (size_t)t->down_expert_bytes,
+                    cudaHostRegisterDefault);
+            if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+                if (e1 == cudaSuccess) (void)cudaHostUnregister((void *)(base + gate_src));
+                if (e2 == cudaSuccess) (void)cudaHostUnregister((void *)(base + up_src));
+                if (e3 == cudaSuccess) (void)cudaHostUnregister((void *)(base + down_src));
+                (void)cudaGetLastError();
+                break; /* pool pressure: keep what we have */
+            }
+            const uint32_t b = n * 3u;
+            loc_ids[b + 0] = eu;
+            loc_offs[b + 0] = gate_src;
+            loc_bytes[b + 0] = t->gate_expert_bytes;
+            loc_ids[b + 1] = eu;
+            loc_offs[b + 1] = up_src;
+            loc_bytes[b + 1] = t->gate_expert_bytes;
+            loc_ids[b + 2] = eu;
+            loc_offs[b + 2] = down_src;
+            loc_bytes[b + 2] = t->down_expert_bytes;
+            n++;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_pf_mu);
+            memcpy(g_pf_reg_ids, loc_ids, (size_t)n * 3u * sizeof(int32_t));
+            memcpy(g_pf_reg_offs, loc_offs, (size_t)n * 3u * sizeof(uint64_t));
+            memcpy(g_pf_reg_bytes, loc_bytes, (size_t)n * 3u * sizeof(uint64_t));
+            g_pf_reg_count = n * 3u;
+            g_pf_reg_layer = layer;
+        }
+    }
+}
+
+/* Hit test: is [offset, offset+bytes) inside a registered pinned range?
+ * Returns 1 when the caller may H2D straight from the mmap. */
+static int ds4_pf_registered_hit(uint64_t offset, uint64_t bytes) {
+    if (!ds4_pf_enabled() || g_pf_reg_count == 0) return 0;
+    std::lock_guard<std::mutex> lk(g_pf_mu);
+    for (uint32_t i = 0; i < g_pf_reg_count; i++) {
+        if (offset >= g_pf_reg_offs[i] &&
+            bytes <= g_pf_reg_bytes[i] &&
+            offset - g_pf_reg_offs[i] <= g_pf_reg_bytes[i] - bytes) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void ds4_pf_submit_job(uint32_t layer) {
+    if (!ds4_pf_enabled()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pf_mu);
+        if (!g_pf_thread.joinable()) {
+            g_pf_quit = false;
+            g_pf_job_layer = UINT32_MAX;
+            g_pf_thread = std::thread(ds4_pf_thread_main);
+        }
+        g_pf_job_layer = layer;
+    }
+    g_pf_cv.notify_one();
+}
+
+static void ds4_pf_shutdown(void) {
+    if (!g_pf_thread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pf_mu);
+        g_pf_quit = true;
+    }
+    g_pf_cv.notify_one();
+    g_pf_thread.join();
+    if (getenv("DS4_CUDA_PREFETCH_PREDICT_LOG")) {
+        const uint32_t h = g_pf_hit_count.load();
+        const uint32_t m = g_pf_miss_count.load();
+        fprintf(stderr,
+                "ds4: expert prefetch stats: registered-hit copies=%u "
+                "staged copies=%u hit-rate=%.1f%%\n",
+                h, m,
+                h + m ? 100.0 * (double)h / (double)(h + m) : 0.0);
+    }
+}
+
 static void cuda_stream_selected_stage_release(void) {
+    ds4_pf_shutdown();
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
             (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
@@ -2492,6 +2698,26 @@ static int cuda_model_copy_to_device_streamed(
                                   (size_t)bytes,
                                   cudaMemcpyHostToDevice),
                        what ? what : "stream selected expert copy");
+    }
+
+    /* Predictive prefetch hit: the range was pinned by the worker thread;
+     * feed the copy engine straight from the mmap (full DMA bandwidth, no
+     * pread loop, no host-side staging memcpy). */
+    if (ds4_pf_enabled() && g_model_fd_host_base != NULL &&
+        g_stream_selected_upload_stream != NULL &&
+        ds4_pf_registered_hit(offset, bytes)) {
+        const cudaError_t err = cudaMemcpyAsync(
+                dst,
+                (const char *)g_model_fd_host_base + offset,
+                (size_t)bytes,
+                cudaMemcpyHostToDevice,
+                g_stream_selected_upload_stream);
+        if (err == cudaSuccess) {
+            g_pf_hit_count.fetch_add(1u, std::memory_order_relaxed);
+            return 1;
+        }
+        (void)cudaGetLastError();
+        /* Fall through to the staged path on failure. */
     }
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
@@ -29810,6 +30036,22 @@ static int cuda_stream_selected_cache_begin_load(
         cache.slot_selected_tensor.owner = 0;
         cache.slot_selected_tensor.device_id = 0;
         cache.valid = 1;
+        /* Predictive prefetch: record this layer's routed ids + table
+         * offsets for the next chunk's prediction; the worker-thread job
+         * for the NEXT layer is submitted after the copies. */
+        if (ds4_pf_enabled() && table->layer < DS4_PF_MAX_LAYERS &&
+            slot_count <= DS4_PF_MAX_IDS) {
+            for (uint32_t i = 0; i < slot_count; i++) {
+                g_pf_prev_ids[table->layer][i] = selected_ids[i];
+            }
+            g_pf_prev_count[table->layer] = slot_count;
+            g_pf_table[table->layer].gate_offset = table->gate_offset;
+            g_pf_table[table->layer].up_offset = table->up_offset;
+            g_pf_table[table->layer].down_offset = table->down_offset;
+            g_pf_table[table->layer].gate_expert_bytes = table->gate_expert_bytes;
+            g_pf_table[table->layer].down_expert_bytes = table->down_expert_bytes;
+        }
+        ds4_pf_submit_job(table->layer + 1u);
         return 1;
     } catch (...) {
         cuda_stream_selected_cache_release();

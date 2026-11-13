@@ -2375,17 +2375,55 @@ typedef struct {
     ds4_parallel_fn fn;
     void *ctx;
     uint64_t n_rows;
+    int pin_cpu[DS4_MAX_THREADS]; /* -1 = unpinned; else logical CPU to pin to */
 } ds4_thread_pool;
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+/* Dispatch threshold: jobs below this many rows run inline on the caller.
+ * DS4_POOL_MIN_ROWS overrides; 64 suits the spin-pool's ~1-5 us dispatch. */
+static uint64_t g_pool_min_rows = 64;
+
+/* Spin-then-sleep fast path: the decode issues hundreds of small dispatches
+ * per token, and a condvar wake (~50-150 us) dominates each one.  Workers
+ * spin briefly on the published generation before falling back to the
+ * condvar, and the main thread spins briefly on the atomic done count
+ * before falling back to done_cond.  The mutex protocol is unchanged, so
+ * the slow path is exactly the old behavior. */
+static uint32_t g_fast_gen;
+static uint32_t g_fast_done;
+static double g_pool_spin_sec = 0.000150; /* DS4_POOL_SPIN_US, default 150 us */
+
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+#include <intrin.h>
+#define DS4_CPU_PAUSE() _mm_pause()
+#elif defined(__x86_64__) || defined(__i386__)
+#define DS4_CPU_PAUSE() __asm__ volatile("pause")
+#else
+#define DS4_CPU_PAUSE() ((void)0)
+#endif
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
 
+#if defined(_WIN32)
+    if (g_pool.pin_cpu[tid] >= 0) {
+        SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << g_pool.pin_cpu[tid]);
+    }
+#endif
+
     for (;;) {
+        /* Fast path: spin briefly for the next published generation. */
+        const double t_spin0 = now_sec();
+        for (uint32_t spins = 0; ; spins++) {
+            if (__atomic_load_n(&g_fast_gen, __ATOMIC_ACQUIRE) != seen_generation) break;
+            if ((spins & 255u) == 0u && now_sec() - t_spin0 > g_pool_spin_sec) break;
+            DS4_CPU_PAUSE();
+        }
+
         pthread_mutex_lock(&g_pool.mutex);
         while (seen_generation == g_pool.generation && !g_pool.shutdown) {
             pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
@@ -2412,6 +2450,7 @@ static void *ds4_worker_main(void *arg) {
             g_parallel_depth--;
         }
 
+        __atomic_fetch_add(&g_fast_done, 1, __ATOMIC_RELEASE);
         pthread_mutex_lock(&g_pool.mutex);
         g_pool.done++;
         if (g_pool.done == g_pool.n_workers) {
@@ -2443,6 +2482,56 @@ static void ds4_threads_init(void) {
     if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
     if (n_threads == 0) n_threads = 1;
 
+    const char *spin_env = getenv("DS4_POOL_SPIN_US");
+    if (spin_env && spin_env[0]) {
+        long v = strtol(spin_env, NULL, 10);
+        if (v >= 0) g_pool_spin_sec = (double)v * 1.0e-6; /* 0 disables the spin */
+    }
+
+    const char *min_env = getenv("DS4_POOL_MIN_ROWS");
+    if (min_env && min_env[0]) {
+        long v = strtol(min_env, NULL, 10);
+        if (v >= 1) g_pool_min_rows = (uint64_t)v;
+    }
+
+    /* Optional topology-aware scheduler: pin worker i to a distinct logical
+     * CPU, filling physical cores first and their SMT siblings afterwards.
+     * This makes the SMT tradeoff deterministic instead of relying on the OS
+     * placement, which is what made the 28-vs-32-thread behavior jumpy. */
+    for (uint32_t i = 0; i < DS4_MAX_THREADS; i++) g_pool.pin_cpu[i] = -1;
+#if defined(_WIN32)
+    if (getenv("DS4_POOL_PIN") != NULL) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
+        DWORD len = 0;
+        ULONG_PTR core_masks[DS4_MAX_THREADS];
+        uint32_t n_phys = 0;
+        if (GetLogicalProcessorInformation(buf, &len) == TRUE) {
+            DWORD n = len / sizeof(buf[0]);
+            if (n > 256) n = 256;
+            for (DWORD j = 0; j < n && n_phys < DS4_MAX_THREADS; j++) {
+                if (buf[j].Relationship == RelationProcessorCore &&
+                    buf[j].ProcessorMask != 0) {
+                    core_masks[n_phys++] = buf[j].ProcessorMask;
+                }
+            }
+            /* Worker t -> physical core (t % n_phys), SMT slot (t / n_phys);
+             * the logical CPU id = the slot-th set bit of that core's mask. */
+            for (uint32_t t = 1; t < n_threads; t++) {
+                const ULONG_PTR mask = core_masks[t % n_phys];
+                uint32_t want_slot = t / n_phys;
+                int cpu = -1;
+                for (int bit = 0; bit < 64 && want_slot != UINT32_MAX; bit++) {
+                    if (mask & ((ULONG_PTR)1 << bit)) {
+                        if (want_slot == 0) { cpu = bit; break; }
+                        want_slot--;
+                    }
+                }
+                g_pool.pin_cpu[t] = cpu;
+            }
+        }
+    }
+#endif
+
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
     pthread_cond_init(&g_pool.done_cond, NULL);
@@ -2466,6 +2555,7 @@ static void ds4_threads_shutdown(void) {
     pthread_mutex_lock(&g_pool.mutex);
     g_pool.shutdown = true;
     g_pool.generation++;
+    __atomic_store_n(&g_fast_gen, g_pool.generation, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
     pthread_mutex_unlock(&g_pool.mutex);
 
@@ -2495,6 +2585,8 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     g_pool.n_rows = n_rows;
     g_pool.done = 0;
     g_pool.generation++;
+    __atomic_store_n(&g_fast_gen, g_pool.generation, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fast_done, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
 
     const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
@@ -2508,6 +2600,15 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         g_parallel_depth--;
     }
 
+    /* Fast wait: spin briefly on the atomic done count, then fall back to
+     * the condvar protocol (identical to the pre-fast-path behavior). */
+    const double t_wait0 = now_sec();
+    for (;;) {
+        if (__atomic_load_n(&g_fast_done, __ATOMIC_ACQUIRE) >= g_pool.n_workers) break;
+        if (now_sec() - t_wait0 > g_pool_spin_sec) break;
+        DS4_CPU_PAUSE();
+    }
+
     pthread_mutex_lock(&g_pool.mutex);
     while (g_pool.done < g_pool.n_workers) {
         pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
@@ -2516,7 +2617,13 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
-    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+    /* The spin-pool fast path dropped the dispatch cost to ~1-5 us, so the
+     * old 512-row serialization threshold (a condvar-wakeup-era leftover)
+     * forced small matvecs like the 256-row compressor pair and the 128-row
+     * indexer pair to run single-threaded.  The threshold is now 64 by
+     * default and overridable via DS4_POOL_MIN_ROWS.  Row-partitioned
+     * workers are bit-identical either way. */
+    ds4_parallel_for_min_rows(n_rows, fn, ctx, g_pool_min_rows);
 }
 
 static void cursor_error(ds4_cursor *c, const char *msg) {

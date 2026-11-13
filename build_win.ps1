@@ -1,4 +1,4 @@
-﻿# build_win.ps1 - Build DwarfStar (ds4) natively on Windows.
+# build_win.ps1 - Build DwarfStar (ds4) natively on Windows.
 # Uses clang (LLVM) with the MSVC ABI target for all C code and nvcc
 # (with cl.exe host) for the CUDA TUs. Output objects are COFF/MSVC ABI.
 #
@@ -125,6 +125,7 @@ function Build-Cpu {
     Compile-C 'ds4_web.c' 'ds4_web.obj'
     Compile-C 'ds4_gpu_args.c' 'ds4_gpu_args_cpu.obj' @('-DDS4_NO_GPU')
     Compile-C 'ds4_engram.c' 'ds4_engram.obj'
+    Compile-C 'ds4_router_train.c' 'ds4_router_train_cpu.obj' @('-DDS4_NO_GPU')
     Compile-C 'ds4_eval_cases.c' 'ds4_eval_cases.obj'
 
     $apps = @(
@@ -150,7 +151,8 @@ function Build-Cpu {
     # ds4-eval-cpu
     Link-Exe 'ds4-eval-cpu.exe' @('ds4_eval_cpu.obj','ds4_eval_cases.obj','ds4_help.obj') $cores
     # ds4-agent-cpu
-    Link-Exe 'ds4-agent-cpu.exe' @('ds4_agent_cpu.obj','ds4_help.obj','ds4_prompt_prefix.obj','ds4_web.obj','ds4_kvstore.obj','linenoise.obj','ds4_gpu_args_cpu.obj') $cores
+    Link-Exe 'ds4-router-train-cpu.exe' @('ds4_router_train_cpu.obj') $cores
+Link-Exe 'ds4-agent-cpu.exe' @('ds4_agent_cpu.obj','ds4_help.obj','ds4_prompt_prefix.obj','ds4_web.obj','ds4_kvstore.obj','linenoise.obj','ds4_gpu_args_cpu.obj') $cores
     Write-Host "== CPU build OK =="
 }
 
@@ -180,6 +182,7 @@ if ($Cuda) {
     Compile-C 'ds4_cli.c' 'ds4_cli.obj'
     Compile-C 'ds4_eval.c' 'ds4_eval.obj'
     Compile-C 'ds4_agent.c' 'ds4_agent.obj'
+    Compile-C 'ds4_router_train.c' 'ds4_router_train.obj'
     Compile-C 'ds4_engram.c' 'ds4_engram.obj'
     Compile-C 'ds4_eval_cases.c' 'ds4_eval_cases.obj'
     Compile-C 'linenoise.c' 'linenoise.obj'
@@ -237,10 +240,14 @@ if ($Cuda) {
     Link-Cuda 'ds4-server.exe' @('ds4_server.obj','ds4_help.obj','ds4_kvstore.obj','rax.obj','ds4_gpu_args.obj')
     Link-Cuda 'ds4-bench.exe' @('ds4_bench.obj','ds4_help.obj','ds4_gpu_args.obj')
     Link-Cuda 'ds4-eval.exe' @('ds4_eval.obj','ds4_eval_cases.obj','ds4_help.obj')
+    Link-Cuda 'ds4-router-train.exe' @('ds4_router_train.obj')
     Link-Cuda 'ds4-agent.exe' @('ds4_agent.obj','ds4_help.obj','ds4_prompt_prefix.obj','ds4_web.obj','ds4_kvstore.obj','linenoise.obj','ds4_gpu_args.obj')
     Write-Host "== CUDA build OK =="
 } else {
     Build-Cpu
 }
+
+
+
 
 

@@ -674,3 +674,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    char *err, size_t errlen);
 
 #endif
+
+/* ReMoE router trainer CLI (Part 1): trains the learned-router layers and
+ * writes a router-delta sidecar for DS4_ROUTER_DELTA. */
+int ds4_router_train_main(int argc, char **argv);

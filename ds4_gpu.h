@@ -512,6 +512,18 @@ void ds4_gpu_stage_lru_reset(void);
 /* DS4_ROUTER_DELTA: install a per-layer router weight override on device. */
 int ds4_gpu_install_router_delta(const void *host_data,
                                  uint64_t offset, uint64_t bytes);
+/* ReMoE trainer GPU capture: async D2D copy on the capture stream
+ * (ordered after the default stream) + teardown sync. */
+int ds4_gpu_tensor_copy_async_after_default(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
+void ds4_gpu_capture_stream_sync(void);
+/* ReMoE trainer probe task loss: sampled-CE logits/coeff/grad kernels. */
+int ds4_gpu_probe_sampled_ce(
+        ds4_gpu_tensor *dLdh, ds4_gpu_tensor *loss,
+        const ds4_gpu_tensor *h, const ds4_gpu_tensor *w,
+        const ds4_gpu_tensor *targets,
+        ds4_gpu_tensor *scratch_logits, ds4_gpu_tensor *scratch_coeff,
+        uint32_t n_pos, uint32_t n_row, uint32_t in_dim);
 /* Layer-2 two-stage retrieval (DS4_CUDA_INDEXER_2STAGE): exact squared
  * norm of each packed index row (dequantized values), env-gated. */
 int ds4_gpu_index_norm_capture(

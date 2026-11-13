@@ -509,11 +509,41 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
  * struct still embeds ds4_gpu_config and the global decls in
  * ds4_gpu_mgpu.h need matching definitions. The bitq AUTO scheduler
  * references ds4_gpu_free_bytes; stub it to "unknown" (the scheduler then
- * falls back to its non-GPU defaults). */
+ * falls back to its non-GPU defaults).  The ReMoE trainer's -probe path
+ * references the GPU tensor APIs; stub them so the CPU trainer still links
+ * (the probe path is rejected at arg parse in CPU builds). */
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 uint64_t ds4_gpu_free_bytes(void) { return 0; }
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) { (void)bytes; return NULL; }
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) { (void)bytes; return NULL; }
+ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+    (void)base; (void)offset; (void)bytes; return NULL;
+}
+void ds4_gpu_tensor_free(ds4_gpu_tensor *t) { (void)t; }
+int ds4_gpu_tensor_write(ds4_gpu_tensor *t, uint64_t off, const void *src, uint64_t bytes) {
+    (void)t; (void)off; (void)src; (void)bytes; return 0;
+}
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *dst, uint64_t bytes) {
+    (void)t; (void)off; (void)dst; (void)bytes; return 0;
+}
+int ds4_gpu_probe_sampled_ce(
+        ds4_gpu_tensor *dLdh, ds4_gpu_tensor *loss,
+        const ds4_gpu_tensor *h, const ds4_gpu_tensor *w,
+        const ds4_gpu_tensor *targets,
+        ds4_gpu_tensor *scratch_logits, ds4_gpu_tensor *scratch_coeff,
+        uint32_t n_pos, uint32_t n_row, uint32_t in_dim) {
+    (void)dLdh; (void)loss; (void)h; (void)w; (void)targets;
+    (void)scratch_logits; (void)scratch_coeff;
+    (void)n_pos; (void)n_row; (void)in_dim;
+    return 0;
+}
+int ds4_gpu_tensor_copy_async_after_default(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) {
+    (void)dst; (void)src; (void)bytes; return 0;
+}
+void ds4_gpu_capture_stream_sync(void) {}
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -13222,6 +13252,38 @@ static void layer_hash_selected_experts(
 
 /* Router scores use sqrt(softplus(logit)); normalization happens only after
  * the six selected experts are known. */
+/* ReMoE trainer capture hooks (Part 1/②): the trainer installs these to
+ * collect (x, router logits) pairs from the CPU forward, plus the extended
+ * probe tuple on the GPU path.  NULL outside training runs. */
+typedef void (*ds4_router_capture_fn)(const ds4_layer_weights *layer,
+                                      const float *x,
+                                      const float logits[DS4_MAX_EXPERT]);
+static ds4_router_capture_fn g_router_capture = NULL;
+/* ② extended capture hook: per (layer, position) adds the post-attention
+ * hidden, per-slot weighted expert outputs (down), and routed/shared FFN
+ * outputs so the probe task loss can rebuild h_l and the local expert
+ * gradient.  NULL unless the trainer runs with -probe. */
+typedef void (*ds4_router_capture_full_fn)(
+    const ds4_layer_weights *layer,
+    const float *x,
+    const float logits[DS4_MAX_EXPERT],
+    const float *attn,
+    const float *down,
+    const float *routed,
+    const float *shared);
+static ds4_router_capture_full_fn g_router_capture_full = NULL;
+/* GPU capture buffer: [window][n_layers][DS4_RT_CAP_ENTRY f32] filled by
+ * async D2D copies during the GPU forward, drained once after each prefill.
+ * Entry layout: logits(DS4_N_EXPERT) | x(DS4_N_EMBD) | attn_hc(DS4_N_EMBD)
+ * | down(DS4_N_EXPERT_USED x DS4_N_EMBD, per-slot weighted expert outputs)
+ * | routed_out(DS4_N_EMBD) | shared_out(DS4_N_EMBD).  h_l (post-FFN hidden)
+ * is rebuilt on the host as attn_hc + routed_out + shared_out. */
+#define DS4_RT_CAP_ENTRY \
+    (DS4_N_EXPERT + 4u * DS4_N_EMBD + DS4_N_EXPERT_USED * DS4_N_EMBD)
+static ds4_gpu_tensor *g_rt_cap = NULL;
+static uint32_t g_rt_cap_window = 0;
+static uint32_t g_rt_cap_layers = 0;
+
 static void layer_router_probs_one(
         float             probs[DS4_MAX_EXPERT],
         const ds4_model   * model,
@@ -13230,6 +13292,7 @@ static void layer_router_probs_one(
     float logits[DS4_MAX_EXPERT];
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
+    if (g_router_capture) g_router_capture(layer, x, logits);
     for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
@@ -35187,6 +35250,78 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    /* ReMoE trainer (Part 1/②) GPU capture: logits + x + attn_hc + per-slot
+     * weighted expert outputs (down, non-atomic path guaranteed for the
+     * trainer's n_tokens=16 < 128) + routed/shared FFN outputs, all async
+     * D2D into the persistent capture buffer (trainer-gated, zero sync on
+     * the default path).  h_l is rebuilt on the host as attn+routed+shared.
+     * Hash-routed layers are skipped (no learned router to train). */
+    if (ok && g_router_capture && layer->ffn_gate_tid2eid == NULL) {
+        if (g_rt_cap && pos0 + n_tokens <= g_rt_cap_window) {
+            const uint64_t ebytes = (uint64_t)DS4_RT_CAP_ENTRY * sizeof(float);
+            const uint64_t base =
+                ((uint64_t)pos0 * g_rt_cap_layers + il) * ebytes;
+            const uint64_t nlog =
+                (uint64_t)n_tokens * DS4_N_EXPERT * sizeof(float);
+            const uint64_t nemb =
+                (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+            const uint64_t ndown = (uint64_t)n_tokens * DS4_N_EXPERT_USED *
+                                   DS4_N_EMBD * sizeof(float);
+            ds4_gpu_tensor *v_logits =
+                ds4_gpu_tensor_view(g_rt_cap, base, nlog);
+            ds4_gpu_tensor *v_x =
+                ds4_gpu_tensor_view(g_rt_cap, base + nlog, nemb);
+            ds4_gpu_tensor *v_attn =
+                ds4_gpu_tensor_view(g_rt_cap, base + nlog + nemb, nemb);
+            ds4_gpu_tensor *v_down =
+                ds4_gpu_tensor_view(g_rt_cap,
+                                    base + nlog + 2u * nemb, ndown);
+            ds4_gpu_tensor *v_routed =
+                ds4_gpu_tensor_view(g_rt_cap,
+                                    base + nlog + 2u * nemb + ndown, nemb);
+            ds4_gpu_tensor *v_shared =
+                ds4_gpu_tensor_view(g_rt_cap,
+                                    base + nlog + 2u * nemb + ndown + nemb,
+                                    nemb);
+            ok = v_logits && v_x && v_attn && v_down && v_routed && v_shared &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_logits, metal_graph_batch_router_logits(g),
+                     nlog) != 0 &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_x, metal_graph_batch_ffn_norm(g), nemb) != 0 &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_attn, metal_graph_batch_after_attn_hc(g), nemb) != 0 &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_down, metal_graph_batch_routed_down(g), ndown) != 0 &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_routed, metal_graph_batch_routed_out(g), nemb) != 0 &&
+                 ds4_gpu_tensor_copy_async_after_default(
+                     v_shared, metal_graph_batch_shared_out(g), nemb) != 0;
+            ds4_gpu_tensor_free(v_logits);
+            ds4_gpu_tensor_free(v_x);
+            ds4_gpu_tensor_free(v_attn);
+            ds4_gpu_tensor_free(v_down);
+            ds4_gpu_tensor_free(v_routed);
+            ds4_gpu_tensor_free(v_shared);
+        } else {
+            float *h_logits = xmalloc((size_t)n_tokens * DS4_N_EXPERT * sizeof(float));
+            float *h_x = xmalloc((size_t)n_tokens * DS4_N_EMBD * sizeof(float));
+            ok = ds4_gpu_tensor_read(metal_graph_batch_router_logits(g), 0,
+                                     h_logits,
+                                     (uint64_t)n_tokens * DS4_N_EXPERT * sizeof(float)) != 0 &&
+                 ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(g), 0, h_x,
+                                     (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
+            if (ok) {
+                for (uint32_t t = 0; t < n_tokens; t++) {
+                    g_router_capture(layer,
+                                     h_x + (uint64_t)t * DS4_N_EMBD,
+                                     h_logits + (uint64_t)t * DS4_N_EXPERT);
+                }
+            }
+            free(h_x);
+            free(h_logits);
+        }
+    }
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
     }
@@ -76730,6 +76865,949 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 "original router\n");
     }
     *out = e;
+    return 0;
+}
+
+/* =========================================================================
+ * ReMoE router trainer (Part 1): fine-tune the learned-router layers so
+ * adjacent positions route to the same experts.  Reduces the unique-expert
+ * working set per prefill chunk (SSD staging volume) and raises the
+ * decode-side dynamic-reuse hit rate (DS4_REMOE_REUSE).
+ *
+ * Only the router matrices are updated; no gradient flows through the
+ * transformer.  Per layer, dL/dW = sum_t (dL/dz_t) x_t^T is a purely local
+ * computation from the captured (x_t, z_t) pairs, so the forward is a
+ * single training-free pass and the optimizer is plain Adam on
+ * 40 x 256 x 4096 fp32 parameters.
+ *
+ * Output: a router-delta sidecar (DS4_ROUTER_DELTA) that overrides the
+ * router tensors without touching the original GGUF.
+ * ========================================================================= */
+
+typedef struct {
+    int il;
+    uint64_t off;
+    uint32_t n_expert;
+    uint32_t in_dim;
+    float *W;            /* [in_dim][n_expert] copy being trained (d-major) */
+    float *W0;           /* initial router snapshot (pull-back anchor) */
+    float *m, *v;        /* Adam moments */
+    float *cur_x;        /* [window][in_dim] captured router inputs */
+    float *cur_z;        /* [window][n_expert] captured router logits */
+    /* ② probe-mode extras (allocated only with -probe): */
+    float *cur_attn;     /* [window][DS4_N_EMBD] post-attention hidden */
+    float *cur_down;     /* [window][DS4_N_EXPERT_USED][DS4_N_EMBD] */
+    float *cur_routed;   /* [window][DS4_N_EMBD] */
+    float *cur_shared;   /* [window][DS4_N_EMBD] */
+    float *cur_dLdh;     /* [window][DS4_N_EMBD] probe gradient dL/dh */
+    float *z0;           /* [epoch_tokens][n_expert] original-router logits
+                          * captured in epoch 0 (logit-distillation anchor) */
+    uint32_t pos;        /* capture cursor within the current window */
+    uint32_t steps;      /* Adam step count */
+} ds4_router_train_layer;
+
+typedef struct {
+    const ds4_weights *weights;
+    const ds4_model *model;
+    ds4_router_train_layer *layers;
+    int n_layers;
+    uint32_t window;
+    float lr;
+    float lambda;
+    float mu;             /* logit-distillation weight toward z0 */
+    int epoch;            /* current epoch (0 = capture z0, no task loss) */
+    uint64_t window_base; /* global position of the current window's start */
+    double loss_sum;
+    double task_sum;
+    uint64_t pairs;
+    uint64_t overlap_sum;   /* top-k intersections between adjacent positions */
+    uint64_t overlap_pairs;
+    /* ② probe task-loss state */
+    bool probe;
+    float probe_w;      /* task-loss weight (CLI -pc) */
+    uint32_t probe_s;   /* sampled vocab size (CLI -ps) */
+    double probe_sum;   /* accumulated probe CE over target-valid positions */
+    uint64_t probe_pos;
+} ds4_router_train_ctx;
+
+static ds4_router_train_ctx g_rt;
+
+static float rt_sigmoid(float z) {
+    if (z > 20.0f) return 1.0f;
+    if (z < -20.0f) return 0.0f;
+    return 1.0f / (1.0f + expf(-z));
+}
+
+static void rt_layer_step(ds4_router_train_layer *L) {
+    const uint32_t W = g_rt.window;
+    const uint32_t E = L->n_expert;
+    const uint32_t D = L->in_dim;
+    const float lambda = g_rt.lambda;
+    const float lr = g_rt.lr;
+    const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+
+    const float *bias = NULL;
+    if (L->il >= 0 && L->il < (int)DS4_N_LAYER &&
+        g_rt.weights->layer[L->il].ffn_exp_probs_b) {
+        bias = (const float *)tensor_data(g_rt.model,
+                g_rt.weights->layer[L->il].ffn_exp_probs_b);
+    }
+
+    float *ga = xmalloc((size_t)E * sizeof(float));
+    float *gb = xmalloc((size_t)E * sizeof(float));
+    float *grad = xmalloc((size_t)E * D * sizeof(float));
+    memset(grad, 0, (size_t)E * D * sizeof(float));
+
+    const bool ptm = getenv("DS4_RT_STEP_TIMING") != NULL;
+    double t_pairs = 0.0, t_grad = 0.0, t_adam = 0.0;
+    double tp0 = ptm ? now_sec() : 0.0;
+
+    for (uint32_t t = 0; t + 1u < W; t++) {
+        const float *za = L->cur_z + (size_t)t * E;
+        const float *zb = L->cur_z + (size_t)(t + 1u) * E;
+        float sa[DS4_MAX_EXPERT], sb[DS4_MAX_EXPERT];
+        for (uint32_t e = 0; e < E; e++) {
+            float va = sqrtf(softplus_stable(za[e]));
+            float vb = sqrtf(softplus_stable(zb[e]));
+            if (bias) { va += bias[e]; vb += bias[e]; }
+            sa[e] = va;
+            sb[e] = vb;
+        }
+        /* Top-6 sets mirror inference selection (treated as fixed w.r.t. z,
+         * straight-through). */
+        float sel_a[DS4_MAX_EXPERT], sel_b[DS4_MAX_EXPERT];
+        memcpy(sel_a, sa, E * sizeof(float));
+        memcpy(sel_b, sb, E * sizeof(float));
+        int top_a[DS4_MAX_EXPERT_USED], top_b[DS4_MAX_EXPERT_USED];
+        topk_desc(sel_a, (int)E, (int)DS4_N_EXPERT_USED, top_a);
+        topk_desc(sel_b, (int)E, (int)DS4_N_EXPERT_USED, top_b);
+        float Sa_sum = 0.0f, Sb_sum = 0.0f;
+        float qa[DS4_MAX_EXPERT], qb[DS4_MAX_EXPERT];
+        memset(qa, 0, sizeof(qa));
+        memset(qb, 0, sizeof(qb));
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            Sa_sum += sa[top_a[i]];
+            Sb_sum += sb[top_b[i]];
+        }
+        if (Sa_sum <= 0.0f) Sa_sum = 1.0f;
+        if (Sb_sum <= 0.0f) Sb_sum = 1.0f;
+        float dotq = 0.0f;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            qa[top_a[i]] = sa[top_a[i]] / Sa_sum;
+            qb[top_b[i]] = sb[top_b[i]] / Sb_sum;
+        }
+        for (uint32_t e = 0; e < E; e++) dotq += qa[e] * qb[e];
+        if (dotq < 1e-6f) dotq = 1e-6f;
+        /* Linear objective L = -lambda * dotq: bounded gradients (the log
+         * form's 1/dotq factor exploded the first Adam step and collapsed
+         * decoding into token repetition). */
+        const float dlq = -lambda;
+        /* dL/ds_a[f] = dlq * (qb[f] - dotq) / Sa_sum for f in top_a
+         * (chain: dL/dqa[e] = -lambda*qb[e], dqa[e]/ds_a[f] = (d_ef -
+         * qa[e])/Sa_sum, summed over e in top_a; the earlier qa[f]*dotq
+         * form was a derivation slip). */
+        float dla[DS4_MAX_EXPERT], dlb[DS4_MAX_EXPERT];
+        memset(dla, 0, sizeof(dla));
+        memset(dlb, 0, sizeof(dlb));
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const uint32_t f = (uint32_t)top_a[i];
+            dla[f] = dlq * (qb[f] - dotq) / Sa_sum;
+        }
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const uint32_t f = (uint32_t)top_b[i];
+            dlb[f] = dlq * (qa[f] - dotq) / Sb_sum;
+        }
+        float ga[DS4_MAX_EXPERT], gb[DS4_MAX_EXPERT];
+        for (uint32_t e = 0; e < E; e++) {
+            /* ds/dz = sigmoid(z) / (2 sqrt(softplus(z))) */
+            const float ssa = sa[e] - (bias ? bias[e] : 0.0f);
+            const float ssb = sb[e] - (bias ? bias[e] : 0.0f);
+            const float dzsa = ssa > 0.0f
+                ? rt_sigmoid(za[e]) / (2.0f * ssa) : 0.0f;
+            const float dzsb = ssb > 0.0f
+                ? rt_sigmoid(zb[e]) / (2.0f * ssb) : 0.0f;
+            ga[e] = dla[e] * dzsa;
+            gb[e] = dlb[e] * dzsb;
+        }
+        /* Logit-distillation anchor (task proxy): keep the trained router's
+         * logits close to the original router's, captured in epoch 0.  The
+         * pure-auxiliary objective alone collapsed greedy decoding into
+         * phrase loops; this local regularizer plays the role of ReMoE's
+         * joint task loss without a full-model backward pass. */
+        if (g_rt.epoch > 0 && L->z0) {
+            const float *z0a = L->z0 + (g_rt.window_base + t) * E;
+            const float *z0b = L->z0 + (g_rt.window_base + t + 1u) * E;
+            const float mu2 = 2.0f * g_rt.mu;
+            double task = 0.0;
+            for (uint32_t e = 0; e < E; e++) {
+                const float da = za[e] - z0a[e];
+                const float db = zb[e] - z0b[e];
+                ga[e] += mu2 * da;
+                gb[e] += mu2 * db;
+                task += (double)da * da + (double)db * db;
+            }
+            g_rt.task_sum += (double)g_rt.mu * task;
+        }
+        /* ② probe task term: dL/dz_f = pc * (dLdh . down_f) * dln w_f/dz_f
+         * with down_f the captured WEIGHTED per-slot expert output (w_f*E_f)
+         * and dln w_f/dz_f = sigmoid(z)/(2 sqrt(softplus(z))) * (1-w_f)/s_f
+         * (s_f includes the expert bias).  Masked positions (target=-1) got
+         * a zero dLdh from the kernel, so they contribute nothing. */
+        if (L->cur_dLdh) {
+            const float pc = g_rt.probe_w;
+            const float *dLha = L->cur_dLdh + (size_t)t * DS4_N_EMBD;
+            const float *dLhb = L->cur_dLdh + (size_t)(t + 1u) * DS4_N_EMBD;
+            const float *dna = L->cur_down +
+                (size_t)t * DS4_N_EXPERT_USED * DS4_N_EMBD;
+            const float *dnb = L->cur_down +
+                (size_t)(t + 1u) * DS4_N_EXPERT_USED * DS4_N_EMBD;
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                const uint32_t fa = (uint32_t)top_a[i];
+                const float wfa = qa[fa];
+                const float sfa = sa[fa];
+                const float bva = bias ? bias[fa] : 0.0f;
+                const float ssa = sfa - bva;
+                if (wfa > 1e-8f && ssa > 0.0f) {
+                    float dot = 0.0f;
+                    const float *dn = dna + (size_t)i * DS4_N_EMBD;
+                    for (uint32_t d = 0; d < DS4_N_EMBD; d++)
+                        dot += dLha[d] * dn[d];
+                    const float dzs = rt_sigmoid(za[fa]) / (2.0f * ssa);
+                    ga[fa] += pc * dot * dzs * (1.0f - wfa) / sfa;
+                }
+                const uint32_t fb = (uint32_t)top_b[i];
+                const float wfb = qb[fb];
+                const float sfb = sb[fb];
+                const float bvb = bias ? bias[fb] : 0.0f;
+                const float ssb = sfb - bvb;
+                if (wfb > 1e-8f && ssb > 0.0f) {
+                    float dot = 0.0f;
+                    const float *dn = dnb + (size_t)i * DS4_N_EMBD;
+                    for (uint32_t d = 0; d < DS4_N_EMBD; d++)
+                        dot += dLhb[d] * dn[d];
+                    const float dzs = rt_sigmoid(zb[fb]) / (2.0f * ssb);
+                    gb[fb] += pc * dot * dzs * (1.0f - wfb) / sfb;
+                }
+            }
+        }
+        const float *xa = L->cur_x + (size_t)t * D;
+        const float *xb = L->cur_x + (size_t)(t + 1u) * D;
+        if (ptm) { const double tn = now_sec(); t_pairs += tn - tp0; tp0 = tn; }
+        /* grad is d-major [in_dim][n_expert], matching the GGUF layout.
+         * Loop order matters: e-inner keeps grad writes contiguous (1KB
+         * per d row); the original e-outer form wrote one float per cache
+         * line (stride E*4) and cost 565ms/layer in RFO traffic. */
+        for (uint32_t d = 0; d < D; d++) {
+            float *gr = grad + (size_t)d * E;
+            const float xad = xa[d];
+            const float xbd = xb[d];
+            for (uint32_t e = 0; e < E; e++) {
+                gr[e] += ga[e] * xad + gb[e] * xbd;
+            }
+        }
+        if (ptm) { const double tn = now_sec(); t_grad += tn - tp0; tp0 = tn; }
+        g_rt.loss_sum += -lambda * dotq;
+        g_rt.pairs++;
+        if (t == 0u && L->il == (int)DS4_N_HASH_LAYER && g_rt.pairs <= 63u) {
+            fprintf(stderr,
+                    "ds4-rt: layer=%d t=0 dotq=%.4f loss_inc=%.4f\n",
+                    L->il, dotq, -lambda * dotq);
+        }
+        /* top-k overlap statistic */
+        uint32_t ov = 0;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                if (top_a[i] == top_b[j]) { ov++; break; }
+            }
+        }
+        g_rt.overlap_sum += ov;
+        g_rt.overlap_pairs++;
+    }
+
+    /* Adam step on this layer's router matrix (d-major [in_dim][n_expert]). */
+    L->steps++;
+    if (ptm) { tp0 = now_sec(); }
+    const float bc1 = 1.0f - powf(b1, (float)L->steps);
+    const float bc2 = 1.0f - powf(b2, (float)L->steps);
+    for (uint32_t d = 0; d < D; d++) {
+        float *Wr = L->W + (size_t)d * E;
+        float *mr = L->m + (size_t)d * E;
+        float *vr = L->v + (size_t)d * E;
+        const float *gr = grad + (size_t)d * E;
+        for (uint32_t e = 0; e < E; e++) {
+            const float g = gr[e];
+            mr[e] = b1 * mr[e] + (1.0f - b1) * g;
+            vr[e] = b2 * vr[e] + (1.0f - b2) * g * g;
+            const float mh = mr[e] / bc1;
+            const float vh = vr[e] / bc2;
+            Wr[e] -= lr * mh / (sqrtf(vh) + eps);
+        }
+    }
+
+    /* Proximal anchor: gently pull the router back toward its initial
+     * snapshot so pure-auxiliary training cannot drift the task routing
+     * (the first no-anchor run collapsed decoding into repetition). */
+    {
+        const float gamma = 1e-3f;
+        for (uint32_t d = 0; d < D; d++) {
+            float *Wr = L->W + (size_t)d * E;
+            const float *W0r = L->W0 + (size_t)d * E;
+            for (uint32_t e = 0; e < E; e++) {
+                Wr[e] = (1.0f - gamma) * Wr[e] + gamma * W0r[e];
+            }
+        }
+    }
+    if (ptm) {
+        t_adam = now_sec() - tp0;
+        fprintf(stderr,
+                "ds4-rt: step L=%d pairs=%.1fms grad=%.1fms adam=%.1fms\n",
+                L->il, t_pairs * 1e3, t_grad * 1e3, t_adam * 1e3);
+    }
+
+    free(grad);
+    free(gb);
+    free(ga);
+}
+
+/* Drain the GPU capture buffer once after each GPU prefill window and feed
+ * the trainer's capture hook in the order the per-layer cursors expect
+ * (chunk-major iteration keeps each layer's positions ascending).  Hash
+ * layers hold garbage entries; the hook ignores them by pointer match. */
+static void rt_drain_gpu_capture(const ds4_weights *weights,
+                                 uint32_t window) {
+    if (!g_rt_cap || !g_router_capture) return;
+    const uint32_t layers = g_rt_cap_layers;
+    const uint64_t entry_f = DS4_RT_CAP_ENTRY;
+    const uint64_t total = (uint64_t)window * layers * entry_f * sizeof(float);
+    float *buf = xmalloc(total);
+    fprintf(stderr, "ds4-rt: drain begin window=%u layers=%u entry=%llu total=%.1fMiB\n",
+            window, layers, (unsigned long long)entry_f,
+            (double)total / 1048576.0);
+    if (!ds4_gpu_tensor_read(g_rt_cap, 0, buf, total)) {
+        free(buf);
+        fprintf(stderr, "ds4-router-train: capture drain failed\n");
+        return;
+    }
+    for (uint32_t p = 0; p < window; p++) {
+        for (uint32_t il = 0; il < layers; il++) {
+            const float *e = buf + ((uint64_t)p * layers + il) * entry_f;
+            const float *logits = e;
+            const float *x = e + DS4_N_EXPERT;
+            if (g_router_capture_full) {
+                g_router_capture_full(&weights->layer[il], x, logits,
+                                      e + DS4_N_EXPERT + DS4_N_EMBD,
+                                      e + DS4_N_EXPERT + 2u * DS4_N_EMBD,
+                                      e + DS4_N_EXPERT + 2u * DS4_N_EMBD +
+                                          DS4_N_EXPERT_USED * DS4_N_EMBD,
+                                      e + DS4_N_EXPERT + 2u * DS4_N_EMBD +
+                                          DS4_N_EXPERT_USED * DS4_N_EMBD +
+                                          DS4_N_EMBD);
+            } else {
+                g_router_capture(&weights->layer[il], x, logits);
+            }
+        }
+    }
+    free(buf);
+    fprintf(stderr, "ds4-rt: drain done\n");
+}
+
+static void rt_capture(const ds4_layer_weights *layer,
+                       const float *x,
+                       const float logits[DS4_MAX_EXPERT]) {
+    for (int i = 0; i < g_rt.n_layers; i++) {
+        ds4_router_train_layer *L = &g_rt.layers[i];
+        if (&g_rt.weights->layer[L->il] != layer) continue;
+        const uint32_t t = L->pos;
+        if (t >= g_rt.window) break;
+        L->pos = t + 1u;
+        memcpy(L->cur_x + (size_t)t * L->in_dim, x,
+               (size_t)L->in_dim * sizeof(float));
+        memcpy(L->cur_z + (size_t)t * L->n_expert, logits,
+               (size_t)L->n_expert * sizeof(float));
+        if (g_rt.epoch == 0 && L->z0) {
+            memcpy(L->z0 + (g_rt.window_base + t) * L->n_expert, logits,
+                   (size_t)L->n_expert * sizeof(float));
+        }
+        if (t + 1u == g_rt.window) {
+            L->pos = 0;
+            rt_layer_step(L);
+        }
+        break;
+    }
+}
+
+/* ② extended capture: same as rt_capture plus the probe-mode arrays
+ * (attn/down/routed/shared) used for the task-loss gradient. */
+static void rt_capture_full(const ds4_layer_weights *layer,
+                            const float *x,
+                            const float logits[DS4_MAX_EXPERT],
+                            const float *attn,
+                            const float *down,
+                            const float *routed,
+                            const float *shared) {
+    for (int i = 0; i < g_rt.n_layers; i++) {
+        ds4_router_train_layer *L = &g_rt.layers[i];
+        if (&g_rt.weights->layer[L->il] != layer) continue;
+        const uint32_t t = L->pos;
+        if (t >= g_rt.window) break;
+        L->pos = t + 1u;
+        memcpy(L->cur_x + (size_t)t * L->in_dim, x,
+               (size_t)L->in_dim * sizeof(float));
+        memcpy(L->cur_z + (size_t)t * L->n_expert, logits,
+               (size_t)L->n_expert * sizeof(float));
+        if (g_rt.epoch == 0 && L->z0) {
+            memcpy(L->z0 + (g_rt.window_base + t) * L->n_expert, logits,
+                   (size_t)L->n_expert * sizeof(float));
+        }
+        if (L->cur_attn) {
+            memcpy(L->cur_attn + (size_t)t * DS4_N_EMBD, attn,
+                   (size_t)DS4_N_EMBD * sizeof(float));
+            memcpy(L->cur_down + (size_t)t * DS4_N_EXPERT_USED * DS4_N_EMBD,
+                   down,
+                   (size_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+            memcpy(L->cur_routed + (size_t)t * DS4_N_EMBD, routed,
+                   (size_t)DS4_N_EMBD * sizeof(float));
+            memcpy(L->cur_shared + (size_t)t * DS4_N_EMBD, shared,
+                   (size_t)DS4_N_EMBD * sizeof(float));
+        }
+        if (t + 1u == g_rt.window) {
+            L->pos = 0;
+            /* In probe mode the step runs after rt_probe_all has filled
+             * cur_dLdh for the whole window. */
+            if (!g_rt.probe) rt_layer_step(L);
+        }
+        break;
+    }
+}
+/* ② probe driver: sampled-softmax next-token CE per layer, run after each
+ * window's drain.  Builds h_l = attn + routed + shared on the host, uploads
+ * it together with the compact sampled head rows, runs the GPU probe
+ * kernels, reads dL/dh back, then runs the layer's Adam step (which now
+ * combines aux + probe task + distillation terms). */
+static void rt_probe_all(ds4_engine *e, uint32_t window,
+                         const int32_t *targets) {
+    if (!g_rt.probe) return;
+    const ds4_tensor *head = g_rt.weights->output;
+    if (!head || head->type != DS4_TENSOR_Q8_0 || head->ndim != 2) {
+        fprintf(stderr, "ds4-router-train: probe needs a Q8_0 output head\n");
+        return;
+    }
+    const uint32_t in_dim = (uint32_t)head->dim[0];
+    const uint32_t vocab = (uint32_t)head->dim[1];
+    const uint64_t row_bytes = ((uint64_t)in_dim / 32u) * 34u;
+    const uint8_t *head_data = (const uint8_t *)tensor_data(&e->model, head);
+    if (!head_data) {
+        fprintf(stderr, "ds4-router-train: probe head not mapped\n");
+        return;
+    }
+    const uint32_t S = g_rt.probe_s > 0 ? g_rt.probe_s : 512u;
+
+    /* Row set: S sampled vocab ids (deduped) + distinct targets in order. */
+    uint32_t *rows = xmalloc((S + window) * sizeof(uint32_t));
+    uint32_t n_sample = 0;
+    while (n_sample < S) {
+        const uint32_t v = (uint32_t)(rand() % (int)vocab);
+        bool dup = false;
+        for (uint32_t i = 0; i < n_sample; i++)
+            if (rows[i] == v) { dup = true; break; }
+        if (dup) continue;
+        rows[n_sample++] = v;
+    }
+    uint32_t n_target = 0;
+    for (uint32_t t = 0; t < window; t++) {
+        if (targets[t] < 0) continue;
+        bool dup = false;
+        for (uint32_t i = 0; i < n_sample + n_target; i++)
+            if (rows[i] == (uint32_t)targets[t]) { dup = true; break; }
+        if (dup) continue;
+        rows[n_sample + n_target] = (uint32_t)targets[t];
+        n_target++;
+    }
+    const uint32_t n_row = n_sample + n_target;
+    int32_t *target_row = xmalloc(window * sizeof(int32_t));
+    for (uint32_t t = 0; t < window; t++) {
+        if (targets[t] < 0) { target_row[t] = -1; continue; }
+        int32_t idx = -1;
+        for (uint32_t r = 0; r < n_row; r++)
+            if (rows[r] == (uint32_t)targets[t]) { idx = (int32_t)r; break; }
+        target_row[t] = idx;
+    }
+
+    /* Compact block-major weights [blocks][n_row][34]. */
+    const uint32_t blocks = in_dim / 32u;
+    uint8_t *wbuf = xmalloc((size_t)blocks * n_row * 34u);
+    for (uint32_t b = 0; b < blocks; b++) {
+        for (uint32_t r = 0; r < n_row; r++) {
+            memcpy(wbuf + ((size_t)b * n_row + r) * 34u,
+                   head_data + (uint64_t)rows[r] * row_bytes +
+                       (uint64_t)b * 34u,
+                   34u);
+        }
+    }
+    free(rows);
+    fprintf(stderr, "ds4-rt: probe rows=%u (s=%u t=%u)\n",
+            n_row, n_sample, n_target);
+
+    ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc((uint64_t)blocks * n_row * 34u);
+    ds4_gpu_tensor *tgt_t = ds4_gpu_tensor_alloc((uint64_t)window * 4u);
+    ds4_gpu_tensor *h_t = ds4_gpu_tensor_alloc((uint64_t)window * in_dim * 4u);
+    ds4_gpu_tensor *dLdh_t = ds4_gpu_tensor_alloc((uint64_t)window * in_dim * 4u);
+    ds4_gpu_tensor *loss_t = ds4_gpu_tensor_alloc((uint64_t)window * 4u);
+    ds4_gpu_tensor *lg_t = ds4_gpu_tensor_alloc((uint64_t)window * n_row * 4u);
+    ds4_gpu_tensor *cf_t = ds4_gpu_tensor_alloc((uint64_t)window * n_row * 4u);
+    if (!w_t || !tgt_t || !h_t || !dLdh_t || !loss_t || !lg_t || !cf_t) {
+        fprintf(stderr, "ds4-router-train: probe tensor alloc failed\n");
+        free(wbuf);
+        free(target_row);
+        goto probe_cleanup;
+    }
+    if (!ds4_gpu_tensor_write(w_t, 0, wbuf, (uint64_t)blocks * n_row * 34u) ||
+        !ds4_gpu_tensor_write(tgt_t, 0, target_row, (uint64_t)window * 4u)) {
+        fprintf(stderr, "ds4-router-train: probe upload failed\n");
+        free(wbuf);
+        free(target_row);
+        goto probe_cleanup;
+    }
+    free(wbuf);
+    fprintf(stderr, "ds4-rt: probe upload ok\n");
+
+    float *hl = xmalloc((size_t)window * in_dim * sizeof(float));
+    float *dl = xmalloc((size_t)window * in_dim * sizeof(float));
+    float *loss_h = xmalloc((size_t)window * sizeof(float));
+    for (int i = 0; i < g_rt.n_layers; i++) {
+        ds4_router_train_layer *L = &g_rt.layers[i];
+        for (uint32_t t = 0; t < window; t++) {
+            const float *at = L->cur_attn + (size_t)t * DS4_N_EMBD;
+            const float *rt = L->cur_routed + (size_t)t * DS4_N_EMBD;
+            const float *sh = L->cur_shared + (size_t)t * DS4_N_EMBD;
+            float *hp = hl + (size_t)t * DS4_N_EMBD;
+            for (uint32_t d = 0; d < DS4_N_EMBD; d++)
+                hp[d] = at[d] + rt[d] + sh[d];
+        }
+        if (!ds4_gpu_tensor_write(h_t, 0, hl,
+                                  (uint64_t)window * DS4_N_EMBD * 4u)) {
+            fprintf(stderr, "ds4-router-train: probe h upload failed\n");
+            break;
+        }
+        if (!ds4_gpu_probe_sampled_ce(dLdh_t, loss_t, h_t, w_t, tgt_t,
+                                      lg_t, cf_t, window, n_row,
+                                      DS4_N_EMBD)) {
+            fprintf(stderr, "ds4-router-train: probe kernel failed\n");
+            break;
+        }
+        fprintf(stderr, "ds4-rt: probe L=%d kernels ok\n", L->il);
+        if (!ds4_gpu_tensor_read(dLdh_t, 0, dl,
+                                 (uint64_t)window * DS4_N_EMBD * 4u) ||
+            !ds4_gpu_tensor_read(loss_t, 0, loss_h,
+                                 (uint64_t)window * 4u)) {
+            fprintf(stderr, "ds4-router-train: probe readback failed\n");
+            break;
+        }
+        memcpy(L->cur_dLdh, dl, (size_t)window * DS4_N_EMBD * sizeof(float));
+        for (uint32_t t = 0; t < window; t++) {
+            if (target_row[t] < 0) continue;
+            g_rt.probe_sum += (double)loss_h[t];
+            g_rt.probe_pos++;
+        }
+        rt_layer_step(L);
+    }
+    free(loss_h);
+    free(dl);
+    free(hl);
+    free(target_row);
+
+probe_cleanup:
+    ds4_gpu_tensor_free(cf_t);
+    ds4_gpu_tensor_free(lg_t);
+    ds4_gpu_tensor_free(loss_t);
+    ds4_gpu_tensor_free(dLdh_t);
+    ds4_gpu_tensor_free(h_t);
+    ds4_gpu_tensor_free(tgt_t);
+    ds4_gpu_tensor_free(w_t);
+}
+
+static int rt_write_sidecar(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ds4-router-train: cannot write %s\n", path);
+        return 1;
+    }
+    fwrite("DS4RD001", 1, 8, f);
+    const uint32_t n_entries = (uint32_t)g_rt.n_layers;
+    fwrite(&n_entries, 4, 1, f);
+    for (int i = 0; i < g_rt.n_layers; i++) {
+        const ds4_router_train_layer *L = &g_rt.layers[i];
+        const uint32_t nf = L->n_expert * L->in_dim;
+        fwrite(&L->off, 8, 1, f);
+        fwrite(&nf, 4, 1, f);
+        fwrite(L->W, 4, nf, f);
+    }
+    fclose(f);
+    return 0;
+}
+
+int ds4_router_train_main(int argc, char **argv) {
+    const char *model_path = NULL;
+    const char *corpus_path = NULL;
+    const char *out_path = "router_delta.bin";
+    uint64_t token_budget = 30000;
+    uint32_t window = 64;
+    float lr = 3e-4f;
+    float lambda = 1.0f;
+    float mu = 1.0f;
+    int epochs = 1;
+    bool gpu_mode = false;
+    int ckpt_every = 0;
+    bool trace = false;
+    bool probe_mode = false;
+    float probe_w = 1e-3f;
+    uint32_t probe_s = 512;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) model_path = argv[++i];
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) corpus_path = argv[++i];
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) token_budget = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "-w") && i + 1 < argc) window = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-lr") && i + 1 < argc) lr = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) lambda = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-mu") && i + 1 < argc) mu = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-e") && i + 1 < argc) epochs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-ckpt") && i + 1 < argc) ckpt_every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-gpu")) {
+#ifndef DS4_NO_GPU
+            gpu_mode = true;
+#else
+            fprintf(stderr, "ds4-router-train: -gpu unsupported in this CPU-only build\n");
+            return 1;
+#endif
+        }
+        else if (!strcmp(argv[i], "-trace")) trace = true;
+        else if (!strcmp(argv[i], "-probe")) probe_mode = true;
+        else if (!strcmp(argv[i], "-pc") && i + 1 < argc) probe_w = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "-ps") && i + 1 < argc) probe_s = (uint32_t)atoi(argv[++i]);
+        else {
+            fprintf(stderr, "usage: ds4-router-train -m GGUF -c corpus.txt [-o delta.bin] [-t tokens] [-w window] [-lr lr] [-l lambda] [-mu mu] [-e epochs] [-gpu] [-ckpt N] [-trace] [-probe [-pc w] [-ps S]]\n");
+            return 1;
+        }
+    }
+    if (ckpt_every < 0) ckpt_every = 0;
+    if (probe_mode && !gpu_mode) {
+        fprintf(stderr, "ds4-router-train: -probe requires -gpu\n");
+        return 1;
+    }
+    if (probe_s < 16) probe_s = 16;
+    if (probe_s > 16384) probe_s = 16384;
+    if (!model_path || !corpus_path) {
+        fprintf(stderr, "ds4-router-train: -m and -c are required\n");
+        return 1;
+    }
+    if (window < 8 || window > 256) window = 64;
+    if (epochs < 1) epochs = 1;
+    if (token_budget < window) token_budget = window;
+    /* The trainer's capture depends on serial per-token routing order. */
+    _putenv_s("DS4_NO_ROUTED_TOKEN_PARALLEL", "1");
+
+    ds4_engine_options opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.model_path = model_path;
+    opt.backend = gpu_mode ? DS4_BACKEND_CUDA : DS4_BACKEND_CPU;
+    opt.context_size = (int)window + 2;
+    /* quality=0 matches the hybrid prefill engine: the SSD streaming
+     * selected-slot path (metal_graph_decode_cuda_selected_slots_expected)
+     * requires !g->quality. */
+    opt.quality = gpu_mode ? 0 : 1;
+    if (gpu_mode) {
+        opt.ssd_streaming = true;
+        opt.ssd_streaming_cold = false;
+        opt.ssd_streaming_cache_experts = 16;
+        opt.prefill_chunk = 16;
+    }
+    ds4_engine *e = NULL;
+    if (ds4_engine_open(&e, &opt) != 0 || !e) {
+        fprintf(stderr, "ds4-router-train: engine open failed\n");
+        return 1;
+    }
+
+    const uint32_t n_layers = (uint32_t)DS4_N_LAYER;
+    g_rt.weights = &e->weights;
+    g_rt.model = &e->model;
+    g_rt.window = window;
+    g_rt.lr = lr;
+    g_rt.lambda = lambda;
+    g_rt.mu = mu;
+    g_rt.probe = probe_mode;
+    g_rt.probe_w = probe_w;
+    g_rt.probe_s = probe_s;
+    g_rt.epoch = 0;
+    g_rt.window_base = 0;
+    g_rt.n_layers = 0;
+    int cap = (int)n_layers;
+    g_rt.layers = xcalloc((size_t)cap, sizeof(g_rt.layers[0]));
+    for (uint32_t il = 0; il < n_layers; il++) {
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+        if (lw->ffn_gate_tid2eid || !lw->ffn_gate_inp) continue;
+        if (lw->ffn_gate_inp->ndim != 2 ||
+            lw->ffn_gate_inp->dim[0] != DS4_N_EMBD ||
+            lw->ffn_gate_inp->dim[1] != DS4_N_EXPERT) {
+            continue;
+        }
+        ds4_router_train_layer *L = &g_rt.layers[g_rt.n_layers++];
+        L->il = (int)il;
+        L->off = lw->ffn_gate_inp->abs_offset;
+        L->in_dim = (uint32_t)lw->ffn_gate_inp->dim[0];   /* 4096 */
+        L->n_expert = (uint32_t)lw->ffn_gate_inp->dim[1]; /* 256 */
+        /* W mirrors the GGUF layout [in_dim][n_expert] (d-major). */
+        const size_t nf = (size_t)L->in_dim * L->n_expert;
+        L->W = xmalloc(nf * sizeof(float));
+        L->W0 = xmalloc(nf * sizeof(float));
+        L->m = xcalloc(nf, sizeof(float));
+        L->v = xcalloc(nf, sizeof(float));
+        memcpy(L->W, tensor_data(&e->model, lw->ffn_gate_inp), nf * sizeof(float));
+        memcpy(L->W0, L->W, nf * sizeof(float));
+        L->z0 = xmalloc((size_t)token_budget * L->n_expert * sizeof(float));
+        L->cur_x = xmalloc((size_t)window * L->in_dim * sizeof(float));
+        L->cur_z = xmalloc((size_t)window * L->n_expert * sizeof(float));
+        if (probe_mode) {
+            L->cur_attn = xmalloc((size_t)window * DS4_N_EMBD * sizeof(float));
+            L->cur_down = xmalloc((size_t)window * DS4_N_EXPERT_USED *
+                                  DS4_N_EMBD * sizeof(float));
+            L->cur_routed = xmalloc((size_t)window * DS4_N_EMBD * sizeof(float));
+            L->cur_shared = xmalloc((size_t)window * DS4_N_EMBD * sizeof(float));
+            L->cur_dLdh = xmalloc((size_t)window * DS4_N_EMBD * sizeof(float));
+        }
+        L->pos = 0;
+    }
+    fprintf(stderr,
+            "ds4-router-train: %d router layers (%.1f M params), window=%u, "
+            "lr=%g lambda=%g epochs=%d budget=%llu tokens\n",
+            g_rt.n_layers,
+            (double)g_rt.n_layers * DS4_N_EXPERT * DS4_N_EMBD / 1e6,
+            window, lr, lambda, epochs,
+            (unsigned long long)token_budget);
+
+    float *logits_buf = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    ds4_kv_cache cache;
+    kv_cache_init(&cache, window + 2, ds4_default_raw_cap(window + 2));
+    /* GPU mode: one graph reused across all windows (the server reuses the
+     * session graph across requests the same way; per-window alloc/free was
+     * measured as a large fixed overhead).  CPU-only builds take the plain
+     * CPU forward path instead (-gpu is rejected at arg parse there). */
+    bool gpu_ready = false;
+#ifndef DS4_NO_GPU
+    ds4_gpu_graph gpu_g;
+    uint32_t gpu_prefill_cap = 16;
+    if (gpu_mode) {
+        gpu_prefill_cap =
+            metal_graph_prefill_cap_for_prompt((int)window, 16u);
+        const uint32_t raw_cap =
+            metal_graph_raw_cap_for_context(window + 2u, gpu_prefill_cap);
+        const ds4_layer_weights *shape_layer =
+            weights_first_bound_layer(&e->weights);
+        gpu_ready = shape_layer &&
+            metal_graph_alloc_raw_cap(
+                    &gpu_g, &e->weights, shape_layer,
+                    raw_cap, window + 2u, gpu_prefill_cap,
+                    false, NULL, false, NULL);
+        if (!gpu_ready) {
+            fprintf(stderr, "ds4-router-train: GPU graph alloc failed\n");
+            return 1;
+        }
+        gpu_g.quality = 0;
+        gpu_g.ssd_streaming = true;
+        gpu_g.ssd_streaming_cold = false;
+        gpu_g.power_percent = 100;
+        g_rt_cap_layers = (uint32_t)DS4_N_LAYER;
+        g_rt_cap_window = window;
+        g_rt_cap = ds4_gpu_tensor_alloc(
+                (uint64_t)window * g_rt_cap_layers *
+                (uint64_t)DS4_RT_CAP_ENTRY * sizeof(float));
+        if (!g_rt_cap) {
+            fprintf(stderr,
+                    "ds4-router-train: GPU capture buffer alloc failed\n");
+            return 1;
+        }
+    }
+#endif /* !DS4_NO_GPU */
+    ds4_tokens toks;
+    memset(&toks, 0, sizeof(toks));
+    char *line = xmalloc(1u << 20);
+    uint64_t total_tokens = 0;
+    uint64_t windows_done = 0;
+    const double t_start = now_sec();
+    g_router_capture = rt_capture;
+    g_router_capture_full = probe_mode ? rt_capture_full : NULL;
+
+    for (int epoch = 0; epoch < epochs; epoch++) {
+        g_rt.epoch = epoch;
+        FILE *f = fopen(corpus_path, "rb");
+        if (!f) {
+            fprintf(stderr, "ds4-router-train: cannot open corpus %s\n", corpus_path);
+            break;
+        }
+        g_rt.loss_sum = 0.0;
+        g_rt.task_sum = 0.0;
+        g_rt.pairs = 0;
+        g_rt.overlap_sum = 0;
+        g_rt.overlap_pairs = 0;
+        g_rt.probe_sum = 0.0;
+        g_rt.probe_pos = 0;
+        double prev_ov_sum = 0.0;
+        uint64_t prev_ov_pairs = 0;
+        uint64_t epoch_tokens = 0;
+        while (epoch_tokens < token_budget &&
+               fgets(line, 1 << 20, f) != NULL) {
+            size_t ln = strlen(line);
+            while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r')) line[--ln] = 0;
+            if (ln < 8) continue;
+            ds4_tokens doc;
+            memset(&doc, 0, sizeof(doc));
+            ds4_tokenize_text(e, line, &doc);
+            if (doc.len < (int)window) { ds4_tokens_free(&doc); continue; }
+            int off = 0;
+            while (off + (int)window <= doc.len &&
+                   epoch_tokens + window <= token_budget) {
+                toks.v = doc.v + off;
+                toks.len = (int)window;
+                int32_t *targets = probe_mode
+                    ? xmalloc((size_t)window * sizeof(int32_t)) : NULL;
+                if (targets) {
+                    for (uint32_t t = 0; t < window; t++) {
+                        targets[t] = (off + (int)t + 1 < doc.len)
+                            ? (int32_t)doc.v[off + (int)t + 1] : -1;
+                    }
+                }
+                for (int i = 0; i < g_rt.n_layers; i++) g_rt.layers[i].pos = 0;
+                g_rt.window_base = epoch_tokens;
+                if (gpu_mode) {
+#ifndef DS4_NO_GPU
+                    /* GPU forward on the reused graph: the prefill router
+                     * step feeds the capture hook via the D2H block in the
+                     * batched FFN.  Chunk=16 mirrors the hybrid server. */
+                    const double tw0 = now_sec();
+                    bool ok;
+                    if (gpu_prefill_cap < (uint32_t)window) {
+                        ok = metal_graph_prefill_chunked(
+                                &gpu_g, &e->model, &e->weights, &toks,
+                                (int)window, logits_buf, false,
+                                NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                    } else {
+                        ok = metal_graph_prefill_raw_swa(
+                                &gpu_g, &e->model, &e->weights, &toks,
+                                (int)window,
+                                logits_buf, true, NULL, NULL, NULL, NULL, NULL);
+                    }
+                    const double t_prefill = now_sec() - tw0;
+                    if (!ok) {
+                        fprintf(stderr,
+                                "ds4-router-train: GPU prefill failed\n");
+                        return 1;
+                    }
+                    rt_drain_gpu_capture(&e->weights, window);
+                    if (probe_mode) rt_probe_all(e, window, targets);
+                    const double t_drain = now_sec() - tw0 - t_prefill;
+                    fprintf(stderr,
+                            "ds4-rt: window %llu prefill=%.2fs drain+step=%.2fs\n",
+                            (unsigned long long)windows_done,
+                            t_prefill, t_drain);
+#endif /* !DS4_NO_GPU */
+                } else {
+                    /* Fresh KV per window: positions restart at 0. */
+                    kv_cache_free(&cache);
+                    kv_cache_init(&cache, window + 2,
+                                  ds4_default_raw_cap(window + 2));
+                    prefill_layer_major_cpu(logits_buf, &e->model, &e->weights,
+                                            &cache, &toks, NULL, 0.0f, 0.0f);
+                }
+                off += (int)window;
+                epoch_tokens += window;
+                total_tokens += window;
+                windows_done++;
+                free(targets);
+                targets = NULL;
+                if (trace) {
+                    const double cum_ov = g_rt.overlap_pairs
+                        ? (double)g_rt.overlap_sum / (double)g_rt.overlap_pairs
+                        : 0.0;
+                    const uint64_t d_pairs = g_rt.overlap_pairs - prev_ov_pairs;
+                    const double win_ov = d_pairs
+                        ? (double)(g_rt.overlap_sum - prev_ov_sum) / (double)d_pairs
+                        : 0.0;
+                    fprintf(stderr,
+                            "ds4-rt: win=%llu cum_ov=%.2f win_ov=%.2f "
+                            "loss=%.3f task=%.3f probe=%.3f\n",
+                            (unsigned long long)windows_done, cum_ov, win_ov,
+                            g_rt.pairs ? g_rt.loss_sum / (double)g_rt.pairs : 0.0,
+                            g_rt.pairs ? g_rt.task_sum / (double)g_rt.pairs : 0.0,
+                            g_rt.probe_pos
+                                ? g_rt.probe_sum / (double)g_rt.probe_pos : 0.0);
+                    prev_ov_sum = g_rt.overlap_sum;
+                    prev_ov_pairs = g_rt.overlap_pairs;
+                }
+                if (ckpt_every > 0 &&
+                    (windows_done % (uint64_t)ckpt_every) == 0) {
+                    char base[1000], ck[1024];
+                    snprintf(base, sizeof(base), "%s", out_path);
+                    const size_t bl = strlen(base);
+                    if (bl > 4 && !strcmp(base + bl - 4, ".bin")) base[bl - 4] = 0;
+                    snprintf(ck, sizeof(ck), "%s_w%llu.bin", base,
+                             (unsigned long long)windows_done);
+                    if (rt_write_sidecar(ck) != 0) {
+                        fprintf(stderr,
+                                "ds4-router-train: checkpoint write failed\n");
+                        return 1;
+                    }
+                }
+                if ((windows_done % 16) == 0) {
+                    const double el = now_sec() - t_start;
+                    fprintf(stderr,
+                            "ds4-router-train: windows=%llu tokens=%llu elapsed=%.0fs "
+                            "loss=%.3f overlap=%.2f/6\r",
+                            (unsigned long long)windows_done,
+                            (unsigned long long)total_tokens, el,
+                            g_rt.pairs ? g_rt.loss_sum / (double)g_rt.pairs : 0.0,
+                            g_rt.overlap_pairs
+                                ? (double)g_rt.overlap_sum / (double)g_rt.overlap_pairs
+                                : 0.0);
+                    fflush(stderr);
+                }
+            }
+            ds4_tokens_free(&doc);
+        }
+        fclose(f);
+        fprintf(stderr,
+                "\nds4-router-train: epoch %d done tokens=%llu loss=%.3f "
+                "task=%.3f adj_overlap=%.2f/6\n",
+                epoch, (unsigned long long)total_tokens,
+                g_rt.pairs ? g_rt.loss_sum / (double)g_rt.pairs : 0.0,
+                g_rt.pairs ? g_rt.task_sum / (double)g_rt.pairs : 0.0,
+                g_rt.overlap_pairs
+                    ? (double)g_rt.overlap_sum / (double)g_rt.overlap_pairs
+                    : 0.0);
+        /* Install the updated routers for the next epoch's forward. */
+        for (int i = 0; i < g_rt.n_layers; i++) {
+            ds4_router_delta_register(g_rt.layers[i].off,
+                                      (const uint8_t *)g_rt.layers[i].W);
+        }
+    }
+    g_router_capture = NULL;
+    g_router_capture_full = NULL;
+    /* Settle the capture stream before freeing its destination buffer. */
+#ifndef DS4_NO_GPU
+    ds4_gpu_capture_stream_sync();
+#endif
+    if (g_rt_cap) {
+        ds4_gpu_tensor_free(g_rt_cap);
+        g_rt_cap = NULL;
+    }
+#ifndef DS4_NO_GPU
+    if (gpu_ready) metal_graph_free(&gpu_g);
+#endif
+
+    /* Write the final router-delta sidecar. */
+    if (rt_write_sidecar(out_path) != 0) return 1;
+    fprintf(stderr, "ds4-router-train: wrote %s (%d entries)\n",
+            out_path, (int)g_rt.n_layers);
+    fprintf(stderr, "ds4-router-train: teardown ok\n");
     return 0;
 }
 

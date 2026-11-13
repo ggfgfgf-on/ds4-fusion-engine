@@ -3792,6 +3792,225 @@ extern "C" uint64_t ds4_gpu_free_bytes(void) {
     return (uint64_t)free_b;
 }
 
+/* Capture-copy stream for the ReMoE router trainer (file scope so teardown
+ * can synchronize it; the trainer's drain does a synchronous D2H). */
+static cudaStream_t g_cap_stream = NULL;
+static cudaEvent_t g_cap_ev = NULL;
+static int g_cap_init_ok = 0;
+
+extern "C" void ds4_gpu_capture_stream_sync(void) {
+    if (g_cap_init_ok && g_cap_stream) {
+        (void)cudaStreamSynchronize(g_cap_stream);
+    }
+}
+
+extern "C" int ds4_gpu_tensor_copy_async_after_default(
+        ds4_gpu_tensor *dst,
+        const ds4_gpu_tensor *src,
+        uint64_t bytes) {
+    if (!dst || !src || bytes > dst->bytes || bytes > src->bytes) return 0;
+    if (bytes == 0) return 1;
+    if (!g_cap_init_ok) {
+        g_cap_init_ok = 1;
+        if (cudaStreamCreateWithFlags(&g_cap_stream, cudaStreamNonBlocking) !=
+            cudaSuccess) {
+            return 0;
+        }
+        if (cudaEventCreateWithFlags(&g_cap_ev, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            return 0;
+        }
+    }
+    if (cudaEventRecord(g_cap_ev, 0) != cudaSuccess) return 0;
+    if (cudaStreamWaitEvent(g_cap_stream, g_cap_ev, 0) != cudaSuccess) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst->ptr, src->ptr, (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice, g_cap_stream),
+                   "tensor copy async (capture stream)");
+}
+
+__global__ static void probe_sampled_logits_kernel(
+        float *logits,               /* [n_pos][n_row] */
+        const float *h,              /* [n_pos][in_dim] fp32 */
+        const unsigned char *w,      /* [blocks][n_row][34] */
+        uint32_t n_pos, uint32_t n_row, uint32_t in_dim) {
+    const uint32_t pos = blockIdx.x * 32u + (threadIdx.x & 31u);
+    const uint32_t row = blockIdx.y * 8u + (threadIdx.x >> 5u);
+    /* No early return: out-of-range threads must stay inside the
+     * __syncthreads()s (a partial-block exit deadlocks the barrier). */
+    const bool active = pos < n_pos && row < n_row;
+    __shared__ float hs[32][33];
+    float acc = 0.0f;
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t b = 0; b < blocks; b++) {
+        if (threadIdx.x < 32u) {
+            const uint32_t pl = blockIdx.x * 32u + threadIdx.x;
+            const uint32_t d0 = b * 32u;
+            const uint32_t dn = in_dim - d0 < 32u ? in_dim - d0 : 32u;
+            const float *hp = pl < n_pos
+                ? h + (uint64_t)pl * in_dim + d0 : NULL;
+            for (uint32_t d = 0; d < 32u; d++)
+                hs[threadIdx.x][d] =
+                    (hp && d < dn) ? hp[d] : 0.0f;
+        }
+        __syncthreads();
+        if (active) {
+            const unsigned char *wb = w + ((uint64_t)b * n_row + row) * 34u;
+            const float s = __half2float(*(const __half *)wb);
+            const int8_t *qs = (const int8_t *)(wb + 2u);
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < 32u; d++)
+                dot += (float)qs[d] * hs[threadIdx.x & 31u][d];
+            acc += s * dot;
+        }
+        __syncthreads();
+    }
+    if (active) logits[(uint64_t)pos * n_row + row] = acc;
+}
+
+__global__ static void probe_softmax_coeff_kernel(
+        float *coeff,                /* [n_pos][n_row] */
+        float *loss,                 /* [n_pos] CE loss (0 for masked) */
+        const float *logits,         /* [n_pos][n_row] */
+        const int32_t *target_row,   /* [n_pos]: sample-row index of the true
+                                      * token, or -1 (masked position) */
+        uint32_t n_pos, uint32_t n_row) {
+    const uint32_t pos = blockIdx.x;
+    if (pos >= n_pos) return;
+    const float *lp = logits + (uint64_t)pos * n_row;
+    float *cp = coeff + (uint64_t)pos * n_row;
+    const int32_t tr = target_row[pos];
+    if (tr < 0) {
+        for (uint32_t r = threadIdx.x; r < n_row; r += blockDim.x) cp[r] = 0.0f;
+        if (threadIdx.x == 0) loss[pos] = 0.0f;
+        return;
+    }
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    __shared__ float part_max[8], part_sum[8];
+    float mx = -1e30f;
+    for (uint32_t r = threadIdx.x; r < n_row; r += blockDim.x)
+        mx = fmaxf(mx, lp[r]);
+    for (uint32_t off = 16; off > 0; off >>= 1)
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+    if (lane == 0) part_max[warp] = mx;
+    __syncthreads();
+    /* 8-thread cross-warp reduce: shfl_down with the 0xff mask is legal here
+     * because lanes 0-7 all execute it converged; the result is broadcast
+     * through shared memory + __syncthreads (a single-lane __shfl_sync
+     * broadcast would be UB and deadlocks on sm_120). */
+    if (warp == 0 && threadIdx.x < 8u) {
+        float v = part_max[threadIdx.x];
+        for (uint32_t off = 4; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_down_sync(0x000000ffu, v, off));
+        if (threadIdx.x == 0) part_max[0] = v;
+    }
+    __syncthreads();
+    mx = part_max[0];
+    float sum = 0.0f;
+    for (uint32_t r = threadIdx.x; r < n_row; r += blockDim.x)
+        sum += __expf(lp[r] - mx);
+    for (uint32_t off = 16; off > 0; off >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) part_sum[warp] = sum;
+    __syncthreads();
+    if (warp == 0 && threadIdx.x < 8u) {
+        float v = part_sum[threadIdx.x];
+        for (uint32_t off = 4; off > 0; off >>= 1)
+            v += __shfl_down_sync(0x000000ffu, v, off);
+        if (threadIdx.x == 0) part_sum[0] = v;
+    }
+    __syncthreads();
+    sum = part_sum[0];
+    const float logsum = logf(sum);
+    for (uint32_t r = threadIdx.x; r < n_row; r += blockDim.x) {
+        const float p = __expf(lp[r] - mx) / sum;
+        cp[r] = ((int32_t)r == tr) ? p - 1.0f : p;
+    }
+    if (threadIdx.x == 0) loss[pos] = (mx + logsum) - lp[tr];
+}
+
+__global__ static void probe_grad_accum_kernel(
+        float *dLdh,                 /* [n_pos][in_dim] */
+        const float *coeff,          /* [n_pos][n_row] */
+        const unsigned char *w,      /* [blocks][n_row][34] */
+        uint32_t n_pos, uint32_t n_row, uint32_t in_dim) {
+    const uint32_t pos = blockIdx.x * 32u + (threadIdx.x >> 5u);
+    const uint32_t d = threadIdx.x & 31u;
+    /* Same barrier discipline as the logits kernel: keep every thread in
+     * the __syncthreads loop even when its position is out of range. */
+    const bool active = pos < n_pos;
+    __shared__ int8_t qs[32];
+    __shared__ float srow;
+    const uint32_t b = blockIdx.y;
+    const float *cp = active ? coeff + (uint64_t)pos * n_row : NULL;
+    float acc = 0.0f;
+    for (uint32_t r = 0; r < n_row; r++) {
+        if (threadIdx.x < 32u) {
+            const unsigned char *wb = w + ((uint64_t)b * n_row + r) * 34u;
+            srow = __half2float(*(const __half *)wb);
+            for (uint32_t i = 0; i < 32u; i++) qs[i] = wb[2u + i];
+        }
+        __syncthreads();
+        if (active) acc += cp[r] * (srow * (float)qs[d]);
+        __syncthreads();
+    }
+    const uint32_t d0 = b * 32u;
+    if (active && d0 + d < in_dim)
+        dLdh[(uint64_t)pos * in_dim + d0 + d] = acc;
+}
+
+extern "C" int ds4_gpu_probe_sampled_ce(
+        ds4_gpu_tensor *dLdh,           /* [n_pos][in_dim] fp32 out */
+        ds4_gpu_tensor *loss,           /* [n_pos] fp32 out */
+        const ds4_gpu_tensor *h,        /* [n_pos][in_dim] fp32 */
+        const ds4_gpu_tensor *w,        /* [blocks][n_row][34] */
+        const ds4_gpu_tensor *targets,  /* [n_pos] int32 */
+        ds4_gpu_tensor *scratch_logits, /* [n_pos][n_row] fp32 */
+        ds4_gpu_tensor *scratch_coeff,  /* [n_pos][n_row] fp32 */
+        uint32_t n_pos, uint32_t n_row, uint32_t in_dim) {
+    if (!dLdh || !loss || !h || !w || !targets ||
+        !scratch_logits || !scratch_coeff) return 0;
+    if (in_dim == 0 || n_pos == 0 || n_row == 0 || (in_dim & 31u) != 0)
+        return 0;
+    const uint32_t blocks = in_dim / 32u;
+    if (w->bytes < (uint64_t)blocks * n_row * 34u) return 0;
+    if (h->bytes < (uint64_t)n_pos * in_dim * 4u) return 0;
+    if (targets->bytes < (uint64_t)n_pos * 4u) return 0;
+    if (dLdh->bytes < (uint64_t)n_pos * in_dim * 4u) return 0;
+    if (loss->bytes < (uint64_t)n_pos * 4u) return 0;
+    if (scratch_logits->bytes < (uint64_t)n_pos * n_row * 4u) return 0;
+    if (scratch_coeff->bytes < (uint64_t)n_pos * n_row * 4u) return 0;
+    cudaStream_t s = cuda_decode_stream();
+    const bool ptm = getenv("DS4_RT_PROBE_TIMING") != NULL;
+    dim3 g1((n_pos + 31u) / 32u, (n_row + 7u) / 8u, 1);
+    probe_sampled_logits_kernel<<<g1, 256, 0, s>>>(
+            (float *)scratch_logits->ptr, (const float *)h->ptr,
+            (const unsigned char *)w->ptr, n_pos, n_row, in_dim);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (ptm) {
+        (void)cudaDeviceSynchronize();
+        fprintf(stderr, "ds4-probe: logits kernel done\n");
+    }
+    probe_softmax_coeff_kernel<<<n_pos, 256, 0, s>>>(
+            (float *)scratch_coeff->ptr, (float *)loss->ptr,
+            (const float *)scratch_logits->ptr, (const int32_t *)targets->ptr,
+            n_pos, n_row);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (ptm) {
+        (void)cudaDeviceSynchronize();
+        fprintf(stderr, "ds4-probe: coeff kernel done\n");
+    }
+    dim3 g2((n_pos + 31u) / 32u, blocks, 1);
+    probe_grad_accum_kernel<<<g2, 1024, 0, s>>>(
+            (float *)dLdh->ptr, (const float *)scratch_coeff->ptr,
+            (const unsigned char *)w->ptr, n_pos, n_row, in_dim);
+    if (ptm) {
+        (void)cudaDeviceSynchronize();
+        fprintf(stderr, "ds4-probe: grad kernel done\n");
+    }
+    return cuda_ok(cudaGetLastError(), "probe sampled CE launch");
+}
+
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */

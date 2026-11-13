@@ -18293,6 +18293,29 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
+        ds4_gpu_tensor_free(g->layer_index_norm_cache[il]);
+        ds4_gpu_tensor_free(g->layer_index_cluster_cent[il]);
+        ds4_gpu_tensor_free(g->layer_index_cluster_radius[il]);
+        ds4_gpu_tensor_free(g->layer_index_cluster_dmax[il]);
+        ds4_gpu_tensor_free(g->layer_index_cluster_count[il]);
+        ds4_gpu_tensor_free(g->layer_index_cluster_assign[il]);
+        struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+        free(st->phys);
+        free(st->stamp);
+        free(st->ever);
+        ds4_gpu_tensor_free(st->table);
+        st->phys = NULL;
+        st->stamp = NULL;
+        st->ever = NULL;
+        st->table = NULL;
+    }
+    free(g->paging_pin);
+    free(g->paging_pin2);
+    g->paging_pin = NULL;
+    g->paging_pin2 = NULL;
+    if (g->paging_fp) {
+        fclose(g->paging_fp);
+        g->paging_fp = NULL;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
@@ -22773,7 +22796,13 @@ static bool metal_graph_commit_attn_comp_stage(
         uint32_t       rows) {
     if (ds4_kv_bitq_comp_enabled()) {
         /* DS4_CUDA_KV_BITQ_COMP: pack the staged f32 rows into the packed
-         * cache (the F16 flow copies; the packed flow quantizes). */
+         * cache (the F16 flow copies; the packed flow quantizes).  Under
+         * DS4_CUDA_INDEXER_PAGING (ratio-4 layers only) the pack goes
+         * page-by-page into the resident ring via the page table. */
+        if (ds4_indexer_paging_enabled() && ds4_layer_compress_ratio(il) == 4 &&
+            getenv("DS4_CUDA_INDEXER_PAGING_NO_PACK") == NULL) {
+            return metal_graph_indexer_paging_pack_stage(g, il, first_row, rows);
+        }
         return ds4_gpu_comp_cache_bitq_pack_stage_tensor(
                 metal_graph_attn_comp_stage(g),
                 g->layer_attn_comp_cache[il],
@@ -26369,6 +26398,9 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                 &decode_index_stage_t0);
             }
         } else if (ok && indexed_attention) {
+            if (ok && ds4_indexer_paging_enabled()) {
+                ok = metal_graph_indexer_paging_read_prepare(g, il, n_comp);
+            }
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     metal_graph_heads(g),
                     model->map,
@@ -33345,6 +33377,9 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
+                    if (ok && ds4_indexer_paging_enabled()) {
+                        ok = metal_graph_indexer_paging_read_prepare(g, il, n_comp);
+                    }
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(metal_graph_batch_heads(g),
                                                                               model->map,
                                                                               model->size,

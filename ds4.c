@@ -17425,6 +17425,15 @@ typedef struct {
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_raw_cache_tp[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache_tp[DS4_MAX_LAYER];
+    /* DS4_CUDA_INDEXER_2STAGE: per-layer norm side table (Cauchy-Schwarz
+     * bounds) + MacQueen clustering state (seeded at row-append time). */
+    ds4_gpu_tensor *layer_index_norm_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_cluster_cent[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_cluster_radius[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_cluster_dmax[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_cluster_count[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_cluster_assign[DS4_MAX_LAYER];
+    uint32_t layer_index_cluster_age[DS4_MAX_LAYER];
 
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
@@ -17444,6 +17453,27 @@ typedef struct {
     uint32_t spec_prefix_n_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     bool spec_capture_prefixes;
+    /* ---- KV paging (DS4_CUDA_INDEXER_PAGING, default OFF) ----
+     * Per-layer page table over the attn comp cache: 512-row pages, a
+     * resident ring (physical slots) + an SSD backing file.  Reads/writes go
+     * through metal_graph_indexer_paging_* helpers; the .cu paged gather
+     * translates logical page -> physical slot. */
+    struct ds4_indexer_paging_state {
+        uint32_t n_pages;       /* logical pages = ceil(logical cap / 512) */
+        uint32_t resident;      /* physical slots */
+        uint32_t *phys;         /* [n_pages] -> slot or UINT32_MAX (evicted) */
+        uint32_t *stamp;        /* [n_pages] last-touch clock */
+        uint8_t  *ever;         /* [n_pages] file content valid (ever evicted) */
+        ds4_gpu_tensor *table;  /* device mirror of phys */
+        uint64_t file_off;      /* per-layer byte offset in the shared file */
+        uint64_t evicts, pulls, verify_fails;
+    } layer_index_paging[DS4_MAX_LAYER];
+    uint32_t paging_resident;   /* shared resident-page count */
+    uint64_t paging_page_bytes; /* 512 x comp row bytes */
+    FILE    *paging_fp;         /* lazily opened shared backing file */
+    unsigned char *paging_pin;  /* pinned staging (page_bytes) */
+    unsigned char *paging_pin2; /* readback verify staging */
+    uint32_t paging_clock;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -19302,6 +19332,14 @@ static const char *ds4_kv_bitq_profile_name(int prof) {
     }
 }
 
+static bool ds4_indexer_paging_enabled(void);
+static bool metal_graph_indexer_paging_init_layer(
+        ds4_gpu_graph *g, uint32_t il);
+static bool metal_graph_indexer_paging_pack_stage(
+        ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows);
+static bool metal_graph_indexer_paging_read_prepare(
+        ds4_gpu_graph *g, uint32_t il, uint32_t n_comp);
+
 static int ds4_kv_bitq_manual_env_present(void) {
     return getenv("DS4_CUDA_KV_BITQ") != NULL ||
            getenv("DS4_CUDA_KV_BITQ_BITS") != NULL ||
@@ -19597,6 +19635,54 @@ static bool metal_graph_alloc_raw_cap(
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
     g->comp_cap = ctx_size / min_ratio + 2u;
     if (g->comp_cap < 2u) g->comp_cap = 2u;
+    /* KV paging config (DS4_CUDA_INDEXER_PAGING, default OFF). */
+    g->paging_resident = 8u;
+    g->paging_page_bytes = 0u;
+    g->paging_fp = NULL;
+    g->paging_pin = NULL;
+    g->paging_pin2 = NULL;
+    g->paging_clock = 0u;
+    {
+        const char *pr = getenv("DS4_CUDA_INDEXER_PAGING_RESIDENT");
+        if (pr && pr[0]) {
+            if (strcasecmp(pr, "auto") == 0) {
+                /* Full residency for the current ctx: resident == n_pages, so
+                 * the read-prepare span gate can never fire and eviction
+                 * never happens. */
+                g->paging_resident = (g->comp_cap + 511u) / 512u;
+                if (g->paging_resident < 1u) g->paging_resident = 1u;
+                fprintf(stderr,
+                        "ds4: indexer paging resident=auto: comp_cap=%u -> "
+                        "%u pages (full residency, never evicts)\n",
+                        g->comp_cap, g->paging_resident);
+            } else {
+                const long v = strtol(pr, NULL, 10);
+                if (v >= 1 && v <= 64) g->paging_resident = (uint32_t)v;
+            }
+        }
+        if (getenv("DS4_CUDA_INDEXER_PAGING") != NULL &&
+            !ds4_kv_bitq_comp_enabled()) {
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_INDEXER_PAGING requires DS4_CUDA_KV_BITQ_COMP "
+                    "(ignored)\n");
+        }
+        if (ds4_indexer_paging_enabled()) {
+            g->paging_page_bytes =
+                512ull * ds4_kv_bitq_comp_row_bytes(DS4_N_HEAD_DIM);
+            if (g->cuda_tp_attn_cache_dup || g->cuda_tp_attn_heads) {
+                fprintf(stderr,
+                        "ds4: DS4_CUDA_INDEXER_PAGING is not supported with "
+                        "CUDA TP attention (cache dup / head split)\n");
+                return false;
+            }
+            g->paging_pin = (unsigned char *)xmalloc((size_t)g->paging_page_bytes);
+            g->paging_pin2 = (unsigned char *)xmalloc((size_t)g->paging_page_bytes);
+            if (!g->paging_pin || !g->paging_pin2) {
+                fprintf(stderr, "ds4: indexer paging staging alloc failed\n");
+                return false;
+            }
+        }
+    }
     if (DS4_GPU_ATTN_COMP_CACHE_F16 || ds4_kv_bitq_comp_enabled()) {
         g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
@@ -19756,10 +19842,19 @@ static bool metal_graph_alloc_raw_cap(
                 ds4_kv_bitq_comp_enabled() ? ds4_kv_bitq_comp_row_bytes(DS4_N_HEAD_DIM)
                                            : (uint64_t)DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            const uint32_t comp_alloc_rows =
+                (ds4_indexer_paging_enabled() && ratio == 4)
+                    ? g->paging_resident * 512u
+                    : g->layer_comp_cap[il];
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
                     layer_tier,
-                    (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
+                    (uint64_t)comp_alloc_rows * comp_row_bytes);
+            if (ds4_indexer_paging_enabled() && ratio == 4 &&
+                !metal_graph_indexer_paging_init_layer(g, il)) {
+                fprintf(stderr, "ds4: indexer paging init failed layer=%u\n", il);
+                return false;
+            }
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
@@ -24536,6 +24631,265 @@ static int metal_graph_hc_pre_f32_fused(
         const ds4_tensor *fn, const ds4_tensor *scale, const ds4_tensor *base,
         const ds4_tensor *norm_w, uint32_t n_tokens);
 
+static bool ds4_indexer_paging_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_CUDA_INDEXER_PAGING") != NULL ? 1 : 0;
+    return on == 1 && ds4_kv_bitq_comp_enabled();
+}
+
+static bool metal_graph_indexer_paging_init_layer(
+        ds4_gpu_graph *g, uint32_t il) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    const uint32_t n_pages = (g->layer_comp_cap[il] + 511u) / 512u;
+    st->n_pages = n_pages;
+    st->resident = g->paging_resident;
+    if (st->resident > n_pages) st->resident = n_pages;
+    if (st->resident < 1u) st->resident = 1u;
+    st->file_off = (uint64_t)il * (uint64_t)n_pages * g->paging_page_bytes;
+    st->phys = (uint32_t *)xmalloc((size_t)n_pages * sizeof(uint32_t));
+    st->stamp = (uint32_t *)xcalloc((size_t)n_pages, sizeof(uint32_t));
+    st->ever = (uint8_t *)xcalloc((size_t)n_pages, 1u);
+    if (!st->phys || !st->stamp || !st->ever) return false;
+    for (uint32_t p = 0; p < n_pages; p++) {
+        st->phys[p] = (p < st->resident) ? p : UINT32_MAX;
+    }
+    st->table = ds4_gpu_tensor_alloc((uint64_t)n_pages * sizeof(uint32_t));
+    if (!st->table) return false;
+    if (ds4_gpu_tensor_write(st->table, 0, st->phys,
+                             (uint64_t)n_pages * sizeof(uint32_t)) == 0) {
+        return false;
+    }
+    if (getenv("DS4_CUDA_INDEXER_PAGING_LOG")) {
+        fprintf(stderr,
+                "ds4: indexer paging layer=%u pages=%u resident=%u page_bytes=%llu\n",
+                il, n_pages, st->resident,
+                (unsigned long long)g->paging_page_bytes);
+    }
+    return true;
+}
+
+static bool metal_graph_indexer_paging_evict(
+        ds4_gpu_graph *g, uint32_t il, uint32_t victim) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    const uint64_t page_bytes = g->paging_page_bytes;
+    if (!g->paging_pin || !g->paging_pin2 || page_bytes == 0u) return false;
+    if (!g->paging_fp) {
+        const char *path = getenv("DS4_CUDA_INDEXER_PAGING_FILE");
+        g->paging_fp = fopen(path && path[0]
+                                 ? path : ".cache/ds4-indexer-paging.bin", "wb+");
+        if (!g->paging_fp) {
+            fprintf(stderr, "ds4: indexer paging file open failed\n");
+            return false;
+        }
+    }
+    const uint32_t slot = st->phys[victim];
+    /* The paged ring is PACKED (bitq comp): row stride = the packed row
+     * bytes, NOT the f32/f16 stride of metal_graph_attn_comp_cache_row_bytes
+     * (that one ignores the pack layout and produced out-of-bounds offsets). */
+    const uint64_t row_bytes = ds4_kv_bitq_comp_row_bytes(DS4_N_HEAD_DIM);
+    const uint64_t src_off = (uint64_t)slot * 512u * row_bytes;
+    if (ds4_gpu_tensor_read(g->layer_attn_comp_cache[il], src_off,
+                            g->paging_pin, page_bytes) == 0) {
+        if (getenv("DS4_CUDA_INDEXER_PAGING_LOG")) {
+            fprintf(stderr, "ds4: paging evict: slot read failed layer=%u victim=%u slot=%u\n",
+                    il, victim, slot);
+        }
+        return false;
+    }
+    const uint64_t off = st->file_off + (uint64_t)victim * page_bytes;
+    if (_fseeki64(g->paging_fp, (int64_t)off, SEEK_SET) != 0 ||
+        fwrite(g->paging_pin, 1, (size_t)page_bytes, g->paging_fp) !=
+            (size_t)page_bytes ||
+        fflush(g->paging_fp) != 0 ||
+        _fseeki64(g->paging_fp, (int64_t)off, SEEK_SET) != 0 ||
+        fread(g->paging_pin2, 1, (size_t)page_bytes, g->paging_fp) !=
+            (size_t)page_bytes) {
+        fprintf(stderr, "ds4: indexer paging evict I/O failed layer=%u page=%u\n",
+                il, victim);
+        return false;
+    }
+    if (memcmp(g->paging_pin, g->paging_pin2, (size_t)page_bytes) != 0) {
+        st->verify_fails++;
+        fprintf(stderr,
+                "ds4: indexer paging EVICT VERIFY FAILED layer=%u page=%u "
+                "(aborting: corrupt pages are never silent)\n", il, victim);
+        return false;
+    }
+    st->phys[victim] = UINT32_MAX;
+    st->ever[victim] = 1;
+    st->evicts++;
+    return true;
+}
+
+static bool metal_graph_indexer_paging_pull(
+        ds4_gpu_graph *g, uint32_t il, uint32_t page, uint32_t slot) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    const uint64_t page_bytes = g->paging_page_bytes;
+    if (!g->paging_pin) return false;
+    if (st->ever[page]) {
+        const uint64_t off = st->file_off + (uint64_t)page * page_bytes;
+        if (_fseeki64(g->paging_fp, (int64_t)off, SEEK_SET) != 0 ||
+            fread(g->paging_pin, 1, (size_t)page_bytes, g->paging_fp) !=
+                (size_t)page_bytes) {
+            fprintf(stderr, "ds4: indexer paging pull read failed layer=%u page=%u\n",
+                    il, page);
+            return false;
+        }
+    } else {
+        memset(g->paging_pin, 0, (size_t)page_bytes);
+    }
+    const uint64_t dst_off =
+        (uint64_t)slot * 512u * ds4_kv_bitq_comp_row_bytes(DS4_N_HEAD_DIM);
+    if (ds4_gpu_tensor_write(g->layer_attn_comp_cache[il], dst_off,
+                             g->paging_pin, page_bytes) == 0) {
+        if (getenv("DS4_CUDA_INDEXER_PAGING_LOG")) {
+            fprintf(stderr, "ds4: paging pull: slot write failed layer=%u page=%u slot=%u\n",
+                    il, page, slot);
+        }
+        return false;
+    }
+    st->phys[page] = slot;
+    st->pulls++;
+    return true;
+}
+
+static bool metal_graph_indexer_paging_sync_table(
+        ds4_gpu_graph *g, uint32_t il) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    if (ds4_gpu_tensor_write(st->table, 0, st->phys,
+                             (uint64_t)st->n_pages * sizeof(uint32_t)) == 0) {
+        return false;
+    }
+    ds4_gpu_indexer_paging_table_set(st->table);
+    return true;
+}
+
+static bool metal_graph_indexer_paging_ensure(
+        ds4_gpu_graph *g, uint32_t il, uint32_t page) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    if (page >= st->n_pages) return false;
+    st->stamp[page] = ++g->paging_clock;
+    if (st->phys[page] != UINT32_MAX) return true;
+    uint32_t victim = UINT32_MAX;
+    uint32_t vstamp = UINT32_MAX;
+    for (uint32_t p = 0; p < st->n_pages; p++) {
+        if (st->phys[p] != UINT32_MAX && st->stamp[p] < vstamp) {
+            vstamp = st->stamp[p];
+            victim = p;
+        }
+    }
+    if (victim == UINT32_MAX) {
+        if (getenv("DS4_CUDA_INDEXER_PAGING_LOG")) {
+            fprintf(stderr, "ds4: paging ensure: no victim layer=%u page=%u "
+                    "n_pages=%u resident=%u clock=%u phys:",
+                    il, page, st->n_pages, st->resident, g->paging_clock);
+            for (uint32_t p = 0; p < st->n_pages && p < 32u; p++) {
+                fprintf(stderr, " %u", st->phys[p]);
+            }
+            fprintf(stderr, "\n");
+        }
+        return false;
+    }
+    const uint32_t slot = st->phys[victim];
+    if (!metal_graph_indexer_paging_evict(g, il, victim)) return false;
+    return metal_graph_indexer_paging_pull(g, il, page, slot);
+}
+
+/* Write path: pack the staged f32 rows into their pages' physical slots. */
+static bool metal_graph_indexer_paging_pack_stage(
+        ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    const bool dbg = getenv("DS4_CUDA_INDEXER_PAGING_LOG") != NULL;
+    const uint32_t p0 = first_row / 512u;
+    const uint32_t p1 = (first_row + rows - 1u) / 512u;
+    for (uint32_t p = p0; p <= p1 && p < st->n_pages; p++) {
+        if (!metal_graph_indexer_paging_ensure(g, il, p)) {
+            if (dbg) fprintf(stderr, "ds4: paging pack: ensure failed layer=%u page=%u\n",
+                             il, p);
+            return false;
+        }
+        const uint32_t lo = p * 512u > first_row ? p * 512u : first_row;
+        const uint32_t hi = (p + 1u) * 512u < first_row + rows
+                                ? (p + 1u) * 512u
+                                : first_row + rows;
+        if (hi <= lo) continue;
+        if (ds4_gpu_comp_cache_bitq_pack_page_tensor(
+                metal_graph_attn_comp_stage(g),
+                g->layer_attn_comp_cache[il],
+                st->phys[p], lo - p * 512u, lo - first_row, hi - lo,
+                DS4_N_HEAD_DIM) == 0) {
+            if (dbg) fprintf(stderr, "ds4: paging pack: pack_page failed layer=%u page=%u\n",
+                             il, p);
+            return false;
+        }
+    }
+    return metal_graph_indexer_paging_sync_table(g, il);
+}
+
+/* Read path + prefetch: the indexed attention only ever reads the top-k
+ * SELECTED rows, so only their pages must be resident simultaneously (the
+ * .cu paged gather zero-fills evicted pages, which are never read).  Read
+ * the selected ids, verify the selection's page span fits the resident
+ * ring (LOUD abort otherwise -- never silent), ensure each selected page
+ * plus the growing tail page (the next token's growth), and publish the
+ * device table.  This is also the v1 prefetcher: the pulls for this
+ * token's selection double as the next token's warm set. */
+static bool metal_graph_indexer_paging_read_prepare(
+        ds4_gpu_graph *g, uint32_t il, uint32_t n_comp) {
+    struct ds4_indexer_paging_state *st = &g->layer_index_paging[il];
+    const bool dbg = getenv("DS4_CUDA_INDEXER_PAGING_LOG") != NULL;
+    if (getenv("DS4_CUDA_INDEXER_PAGING_NO_PREPARE") != NULL) {
+        /* bisect switch: skip the selected-id read + ensures; the table
+         * keeps its init identity mapping. */
+        return metal_graph_indexer_paging_sync_table(g, il);
+    }
+    uint32_t sel[DS4_N_INDEXER_TOP_K];
+    if (ds4_gpu_tensor_read(metal_graph_comp_selected(g), 0, sel,
+                            (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t)) == 0) {
+        if (dbg) fprintf(stderr, "ds4: paging read_prepare: selected read failed layer=%u\n", il);
+        return false;
+    }
+    uint32_t pages[DS4_N_INDEXER_TOP_K];
+    uint32_t np = 0u;
+    for (uint32_t i = 0; i < DS4_N_INDEXER_TOP_K; i++) {
+        const uint32_t r = sel[i];
+        if (r >= n_comp) continue;
+        const uint32_t p = r / 512u;
+        uint32_t j = 0;
+        while (j < np && pages[j] != p) j++;
+        if (j == np) pages[np++] = p;
+    }
+    const uint32_t tail = n_comp / 512u;
+    if (tail < st->n_pages) {
+        uint32_t j = 0;
+        while (j < np && pages[j] != tail) j++;
+        if (j == np) pages[np++] = tail;
+    }
+    if (np > st->resident) {
+        fprintf(stderr,
+                "ds4: indexer paging layer=%u: selection spans %u pages but "
+                "only %u resident slots (raise DS4_CUDA_INDEXER_PAGING_RESIDENT "
+                "or disable paging)\n", il, np, st->resident);
+        return false;
+    }
+    for (uint32_t i = 0; i < np; i++) {
+        if (!metal_graph_indexer_paging_ensure(g, il, pages[i])) {
+            if (dbg) fprintf(stderr, "ds4: paging read_prepare: ensure failed layer=%u page=%u\n",
+                             il, pages[i]);
+            return false;
+        }
+    }
+    if (!metal_graph_indexer_paging_sync_table(g, il)) {
+        if (dbg) fprintf(stderr, "ds4: paging read_prepare: sync_table failed layer=%u\n", il);
+        return false;
+    }
+    if (dbg && ((g->paging_clock & 255u) == 0u)) {
+        fprintf(stderr, "ds4: paging dbg layer=%u n_comp=%u np=%u evicts=%llu pulls=%llu\n",
+                il, n_comp, np,
+                (unsigned long long)st->evicts, (unsigned long long)st->pulls);
+    }
+    return true;
+}
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,

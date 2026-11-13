@@ -505,6 +505,8 @@ int ds4_gpu_bitq_pack_rows_upload(
         uint32_t n_rows, uint32_t head_dim, int bits, const float *src);
 void ds4_gpu_indexer_paging_table_set(const ds4_gpu_tensor *table);
 void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t);
+/* Free dedicated-VRAM bytes (cudaMemGetInfo); 0 = unknown/non-CUDA. */
+uint64_t ds4_gpu_free_bytes(void);
 /* Prefill-safe weight-arena eviction protocol: enter/exit bracket one
  * SSD-streamed chunked prefill; each chunk boundary lets the arena reclaim
  * ranges resolved by earlier chunks that are already past the device. */

@@ -507,12 +507,13 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #if defined(DS4_NO_GPU)
 /* CPU-only build: even though no multi-tier code is reached, the engine
  * struct still embeds ds4_gpu_config and the global decls in
- * ds4_gpu_mgpu.h need matching definitions. We do not stub the
- * function symbols here because no caller references them in CPU
- * builds (every callsite is inside !DS4_NO_GPU). */
+ * ds4_gpu_mgpu.h need matching definitions. The bitq AUTO scheduler
+ * references ds4_gpu_free_bytes; stub it to "unknown" (the scheduler then
+ * falls back to its non-GPU defaults). */
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+uint64_t ds4_gpu_free_bytes(void) { return 0; }
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -19292,6 +19293,197 @@ static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
  * Single-tier (g_n_gpus <= 1) is byte-equivalent regardless of placement,
  * because metal_graph_alloc_kv_cache_tensor_on short-circuits to the
  * legacy 1-arg helpers when g_n_gpus <= 1. */
+static const char *ds4_kv_bitq_profile_name(int prof) {
+    switch (prof) {
+    case DS4_KV_BITQ_PROF_OFF: return "OFF";
+    case DS4_KV_BITQ_PROF_B:   return "B(raw6/comp4/idx4)";
+    case DS4_KV_BITQ_PROF_A:   return "A(raw4/comp4/idx4)";
+    default:                   return "?";
+    }
+}
+
+static int ds4_kv_bitq_manual_env_present(void) {
+    return getenv("DS4_CUDA_KV_BITQ") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_BITS") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_RAW_BITS") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_COMP_BITS") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_IDX_BITS") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_COMP") != NULL ||
+           getenv("DS4_CUDA_KV_BITQ_IDX") != NULL;
+}
+
+/* FP32/F16 attention-compressed row stride for the OFF profile. */
+static uint64_t ds4_kv_bitq_off_comp_row_bytes(void) {
+#if defined(DS4_GPU_ATTN_COMP_CACHE_F16)
+    return (uint64_t)DS4_N_HEAD_DIM *
+           (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+#else
+    return (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+#endif
+}
+
+/* KV cache footprint for one profile at (ctx_size, raw_cap) rows: raw ring
+ * (all layers) + attention-compressed rows + indexer rows, with the packed
+ * strides for B/A and the engine's FP32/F16 accounting for OFF. */
+static uint64_t ds4_kv_bitq_kv_bytes(uint32_t ctx_size, uint32_t raw_cap, int prof) {
+    const uint64_t raw_row = (prof == DS4_KV_BITQ_PROF_OFF)
+            ? (uint64_t)DS4_N_HEAD_DIM * sizeof(float)
+            : (uint64_t)ds4_kv_bitq_row_bytes_bits(DS4_N_HEAD_DIM,
+                  ds4_kv_bitq_profile_raw_bits(prof));
+    uint64_t bytes = (uint64_t)DS4_N_LAYER * raw_cap * raw_row;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        bytes += comp_cap * ((prof == DS4_KV_BITQ_PROF_OFF)
+                ? ds4_kv_bitq_off_comp_row_bytes()
+                : (uint64_t)ds4_kv_bitq_row_bytes_bits(DS4_N_HEAD_DIM, 4));
+        if (ratio == 4) {
+            bytes += comp_cap * ((prof == DS4_KV_BITQ_PROF_OFF)
+                    ? (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float)
+                    : (uint64_t)ds4_kv_bitq_row_bytes_bits(DS4_N_INDEXER_HEAD_DIM, 4));
+        }
+    }
+    return bytes;
+}
+
+/* Largest prefill cap feasible under the engine's own prefill-budget
+ * arithmetic (raw ring + attention scratch + batch workspace <= budget),
+ * with the profile's raw-row stride.  0 = even the 128-token floor fails. */
+static uint32_t ds4_kv_bitq_budget_cap(uint32_t ctx_size, int prof, uint64_t budget) {
+    if (ctx_size == 0 || budget == 0) return 0;
+    const uint64_t comp_cap = (uint64_t)(ctx_size / 4u) + 2u;
+    const uint64_t raw_row = (prof == DS4_KV_BITQ_PROF_OFF)
+            ? (uint64_t)DS4_N_HEAD_DIM * sizeof(float)
+            : (uint64_t)ds4_kv_bitq_row_bytes_bits(DS4_N_HEAD_DIM,
+                  ds4_kv_bitq_profile_raw_bits(prof));
+    {
+        uint64_t raw_cap = 128u + DS4_N_SWA;
+        if (prof == DS4_KV_BITQ_PROF_OFF && raw_cap > 8192u) raw_cap = 8192u;
+        const uint64_t kv_bytes = (uint64_t)DS4_N_LAYER * raw_cap * raw_row;
+        const uint64_t scratch = 2ull * comp_cap * 128u * sizeof(float) +
+                (128u / 4u + 2u) * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t batch = 128ull * 16384ull;
+        if (kv_bytes + scratch + batch > budget) return 0;
+    }
+    uint32_t lo = 128u, hi = ctx_size;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo + 1u) / 2u;
+        uint64_t raw_cap = (uint64_t)mid + DS4_N_SWA;
+        if (prof == DS4_KV_BITQ_PROF_OFF && raw_cap > 8192u) raw_cap = 8192u;
+        const uint64_t kv_bytes = (uint64_t)DS4_N_LAYER * raw_cap * raw_row;
+        const uint64_t scratch = 2ull * comp_cap * mid * sizeof(float) +
+                ((uint64_t)mid / 4u + 2u) * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t batch = (uint64_t)mid * 16384ull;
+        if (kv_bytes + scratch + batch <= budget) lo = mid; else hi = mid - 1u;
+    }
+    return lo;
+}
+
+/* Idempotent: the first call decides the profile for the whole process.
+ * Runs before the first allocation touches the bitq getters. */
+static void ds4_kv_bitq_scheduler_settle(uint32_t ctx_size, uint32_t prefill_chunk) {
+    /* reported covers the manual-override case, where the profile stays
+     * NONE forever and the notice must still print exactly once. */
+    static int ds4_kv_bitq_auto_reported = 0;
+    if (ds4_kv_bitq_auto_profile != DS4_KV_BITQ_PROF_NONE ||
+        ds4_kv_bitq_auto_reported) return;
+    /* Copy immediately: the CRT getenv buffer is invalidated by the next
+     * getenv call (manual_env_present below), so the policy string must not
+     * be compared or printed through the raw pointer afterwards. */
+    char auto_policy[32];
+    auto_policy[0] = '\0';
+    {
+        const char *auto_env = getenv("DS4_CUDA_KV_BITQ_AUTO");
+        if (!auto_env || !auto_env[0]) return; /* not armed: legacy semantics */
+        snprintf(auto_policy, sizeof(auto_policy), "%s", auto_env);
+    }
+    if (ds4_kv_bitq_manual_env_present()) {
+        ds4_kv_bitq_auto_reported = 1;
+        fprintf(stderr,
+                "ds4: bitq scheduler: manual bitq env(s) set; "
+                "DS4_CUDA_KV_BITQ_AUTO=%s ignored\n", auto_policy);
+        return; /* stays NONE: legacy env semantics everywhere */
+    }
+    const int capacity = strcasecmp(auto_policy, "capacity") == 0;
+    if (!capacity && strcasecmp(auto_policy, "quality") != 0) {
+        fprintf(stderr,
+                "ds4: bitq scheduler: unknown DS4_CUDA_KV_BITQ_AUTO=%s "
+                "(expected quality|capacity); using quality\n", auto_policy);
+    }
+
+    const uint64_t free_b = ds4_gpu_free_bytes();
+    int chosen = DS4_KV_BITQ_PROF_OFF;
+    char why[256];
+    why[0] = '\0';
+
+    if (free_b == 0) {
+        /* Pre-CUDA or non-CUDA backend: no VRAM query.  The engine's own
+         * allocation/managed fallbacks cover the fit question. */
+        chosen = capacity ? DS4_KV_BITQ_PROF_A : DS4_KV_BITQ_PROF_OFF;
+        snprintf(why, sizeof(why), "free-VRAM query unavailable");
+    } else if (capacity) {
+        chosen = DS4_KV_BITQ_PROF_A;
+        snprintf(why, sizeof(why), "capacity policy; A budget cap %u",
+                 ds4_kv_bitq_budget_cap(ctx_size, DS4_KV_BITQ_PROF_A, free_b * 3u / 4u));
+    } else {
+        /* quality: OFF -> B -> A.  Fit budget = 3/4 of free VRAM for
+         * kv+scratch+batch; the remaining quarter covers the other graph
+         * buffers. */
+        const uint64_t budget = free_b * 3u / 4u;
+        const uint32_t floor_cap = 512u;
+        if (prefill_chunk != 0) {
+            uint32_t ring = (uint32_t)((uint64_t)DS4_N_SWA + prefill_chunk);
+            if (ring > ctx_size) ring = ctx_size;
+            ring = (uint32_t)align_up(ring, 256u);
+            if (ring == 0) ring = 1;
+            const uint64_t comp_cap = (uint64_t)(ctx_size / 4u) + 2u;
+            const uint64_t scratch = 2ull * comp_cap * prefill_chunk * sizeof(float) +
+                    ((uint64_t)prefill_chunk / 4u + 2u) * DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t batch = (uint64_t)prefill_chunk * 16384ull;
+            int picked = -1;
+            for (int prof = DS4_KV_BITQ_PROF_OFF;
+                 prof <= DS4_KV_BITQ_PROF_A && picked < 0; prof++) {
+                uint32_t eff_ring = ring;
+                if (prof == DS4_KV_BITQ_PROF_OFF && eff_ring > 8192u) eff_ring = 8192u;
+                const uint64_t kv_b = ds4_kv_bitq_kv_bytes(ctx_size, eff_ring, prof);
+                if (kv_b + scratch + batch <= budget) picked = prof;
+            }
+            chosen = picked >= 0 ? picked : DS4_KV_BITQ_PROF_A;
+            if (picked >= 0) {
+                snprintf(why, sizeof(why),
+                         "chunk=%u: %s footprint fits budget", prefill_chunk,
+                         ds4_kv_bitq_profile_name(picked));
+            } else {
+                snprintf(why, sizeof(why),
+                         "chunk=%u: no profile fits budget; A + engine fallback",
+                         prefill_chunk);
+            }
+        } else {
+            uint32_t caps[3];
+            for (int prof = DS4_KV_BITQ_PROF_OFF; prof <= DS4_KV_BITQ_PROF_A; prof++)
+                caps[prof] = ds4_kv_bitq_budget_cap(ctx_size, prof, budget);
+            int picked = -1;
+            for (int prof = DS4_KV_BITQ_PROF_OFF;
+                 prof <= DS4_KV_BITQ_PROF_A && picked < 0; prof++) {
+                if (caps[prof] >= floor_cap) picked = prof;
+            }
+            chosen = picked >= 0 ? picked : DS4_KV_BITQ_PROF_A;
+            snprintf(why, sizeof(why),
+                     "caps OFF %u / B %u / A %u (floor %u)%s",
+                     caps[0], caps[1], caps[2], floor_cap,
+                     picked < 0 ? "; nothing fits, A + engine fallback" : "");
+        }
+    }
+
+    ds4_kv_bitq_auto_profile = chosen;
+    fprintf(stderr,
+            "ds4: bitq scheduler: AUTO=%s ctx=%u free=%lluMiB -> %s | %s\n",
+            auto_policy, (unsigned)ctx_size,
+            (unsigned long long)(free_b >> 20),
+            ds4_kv_bitq_profile_name(chosen), why);
+}
+
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -19307,6 +19499,9 @@ static bool metal_graph_alloc_raw_cap(
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
+    /* DS4_CUDA_KV_BITQ_AUTO: settle the bit-width profile before the first
+     * allocation reads the getters (idempotent, manual envs always win). */
+    ds4_kv_bitq_scheduler_settle(ctx_size, prefill_cap);
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
     /* cache placement on the graph so the dispatch loops can
@@ -40778,6 +40973,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         uint32_t    prefill_chunk,
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
+    /* DS4_CUDA_KV_BITQ_AUTO: this planner may run before the graph alloc
+     * (server context sizing); settle the profile so the byte math below
+     * uses the final bit widths. */
+    ds4_kv_bitq_scheduler_settle((uint32_t)ctx_size, prefill_chunk);
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
         return qwen4_graph_memory_estimate(ctx, prefill_chunk);

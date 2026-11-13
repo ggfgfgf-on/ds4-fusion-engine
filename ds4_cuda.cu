@@ -1,4 +1,4 @@
-﻿#include <cuda_runtime.h>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -3507,6 +3507,14 @@ extern "C" int ds4_gpu_index_cache_bitq_pack_stage_tensor(
             (unsigned char *)cache->ptr, (const float *)stage->ptr, cap,
             first_row, rows, head_dim, kv_bitq_idx_bits());
     return cuda_ok(cudaGetLastError(), "idx bitq pack stage launch");
+}
+
+/* Scheduler decision exported to ds4.c (its getters mirror these). */
+/* Free dedicated-VRAM bytes for the bitq AUTO scheduler. */
+extern "C" uint64_t ds4_gpu_free_bytes(void) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return (uint64_t)free_b;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {

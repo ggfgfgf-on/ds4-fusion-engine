@@ -23493,6 +23493,42 @@ static bool metal_graph_capture_prefix_index_state(
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
+static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
+    (void)g;
+    static int parsed = -1;
+    static uint32_t cached = 0;
+    if (parsed < 0) {
+        parsed = 0;
+#ifndef DS4_ROCM_BUILD
+        const char *env = getenv("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long v = strtoul(env, &end, 10);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (end != env && end && *end == '\0' &&
+                (v == 64ul || v == 128ul || v == 256ul || v == 512ul ||
+                 v == 1024ul || v == 2048ul || v == 4096ul)) {
+                cached = (uint32_t)v;
+                parsed = 1;
+            } else {
+                fprintf(stderr,
+                        "ds4: invalid DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
+                        env);
+            }
+        }
+#endif
+    }
+    if (parsed > 0) return cached;
+
+    /* Keep dense attention longer than the legacy 512-row window by default.
+     * Around the 2K frontier the sparse path's score/top-k setup dominates
+     * the smaller attention scan, while larger contexts benefit from sparse
+     * indexed attention.  This threshold changes only the implementation used
+     * to consume the compressed rows; it must not lower the 512-row indexer
+     * selection defined by DS4_N_INDEXER_TOP_K. */
+    return 1024u;
+}
 /* =========================================================================
  * Metal Decode Release Helpers and Reference Fallbacks.
  * =========================================================================
@@ -89714,6 +89750,7 @@ static bool metal_graph_encode_attention_session_batch(
         const uint32_t n_comp = g->layer_n_comp[il];
         const bool indexed =
             ratio == 4u &&
+            n_comp > metal_graph_decode_indexer_sparse_threshold(g) &&
             g->layer_n_index_comp[il] > DS4_N_INDEXER_TOP_K;
         const uint32_t n_selected = indexed
             ? (DS4_N_INDEXER_TOP_K < g->layer_n_index_comp[il]

@@ -445,6 +445,212 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     return false;
 }
 
+static void print_env_knobs(FILE *fp, const help_colors *c) {
+    title(fp, c, "Environment Knobs (DS4_*)");
+    para(fp, c, "Fusion-engine features added in this port are env-gated and default OFF (certified FP32 baseline). Manual envs override the auto scheduler.");
+    opt(fp, c, "DS4_CUDA_KV_BITQ", "Low-bit KV quantization master switch (raw ring pack). LOSSY: the dequantized KV differs from the FP32 ring, so the attention numeric family changes and greedy output can flip near-threshold tokens - re-certify (whole==split + new canonical reference) before enabling.");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_BITS", "Global code width 2-8. Default: 4.");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_RAW_BITS", "Raw ring width override (B profile: 6, A: 4).");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_COMP_BITS", "Attention-compressed cache width (profiles: 4).");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_IDX_BITS", "Indexer cache width (profiles: 4).");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_COMP", "Pack the attention-compressed cache (standalone or with raw).");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_IDX", "Pack the indexer cache (prefill side). GPU standalone decode is unsupported under it; the hybrid path (CPU decode) is unaffected.");
+    opt(fp, c, "DS4_CUDA_KV_BITQ_AUTO", "Startup bit-width scheduler: quality (OFF->B->A, first that fits) or capacity (A).");
+    opt(fp, c, "DS4_CUDA_INDEXER_2STAGE", "Two-stage indexer retrieval: Cauchy-Schwarz row pruning + incremental clustering (provably exact).");
+    opt(fp, c, "DS4_CUDA_INDEXER_PAGING", "Indexer KV paging: 512-row pages, cold pages GPU->pinned->SSD, pull-back bit-equal. Requires DS4_CUDA_KV_BITQ_COMP (ignored without it); unsupported with CUDA TP attention.");
+    opt(fp, c, "DS4_CUDA_INDEXER_PAGING_RESIDENT", "Resident page budget for paging (1..64, default 8). auto = full residency for the current ctx (never evicts; the span gate can never abort).");
+    opt(fp, c, "DS4_CUDA_INDEXER_PAGING_LOG", "Paging verbose log.");
+    opt(fp, c, "DS4_CUDA_INDEXER_FUSED_DECODE", "Fused indexer decode kernel (bit-exact; +8.1% decode at 32k).");
+    opt(fp, c, "DS4_SLIMINFER_RATIO", "Attention Q-row pruning ratio 0..1 (APIA semantics, KV stays fresh).");
+    opt(fp, c, "DS4_SLIMINFER_PRUNE_LAYER", "Pruning decision layer. Default: 1.");
+    opt(fp, c, "DS4_SLIMINFER_START_POS", "Pruning start position.");
+    opt(fp, c, "DS4_CUDA_PREFILL_GRAPH", "Prefill graph capture/replay (-4.9% vs layer-major).");
+    opt(fp, c, "DS4_PG_BUDGET_MB", "pg adaptive-split budget (MiB).");
+    opt(fp, c, "DS4_PG_MIN_SUB", "pg split floor (whole==split certification uses 16).");
+    opt(fp, c, "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB", "GPU weight-arena cap. 0=unlimited (8GB cards may OOM at boot; 2-4 as emergency, slower).");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB", "WDDM shared-pool headroom kept free for DWM/OS. Default: 8. 0 disables the cap. The cap freezes arena growth when hit; with the prefill LRU scheduler (default on) long-prompt prefill recycles instead of starving. Measured without recycling: ~2.7x throttle (2.94 -> 8.07 t/s).");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_PREFILL_LRU", "Prefill-safe weight-arena LRU (default on): at each SSD-streaming prefill chunk boundary, drain the device and recycle ranges from completed chunks inside the headroom budget. 0 restores the static-cap behavior.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_PREFILL_LRU_MAX_MB", "Largest range the prefill LRU may evict (default 0 = unlimited); model tail always protected. Small caps keep big expert tables resident at the cost of arena pressure.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_LRU", "Weight-arena LRU eviction (default off): evict least-recently-used spans instead of stopping at the cap.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_LRU_MAX_MB", "LRU evictable range size cap (default 1 MiB); model tail always protected.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_TAIL_MB", "Model-tail guard for arena eviction (default 3072 MiB): output-family tensors hold direct device pointers until the final read and are never evicted.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB", "Weight arena chunk size. Default: 1792.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_CACHE", "Optional device weight cache (fd-cache path) enable switch.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_PRELOAD", "Optional full weight preload into the device cache.");
+    opt(fp, c, "DS4_CUDA_DIRECT_MODEL", "Serve weights straight from mapped host memory (no device cache).");
+    opt(fp, c, "DS4_CUDA_PINNED_LIMIT_GB", "Rolling pinned host-RAM budget for zero-copy ranges. Default: total/4 clamped [2,12].");
+    opt(fp, c, "DS4_CUDA_PINNED_ZEROCOPY", "Route >=64MiB expert ranges through the pinned zero-copy registry.");
+    opt(fp, c, "DS4_CUDA_SLOT_BUDGET_MB", "Streaming slot-table budget (MiB). FUSION certified config uses 2048.");
+    opt(fp, c, "DS4_CUDA_STAGE_LRU", "Windows stage-read LRU: cold pages bypass the OS page cache.");
+    opt(fp, c, "DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL", "Disable streaming cold-decode prefill path (set by every certified launch script).");
+    opt(fp, c, "DS4_CUDA_Q8_F16_CACHE_MB", "Q8->F16 dequant cache budget (MiB; 0 disables).");
+    opt(fp, c, "DS4_SSD_AUTO_CACHE_PCT", "SSD expert auto-cache percent 50-95 (Metal/ROCm auto-plan and native-CUDA WDDM band scheduler). Default: 80.");
+    opt(fp, c, "DS4_SSD_AUTO_CACHE_SPILL_MB", "WDDM band scheduler (--ssd-streaming-cache-experts auto, native CUDA): shared-pool spill allowed past dedicated VRAM, in MiB. Default: 1536.");
+    opt(fp, c, "DS4_SSD_AUTO_CACHE_FIXED_MB", "WDDM band scheduler: fixed consumers (KV, buffers, resident model) subtracted from VRAM+spill, in MiB. Default: 3584.");
+    opt(fp, c, "DS4_SSD_AUTO_CACHE_CLIFF_MB", "WDDM band scheduler: thrash-cliff floor the total cache budget is clamped to, in MiB. Default: 5120.");
+    opt(fp, c, "DS4_CUDA_NO_DEFER_SYNC", "Disable deferred upload sync (rollback switch).");
+    opt(fp, c, "DS4_MTP_TIMING", "Print MTP speculative timing counters.");
+    opt(fp, c, "DS4_MTP_SPEC_LOG", "Per-token MTP speculative log.");
+    opt(fp, c, "DS4_HYBRID_PREFILL_CHUNK", "Hybrid-server prefill chunk. Certified config: 0.");
+    opt(fp, c, "DS4_METAL_PREFILL_CHUNK", "Graph prefill chunk override.");
+    opt(fp, c, "DS4_THREADS", "CPU helper thread count.");
+    opt(fp, c, "DS4_POOL_SPIN_US", "CPU pool spin microseconds. Certified config: 500.");
+    opt(fp, c, "DS4_POOL_PIN", "Pin CPU pool workers.");
+    opt(fp, c, "DS4_POOL_MIN_ROWS", "Minimum rows to engage the CPU pool.");
+
+    para(fp, c, "DSpark (speculative drafter):");
+    opt(fp, c, "DS4_DSPARK_EXACT_BOUNDARY", "Replay the last committed row with the exact decode kernels on full-block commit so boundary logits/KV match ordinary decode (default ON; 0 = batched-logits commit).");
+    opt(fp, c, "DS4_DSPARK_VERIFY_CAP", "Verification row cap; 0 = drafter block size (CUDA default), 5 on the gfx1151 fast path.");
+    opt(fp, c, "DS4_DSPARK_SEED_BATCH", "Seed-batch spec layout (default off on CUDA; gfx1151 fast path enables it).");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER", "Adaptive propose scheduler (default ON; 0 disables).");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_WINDOW", "Scheduler acceptance window in tokens. Default: 4 (16 gfx1151).");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_SKIP", "Skip cycles after a draft miss. Default: 2 (4 gfx1151).");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_SLOW_SKIP", "Skip cycles after a slow proposal. Default: 4.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_TAIL_MIN_TOKENS", "Minimum remaining tokens before proposing is skipped.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_BREAK_EVEN_WINDOW", "Scheduler break-even window (tokens) for accept accounting.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_SKIP", "Skip cycles after a cold low-confidence accept.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI", "Cold low-confidence proposal time threshold (ms). Default: 500.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", "Skip cycles when the drafter produces no proposal.");
+    opt(fp, c, "DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", "Skip cycles after a short accept that produced no draft.");
+    opt(fp, c, "DS4_DSPARK_VERIFY_SPLIT_HEAD", "Split verifier head kernels (default: fused head).");
+    opt(fp, c, "DS4_DSPARK_VERIFY_HEAD_NO_TP", "Disable tensor parallelism for the verifier head.");
+    opt(fp, c, "DS4_DSPARK_VERIFY_SELECTED_PROFILE", "Verify through the streaming selected-profile expert path (opt-in, default off).");
+    opt(fp, c, "DS4_DSPARK_DISABLE_VERIFY_SELECTED_PROFILE", "Force-disable the selected-profile verifier.");
+    opt(fp, c, "DS4_DSPARK_VERIFY_NONCAUSAL", "Diagnostic: noncausal-attention verifier probe (3 runs).");
+    opt(fp, c, "DS4_DSPARK_VERIFY_CACHE", "Enable DSpark verifier cache bookkeeping.");
+    opt(fp, c, "DS4_DSPARK_CACHE_RESERVE_GB", "Reserve extra GiB of the DSpark cache window.");
+    opt(fp, c, "DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS", "Disable aliasing the drafter's final output head over the graph's batch buffers.");
+    opt(fp, c, "DS4_DSPARK_EXPERT_OVERLAP", "Diagnostic: report distinct routed experts across verifier rows.");
+    opt(fp, c, "DS4_DSPARK_EXEC_TIER", "Multi-GPU: logical tier that executes the drafter.");
+    opt(fp, c, "DS4_DSPARK_NO_MARKOV", "Disable Markov-bias correction (propose straight from base logits; needs exact verify).");
+    opt(fp, c, "DS4_DSPARK_NO_GPU_MARKOV", "Force the CPU fused Markov argmax (GPU propose reads logits back to host).");
+    opt(fp, c, "DS4_DSPARK_DISABLE_FUSED_CPU_MARKOV_ARGMAX", "Disable the fused CPU Markov argmax.");
+    opt(fp, c, "DS4_DSPARK_DISABLE_REUSE_CONFIDENCE0_MARKOV", "Disable reuse of the confidence-0 Markov state.");
+    opt(fp, c, "DS4_DSPARK_FAKE_ARGMAX_PROPOSAL", "Test mode: propose the base argmax instead of the drafter chain.");
+    opt(fp, c, "DS4_DSPARK_PROBE", "Diagnostic: full DSpark propose/seed probe logging.");
+    opt(fp, c, "DS4_DSPARK_SPEC_LOG", "Diagnostic: per-cycle speculative accept/reject log.");
+    opt(fp, c, "DS4_DSPARK_STATS", "Diagnostic: acceptance/verify timing counters.");
+    opt(fp, c, "DS4_DSPARK_CYCLE_TRACE", "Diagnostic: per-cycle timing trace (needs DS4_DSPARK_STATS).");
+    opt(fp, c, "DS4_DSPARK_STAGE_PROFILE", "Diagnostic: per-stage timing profile.");
+    opt(fp, c, "DS4_DSPARK_PROP_PROFILE", "Diagnostic: proposal-stage timing profile.");
+    opt(fp, c, "DS4_DSPARK_VERIFY_PROFILE", "Diagnostic: per-layer verifier timing profile.");
+    opt(fp, c, "DS4_DSPARK_VERIFY_TOPS_CHECK", "Diagnostic: verify GPU top-1 against CPU argmax per row.");
+    opt(fp, c, "DS4_ROCM_DSPARK_FAST", "ROCm: gfx1151 DSpark fast path.");
+    opt(fp, c, "DS4_ROCM_DSPARK_VERIFY_FAST", "ROCm: fast verifier mode.");
+    opt(fp, c, "DS4_ROCM_DSPARK_GREEDY_GPU_MARKOV", "ROCm: GPU greedy Markov argmax.");
+
+    para(fp, c, "MTP speculation:");
+    opt(fp, c, "DS4_MTP_STRICT", "GPU MTP: strict (exact) verification mode.");
+    opt(fp, c, "DS4_MTP_VERIFY_SERIAL", "CPU MTP: force serial per-token verify (greedy already forces it).");
+    opt(fp, c, "DS4_MTP_BATCH_VERIFY", "GPU/ROCm MTP: roll back to the generic batch verifier (diagnostic).");
+    opt(fp, c, "DS4_MTP_MIN_MARGIN", "GPU MTP: minimum draft margin for fast acceptance.");
+    opt(fp, c, "DS4_MTP_SPEC_DISABLE", "Disable MTP speculation entirely.");
+    opt(fp, c, "DS4_MTP_NO_SNAP", "CPU MTP: skip the MTP-window snapshot (faster; partial-accept rollback then unavailable).");
+    opt(fp, c, "DS4_MTP_FORCE_SNAPSHOT", "GPU MTP: force the frontier snapshot.");
+    opt(fp, c, "DS4_MTP_CAPTURE_PREFIX1", "GPU MTP: prefix-1 capture instead of partial-accept replay.");
+    opt(fp, c, "DS4_MTP_EXACT_REPLAY", "GPU MTP: diagnostic exact-replay on partial accept.");
+    opt(fp, c, "DS4_MTP_FULL_LOGITS", "Diagnostic: full MTP logits readback.");
+    opt(fp, c, "DS4_MTP_CONF_LOG", "Diagnostic: MTP confidence log.");
+    opt(fp, c, "DS4_MTP_PROBE", "Diagnostic: MTP acceptance probe.");
+
+    para(fp, c, "CPU decode parallelism and batching:");
+    opt(fp, c, "DS4_WARM_NEXT", "Prefetch the next layer's weights during the current layer.");
+    opt(fp, c, "DS4_ROUTED_TOKEN_PARALLEL", "Parallelize routed-MoE expert work across CPU tokens.");
+    opt(fp, c, "DS4_NO_ROUTED_TOKEN_PARALLEL", "Disable routed-MoE token parallelism.");
+    opt(fp, c, "DS4_PARALLEL_ATTN_ROWS", "Parallelize attention rows on CPU.");
+    opt(fp, c, "DS4_NO_PARALLEL_ATTN_ROWS", "Disable parallel attention rows.");
+    opt(fp, c, "DS4_NO_BATCHED_ATTN", "Disable batched attention (CPU batch verify).");
+    opt(fp, c, "DS4_NO_BATCHED_ROPE", "Disable batched RoPE.");
+    opt(fp, c, "DS4_BATCHED_ROPE_MAX", "Batched RoPE size cap.");
+    opt(fp, c, "DS4_ATTN_TOKENTILE", "Attention token tile size.");
+    opt(fp, c, "DS4_PARALLEL_FFN", "Parallelize FFN work on CPU.");
+    opt(fp, c, "DS4_BATCHED_FFN", "Batch FFN across tokens (CPU).");
+    opt(fp, c, "DS4_NO_SHARED_BATCH_FFN", "Disable the shared-FFN batch path.");
+    opt(fp, c, "DS4_PREFILL_BATCH", "CPU prefill batch mode.");
+    opt(fp, c, "DS4_LARGE_PAGES", "Map per-layer compressor tensors with 2MB large pages.");
+    opt(fp, c, "DS4_CPU_DISABLE_UNROLLED_ARGMAX", "CPU: fall back from the unrolled argmax kernel.");
+    opt(fp, c, "DS4_SERVER_CPU_BATCH_DECODE", "CPU batched decode for --batched-session N (default on; =0 forces serial per-session): K sessions' tokens advance in one lockstep forward. Measured on this machine: ~no speed change vs serial (CPU forward is compute-bound per row), byte gate stays True; the concurrency win comes from --batched-session N itself.");
+
+    para(fp, c, "CUDA memory, cache, and streaming:");
+    opt(fp, c, "DS4_CUDA_SLOT_RESIDENT_MB", "Streaming slot-table resident budget (MiB).");
+    opt(fp, c, "DS4_CUDA_SLOT_PINNED", "Use pinned staging for the slot cache.");
+    opt(fp, c, "DS4_CUDA_SLOT_NO_GUARD", "Disable the slot budget guard.");
+    opt(fp, c, "DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB", "Optional weight-preload span cap (MiB).");
+    opt(fp, c, "DS4_CUDA_MODEL_COPY_CHUNK_MB", "Chunked model-copy chunk size (MiB). Default: 64.");
+    opt(fp, c, "DS4_CUDA_COPY_MODEL", "Copy the whole model image to the device at startup.");
+    opt(fp, c, "DS4_CUDA_COPY_MODEL_CHUNKED", "Chunked whole-model copy with staged prefetch.");
+    opt(fp, c, "DS4_CUDA_NO_MODEL_COPY", "Disable whole-model copy paths.");
+    opt(fp, c, "DS4_CUDA_KEEP_MODEL_PAGES", "Keep model pages resident (skip page-drop hints).");
+    opt(fp, c, "DS4_CUDA_MODEL_DECOMPRESS", "Read weights through the DFC sidecar (default OFF).");
+    opt(fp, c, "DS4_DFC_VERIFY", "Offline: verify the DFC sidecar after compression.");
+    opt(fp, c, "DS4_CUDA_MODEL_SEQ_SCAN", "Open the model file with sequential-scan hint.");
+    opt(fp, c, "DS4_CUDA_DIRECT_MMAP_COPY", "Copy via direct mmap staging.");
+    opt(fp, c, "DS4_CUDA_NO_DIRECT_IO", "Disable direct-I/O staging.");
+    opt(fp, c, "DS4_CUDA_NO_FD_CACHE", "Disable the fd-based range cache.");
+    opt(fp, c, "DS4_CUDA_STRICT_WEIGHT_CACHE", "Never fall back to host pointers on cache miss.");
+    opt(fp, c, "DS4_CUDA_Q8_F32_PRELOAD", "Preload Q8 weights into the F32 cache.");
+    opt(fp, c, "DS4_CUDA_Q8_F32_ALL", "F32-cache all Q8 weights.");
+    opt(fp, c, "DS4_CUDA_Q8_F32_LARGE", "F32-cache large Q8 weights only.");
+    opt(fp, c, "DS4_CUDA_Q8_F16_ALL", "F16-convert all Q8 weights.");
+    opt(fp, c, "DS4_CUDA_MMQ", "Enable MMQ dense/prefill GEMM tiers.");
+    opt(fp, c, "DS4_CUDA_Q8_NO_ALIGNED", "Disable aligned Q8 kernels.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_DP4A", "Disable DP4A Q8 kernels.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_MMA", "Disable Q8 MMA kernels.");
+    opt(fp, c, "DS4_CUDA_Q8_MMA_MIN_TOK", "Minimum tokens for Q8 MMA dispatch.");
+    opt(fp, c, "DS4_CUDA_Q8_PAIR_BATCH", "Q8 pair batch matmul enable.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_BATCH_TOK4", "Disable 4-token Q8 batch kernel.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_BATCH_TOK8", "Disable 8-token Q8 batch kernel.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_BATCH_WARP", "Disable warp Q8 batch kernel.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_BATCH_EXACT_TOK2", "Disable exact 2-token Q8 batch kernel.");
+    opt(fp, c, "DS4_CUDA_NO_Q8_PAIR_BATCH_EXACT_TOK2", "Disable exact 2-token Q8 pair batch.");
+    opt(fp, c, "DS4_CUDA_F16_CUBLAS_BATCH", "cuBLAS F16 batch matmul enable.");
+    opt(fp, c, "DS4_CUDA_NO_F16_PAIR_MATMUL", "Disable paired F16 matmul.");
+    opt(fp, c, "DS4_CUDA_ATTENTION_OUTPUT_PRELOAD", "Preload attention-output weights.");
+    opt(fp, c, "DS4_CUDA_NO_CUBLAS_ATTENTION", "Disable cuBLAS attention.");
+    opt(fp, c, "DS4_CUDA_WINDOW_ATTENTION", "Window attention enable.");
+    opt(fp, c, "DS4_CUDA_NO_WINDOW_ATTENTION", "Disable window attention.");
+    opt(fp, c, "DS4_CUDA_DECODE_GRAPHS", "Decode-island graph capture.");
+    opt(fp, c, "DS4_CUDA_PREFILL_PIPELINE", "Prefill upload/compute pipeline enable.");
+    opt(fp, c, "DS4_CUDA_PREFILL_PIPELINE_MB", "Prefill pipeline budget (MiB).");
+    opt(fp, c, "DS4_CUDA_PREFETCH_PREDICT", "Predictive expert prefetch.");
+    opt(fp, c, "DS4_CUDA_PREFETCH_PREDICT_EXPERTS", "Experts prefetched per prediction.");
+    opt(fp, c, "DS4_CUDA_STAGE_THREADS", "Staging reader thread count.");
+    opt(fp, c, "DS4_CUDA_STAGE_NORMAL", "Stage reads without direct I/O.");
+    opt(fp, c, "DS4_CUDA_UPLOAD_SYNC", "Synchronous weight upload.");
+    opt(fp, c, "DS4_CUDA_NO_DERIVED_WEIGHTS", "Disable derived (aligned artifact) weights.");
+    opt(fp, c, "DS4_CUDA_NO_SETDEVICE_CACHE", "Disable cached cudaSetDevice.");
+
+    para(fp, c, "Router / experts:");
+    opt(fp, c, "DS4_ROUTER_DELTA", "Router-delta sidecar path (ReMoE Part 1).");
+    opt(fp, c, "DS4_REMOE_REUSE", "ReMoE router-reuse enable.");
+    opt(fp, c, "DS4_REMOE_REUSE_TAU", "ReMoE reuse temperature tau.");
+    opt(fp, c, "DS4_EXPERT_HOTLIST", "Expert hotlist file.");
+    opt(fp, c, "DS4_EXPERT_PROFILE", "Expert access profiling enable.");
+    opt(fp, c, "DS4_CUDA_SERIAL_ROUTER", "Serialize router selection.");
+    opt(fp, c, "DS4_CUDA_NO_PARALLEL_ROUTER_SELECT", "Disable parallel router select.");
+
+    para(fp, c, "Server / hybrid:");
+    opt(fp, c, "DS4_HYBRID_GPU_HEAD", "Hybrid: compute the output head on GPU.");
+    opt(fp, c, "DS4_SERVER_DECODE_COALESCE_US", "Server decode coalescing window (us).");
+    opt(fp, c, "DS4_SERVER_BATCH_LOG", "Diagnostic: server batch log.");
+    opt(fp, c, "DS4_KVSAVE_DEBUG", "Diagnostic: KV save/load debug log.");
+    opt(fp, c, "DS4_LOCK_FILE", "Instance lock file path.");
+
+    para(fp, c, "Correctness verification (hash anchors):");
+    opt(fp, c, "DS4_LM_LAYER_HASH", "Per-layer LM hash verification.");
+    opt(fp, c, "DS4_LM_LAYER_HASH_LAST", "Hash only the last layer.");
+    opt(fp, c, "DS4_LM_HASH_CACHE", "Hash the cache state.");
+    opt(fp, c, "DS4_LM_HASH_FFN", "Hash the FFN output.");
+    opt(fp, c, "DS4_LM_HASH_COMP", "Hash the compressor output.");
+    opt(fp, c, "DS4_LM_HASH_LAYER", "Hash a specific layer.");
+    opt(fp, c, "DS4_LM_HASH_POS", "Hash a specific position.");
+    opt(fp, c, "DS4_LM_HASH_STAGE", "Hash a specific stage.");
+    opt(fp, c, "DS4_LM_HASH_SHARED", "Hash the shared expert output.");
+    opt(fp, c, "DS4_ORACLE_LOGITS", "Diagnostic: dump oracle logits.");
+    para(fp, c, "Not listed: per-kernel dispatch/fusion switches (DS4_CUDA_MOE_*, DS4_METAL_*), *_PROFILE/_LOG/_DUMP/_TRACE diagnostics, and GLM-family knobs.");
+    fputc('\n', fp);
+}
+
 static void more_line(FILE *fp, const help_colors *c, const char *label, const char *topic) {
     static const char *colors[] = {
         "\x1b[38;5;81m", "\x1b[38;5;114m", "\x1b[38;5;179m",
@@ -531,6 +737,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
 static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
+        print_env_knobs(fp, c);
         if (tool_has_topic(tool, "sampling")) print_sampling(fp, c, true, tool);
         if (tool_has_topic(tool, "steering")) print_steering(fp, c);
         print_distributed(fp, c);
@@ -553,6 +760,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     }
 
     if (streq(topic, "runtime")) print_model_runtime(fp, c, tool, true);
+    else if (streq(topic, "env")) print_env_knobs(fp, c);
     else if (streq(topic, "sampling")) print_sampling(fp, c, true, tool);
     else if (streq(topic, "steering")) print_steering(fp, c);
     else if (streq(topic, "distributed")) print_distributed(fp, c);

@@ -2049,7 +2049,8 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (type == 8 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
         return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
-    if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX)
+    if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX &&
+        (type == 0 || type == 1 || type == 8))
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);

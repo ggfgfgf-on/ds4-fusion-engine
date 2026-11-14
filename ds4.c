@@ -5870,6 +5870,9 @@ static bool weights_have_output_head(const ds4_weights *w) {
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && w->output_norm && w->output;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        return w && w->output_norm && w->output;
+    }
     if (ds4_model_is_qwen4()) {
         return w && w->output_hc_norm && w->output_hc_down && w->output_hc_up && w->output;
     }
@@ -5882,6 +5885,9 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        return w && (w->output_norm || w->output);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         return w && (w->output_norm || w->output);
@@ -5964,6 +5970,32 @@ static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint3
     return true;
 }
 
+static bool weights_qwen35_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l) return false;
+    if (!l->attn_norm || !l->post_attn_norm ||
+        !l->ffn_gate || !l->ffn_up || !l->ffn_down) {
+        return false;
+    }
+    if (ds4_qwen4_layer_is_linear(il)) {
+        if (!l->lin_qkv || !l->lin_gate || !l->lin_conv || !l->lin_dt_bias ||
+            !l->lin_a || !l->lin_beta || !l->lin_alpha || !l->lin_norm || !l->lin_out) {
+            return false;
+        }
+    } else {
+        if (!l->attn_q || !l->attn_k || !l->attn_v || !l->attn_output ||
+            !l->attn_q_norm || !l->attn_k_norm) {
+            return false;
+        }
+    }
+    if (DS4_N_NEXTN_PREDICT != 0 &&
+        il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER &&
+        (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm ||
+         !l->nextn_shared_head_norm)) {
+        return false;
+    }
+    return true;
+}
+
 static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (!l->hc_attn_norm || !l->hc_attn_down || !l->hc_attn_up || !l->hc_attn_inject ||
@@ -6000,10 +6032,14 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
+/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the
+ * upstream GGUF.  The Q4_K_M community pack quantizes some dense tensors to
+ * the K family (Q4_K/Q5_K/Q6_K); the qwen4 dense MM handles them. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_Q5_K ||
+           type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_Q4_1;
 }
 
 static void tensor_expect_qwen4_dense_layout(
@@ -6054,7 +6090,8 @@ static void weights_validate_qwen4_layout(
     if (w->token_embd) {
         tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
-    if (require_token_embd && !w->ple_embd)
+    if (require_token_embd && !w->ple_embd &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35)
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
@@ -6075,7 +6112,10 @@ static void weights_validate_qwen4_layout(
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
-    if (have_output) {
+    if (have_output && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    } else if (have_output) {
         tensor_expect_layout(w->output_hc_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
         tensor_expect_qwen4_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_qwen4_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
@@ -6084,6 +6124,13 @@ static void weights_validate_qwen4_layout(
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+            if (!weights_qwen35_layer_has_required(l, il)) {
+                fprintf(stderr, "ds4: required Qwen35 tensors for layer %u are missing\n", il);
+                exit(1);
+            }
+            continue;
+        }
         if (!weights_qwen4_layer_has_required(l, il)) {
             fprintf(stderr, "ds4: required Qwen tensors for layer %u are missing\n", il);
             exit(1);
@@ -6162,6 +6209,9 @@ static void weights_validate_qwen4_layout(
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        return weights_qwen35_layer_has_required(l, il);
+    }
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
     }

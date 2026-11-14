@@ -362,6 +362,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 39: return n % 32 ? 0 : n / 32 * 17;
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
+    case 14: return n % 256 ? 0 : n / 256 * 210;
     case 16: return n % 256 ? 0 : n / 256 * 66;
     default: return 0;
     }
@@ -453,6 +454,14 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         float v = (float)((grid >> (8 * (j & 7))) & 255);
         if (signs & (1u << (j & 7))) v = -v;
         return dev_f16_to_f32(b->d) * (.5f + (signs_scale >> 28)) * .25f * v;
+    }
+    if (TYPE == 14) {
+        const cuda_block_q6_K *b = (const cuda_block_q6_K *)row + i / 256;
+        const unsigned j = i % 256;
+        const unsigned ql = (b->ql[j / 2] >> (4 * (j & 1))) & 15;
+        const unsigned qh = (b->qh[j / 4] >> (2 * (j & 3))) & 3;
+        return dev_f16_to_f32(b->d) * (float)b->scales[j / 16] *
+               (float)((int)(ql | (qh << 4)) - 32);
     }
     return 0;
 }
@@ -1197,7 +1206,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
-    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
+    QWEN_MV(12); QWEN_MV(14); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
     default: return 0;
     }
 #undef QWEN_MV

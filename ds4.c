@@ -62754,6 +62754,9 @@ static uint64_t qwen4_graph_scratch_bytes(const ds4_qwen4_gpu_graph *g) {
 }
 
 static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
+    /* qwen35: MoE/PLE/indexer buffers degenerate to zero floats; allocate a
+     * single slot instead so the graph's null checks never trip on them. */
+    if (n == 0) n = 1;
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(n * sizeof(float));
     if (t) ds4_gpu_tensor_fill_f32(t, 0.0f, n);
     return t;
@@ -62774,7 +62777,11 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
-    const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
+    /* qwen35: single stream (hc degenerate). */
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t hc = DS4_N_HC ? DS4_N_HC : 1u;
+    const uint64_t hc_dim = E * hc;
+    const uint64_t T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -62805,7 +62812,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     }
     QWEN4_ALLOC(R, T * hc_dim);
     QWEN4_ALLOC(xn, T * hc_dim);
-    QWEN4_ALLOC(lo, T * DS4_N_HC_LOWRANK);
+    QWEN4_ALLOC(lo, T * (DS4_N_HC_LOWRANK ? DS4_N_HC_LOWRANK : 1u));
     QWEN4_ALLOC(inj, T * hc * DS4_QWEN4_HC_CHUNKS * hc);
     QWEN4_ALLOC(inj_alt, T * hc * DS4_QWEN4_HC_CHUNKS * hc);
     QWEN4_ALLOC(mixed, T * E);

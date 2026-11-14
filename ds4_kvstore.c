@@ -948,7 +948,9 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
+    /* Dense models (qwen35) report 0 routed bits: their KV is plain FP32
+     * and needs no quantization gate. */
+    if (!ds4_kvstore_quant_bits_supported(quant_bits) && quant_bits != 0) {
         ds4_tokens_free(&store_tokens);
         return false;
     }

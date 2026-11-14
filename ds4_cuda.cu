@@ -83,10 +83,10 @@ typedef struct {
 } cuda_block_q4_K;
 
 typedef struct {
-    uint16_t d;
     uint8_t ql[CUDA_QK_K / 2];
     uint8_t qh[CUDA_QK_K / 4];
     int8_t scales[CUDA_QK_K / 16];
+    uint16_t d;
 } cuda_block_q6_K;
 
 typedef struct {

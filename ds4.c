@@ -63906,9 +63906,9 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * the scratch ensure), attn_o = down output. */
 static bool qwen4_graph_ffn_dense(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t T) {
-    if (!ds4_gpu_rms_norm_weight_tensor(g->mixed, g->R, m->map, m->size,
-                                        l->post_attn_norm->abs_offset,
-                                        T * DS4_N_EMBD, DS4_RMS_EPS)) {
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size,
+                                             l->post_attn_norm->abs_offset,
+                                             DS4_N_EMBD, T, DS4_RMS_EPS)) {
         return false;
     }
     if (!qwen4_gemv(g->qg, m, l->ffn_gate, g->mixed, T) ||
@@ -64005,8 +64005,8 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
         }
         QWEN4_PROF(0);
         if (ok && !qwen35) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
-        if (ok && qwen35) ok = ds4_gpu_rms_norm_weight_tensor(g->mixed, g->R, m->map, m->size,
-                               l->attn_norm->abs_offset, T * DS4_N_EMBD, DS4_RMS_EPS) != 0;
+        if (ok && qwen35) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size,
+                               l->attn_norm->abs_offset, DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
         QWEN4_PROF(1);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
@@ -64071,7 +64071,7 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
         ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * hc_dim * sizeof(float),
                                                    (uint64_t)hc_dim * sizeof(float));
         ok = last != NULL;
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mixed, last, m->map, m->size, w->output_norm->abs_offset, 1 * DS4_N_EMBD, DS4_RMS_EPS) &&
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, last, m->map, m->size, w->output_norm->abs_offset, DS4_N_EMBD, 1, DS4_RMS_EPS) &&
                      qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
         ds4_gpu_tensor_free(last);
     } else if (ok && logits_out && all_rows) {

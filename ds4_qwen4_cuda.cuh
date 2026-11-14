@@ -554,6 +554,23 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         const float scale = d*sc, offset = dm*mn;
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) v[k] = scale*((qs>>(8*k+shift))&(TYPE == 10 ? 3 : 15))-offset;
+    } else if (TYPE == 14) {
+        /* Q6_K: 4 consecutive positions share one scale (except across the
+         * 16-boundary, handled per element); scalar weight loads keep the
+         * 8-aligned rows legal. */
+        const cuda_block_q6_K *b = (const cuda_block_q6_K *)row + i / 256;
+        const unsigned j = i % 256;
+        const float d = dev_f16_to_f32(b->d);
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const unsigned jj = j + k;
+            const unsigned half = jj >> 7, sg = (jj >> 5) & 3u, l = jj & 31u;
+            const unsigned ql = (b->ql[half * 64u + (sg & 1u) * 32u + l] >>
+                                 (sg >= 2u ? 4u : 0u)) & 15u;
+            const unsigned qh = (b->qh[half * 32u + l] >> (2u * sg)) & 3u;
+            v[k] = d * (float)b->scales[jj / 16] *
+                   (float)((int)(ql | (qh << 4)) - 32);
+        }
     } else {
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) v[k] = value<TYPE>(row,i+k,grid_table,sign_table);
@@ -1103,8 +1120,9 @@ template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid, const uint8_t *signs) {
     float acc = 0;
-    /* Q4_K's 16-byte-aligned rows take the vectorized value4 path. */
-    if ((TYPE == 1 || TYPE == 12) && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
+    /* Q4_K's 16-byte-aligned rows and Q6_K's 8-byte-aligned rows take the
+     * vectorized value4 path (Q6_K's value4 uses scalar weight loads). */
+    if ((TYPE == 1 || TYPE == 12 || TYPE == 14) && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
         for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
             const float4 w = value4<TYPE>(row,i,grid,signs), v = *(const float4 *)(x+i);
             acc += w.x*v.x; acc += w.y*v.y; acc += w.z*v.z; acc += w.w*v.w;
@@ -1131,10 +1149,10 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
     if (row >= M) return;
     float a[ROWS] = {};
     const char *wr = w+(uint64_t)row*stride;
-    /* Q4_K rows are 16-byte aligned (2880-byte stride) so the vectorized
-     * value4 path is legal; Q6_K rows (4200) are only 8-aligned and stay
-     * on the scalar path. */
-    if ((TYPE == 1 || TYPE == 12) && !(K%4) && !((uintptr_t)x&15) && !((uintptr_t)wr&7)) {
+    /* Q4_K rows are 16-byte aligned (2880-byte stride) and Q6_K rows are
+     * 8-byte aligned (4200); both value4 variants keep scalar weight loads
+     * so the vectorized paths are legal. */
+    if ((TYPE == 1 || TYPE == 12 || TYPE == 14) && !(K%4) && !((uintptr_t)x&15) && !((uintptr_t)wr&7)) {
         for (unsigned i = lane*4; i < K; i += 128) {
             const float4 v = value4<TYPE>(wr,i,NULL,NULL);
             #pragma unroll

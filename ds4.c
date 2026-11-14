@@ -68780,15 +68780,25 @@ static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint3
                                     (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
                                             DS4_N_LIN_HEAD_DIM * sizeof(float),
                                     remaining, err, errlen);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: qwen35 restore overrun at layer %u (state) remaining=%llu\n",
+                        il, (unsigned long long)*remaining);
+            }
             if (rc == 0) {
                 rc = payload_read_bytes(fp, s->qwen35_cpu_conv_hist[il],
                                         (uint64_t)(DS4_N_LIN_CONV - 1u) *
                                                 DS4_N_LIN_CONV_DIM * sizeof(float),
                                         remaining, err, errlen);
+                if (rc != 0) {
+                    fprintf(stderr, "ds4: qwen35 restore overrun at layer %u (hist) remaining=%llu\n",
+                            il, (unsigned long long)*remaining);
+                }
             }
         } else {
-            /* The payload stores the KV caches as FP16 halves. */
-            const uint64_t nkv = (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+            /* The payload stores the KV caches as FP16 halves; the MTP layer
+             * carries only mtp_rows (0 without a draft). */
+            const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
+            const uint64_t nkv = (uint64_t)n * DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
             uint16_t *half_buf = (uint16_t *)xmalloc(nkv * sizeof(uint16_t));
             if (!half_buf) {
                 rc = 1;
@@ -68797,6 +68807,10 @@ static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint3
             }
             rc = payload_read_bytes(fp, half_buf, nkv * sizeof(uint16_t),
                                     remaining, err, errlen);
+            if (rc != 0) {
+                fprintf(stderr, "ds4: qwen35 restore overrun at layer %u (k) remaining=%llu\n",
+                        il, (unsigned long long)*remaining);
+            }
             if (rc == 0) {
                 for (uint64_t i = 0; i < nkv; i++)
                     s->qwen35_cpu_kv[il][i] = f16_to_f32(half_buf[i]);

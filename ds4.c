@@ -63864,6 +63864,12 @@ static bool qwen4_graph_stage_embeddings(ds4_qwen4_gpu_graph *g, const ds4_model
             const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
             if (img) memcpy(dst, img, E * sizeof(float));
             else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
+                getenv("DS4_QWEN35_DEBUG") && t == 0) {
+                fprintf(stderr, "ds4: qwen35 emb tok=%d: %f %f %f %f %f %f %f %f\n",
+                        tokens[t], dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
+                fflush(stderr);
+            }
             for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         }
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);

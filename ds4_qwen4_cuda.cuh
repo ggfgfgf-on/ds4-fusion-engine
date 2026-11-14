@@ -458,8 +458,12 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
     if (TYPE == 14) {
         const cuda_block_q6_K *b = (const cuda_block_q6_K *)row + i / 256;
         const unsigned j = i % 256;
-        const unsigned ql = (b->ql[j / 2] >> (4 * (j & 1))) & 15;
-        const unsigned qh = (b->qh[j / 4] >> (2 * (j & 3))) & 3;
+        /* ggml Q6_K: each qh byte carries the 2 high bits of four positions
+         * (l, l+32, l+64, l+96); the ql nibbles alternate low/high halves. */
+        const unsigned half = j >> 7, sg = (j >> 5) & 3u, l = j & 31u;
+        const unsigned ql = (b->ql[half * 64u + (sg & 1u) * 32u + l] >>
+                             (sg >= 2u ? 4u : 0u)) & 15u;
+        const unsigned qh = (b->qh[half * 32u + l] >> (2u * sg)) & 3u;
         return dev_f16_to_f32(b->d) * (float)b->scales[j / 16] *
                (float)((int)(ql | (qh << 4)) - 32);
     }

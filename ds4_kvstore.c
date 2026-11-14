@@ -416,8 +416,10 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
 
 /* routed-expert quantizations whose checkpoints the store keys on */
 bool ds4_kvstore_quant_bits_supported(int quant_bits) {
-    return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
-           quant_bits == 6 || quant_bits == 8;
+    /* The production store only ever produced 2/4-bit checkpoints; the
+     * wider set came from the upstream base and would let 5/6/8-bit
+     * models build checkpoints the handoff reader cannot dequantize. */
+    return quant_bits == 2 || quant_bits == 4;
 }
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

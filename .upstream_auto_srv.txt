@@ -7,19 +7,9 @@ ds4: CUDA preparing model tensor mappings
 ds4: CUDA weight arena shared-pool cap: keep >= 8.0 GiB of the WDDM shared pool free for DWM/OS (DS4_CUDA_WEIGHT_ARENA_HEADROOM_GB=8, 0=off)
 ds4: WDDM shared-pool budget 44.93 GiB
 ds4: CUDA loading model tensors into device cache
-ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.531s
+ds4: CUDA startup model preparation covered 0.99 GiB of tensor spans in 0.787s
 ds4: cuda backend initialized for graph diagnostics
 ds4: memory: KV 0.78 GiB (raw 0.67 + compressed 0.11) + buffers 0.13 GiB + resident model 2.81 GiB + expert cache 1.62 GiB + prefill expert reserve 3.38 GiB = 8.71 GiB planned
 ds4: memory detail: ctx=8192 prefill_cap=8192 raw_kv_rows=8192 compressed_kv_rows=2050 backend=cuda
-1114 06:30:13 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
-1114 06:30:13 ds4-server: listening on http://127.0.0.1:8000
-1114 06:30:14 ds4-server: chat ctx=0..118:118 prompt start
-ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=64.00 MiB cached=0.00 GiB free=0.00 GiB reserve=0.75 GiB total=7.93 GiB)
-ds4: CUDA SSD expert cache: 246 slots, 1.62 GiB
-ds4: CUDA loading model tensors 2.35 GiB cached
-ds4: CUDA loading model tensors 4.85 GiB cached
-ds4: CUDA loading model tensors 7.17 GiB cached
-1114 06:30:46 ds4-server: chat ctx=0..118:118 prompt done 31.226s
-ds4: CUDA loading model tensors 8.20 GiB cached
-1114 06:32:20 ds4-server: chat ctx=118..166:48 gen=48 decoding chunk=0.51 t/s avg=0.51 t/s 94.343s
-1114 06:32:20 ds4-server: chat ctx=0..118:118 gen=48 finish=length 125.571s
+1114 22:06:21 ds4-server: context buffers 927.81 MiB (ctx=8192, backend=cuda, prefill_chunk=8192, raw_kv_rows=8192, compressed_kv_rows=2050)
+1114 22:06:40 ds4-server: listening on http://127.0.0.1:8000

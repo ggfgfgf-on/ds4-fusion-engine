@@ -40,3 +40,15 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)
 ROCM_UNAVAILABLE_INT(ds4_gpu_tp_init)
 extern "C" void ds4_gpu_tp_shutdown(void) {}
 extern "C" int ds4_gpu_tp_failed(void) { return 1; }
+
+extern "C" void ds4_gpu_pg_reset(uint64_t request_assignments) {
+    (void)request_assignments;
+}
+
+extern "C" uint64_t ds4_gpu_slot_table_capacity_bytes(void) { return 0; }
+
+extern "C" uint64_t ds4_gpu_slot_peak_union_bytes(void) { return 0; }
+
+extern "C" void ds4_gpu_slot_peak_reset(void) {}
+
+extern "C" uint64_t ds4_gpu_pg_fee_bytes(void) { return 0; }

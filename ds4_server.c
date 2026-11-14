@@ -16032,10 +16032,22 @@ int main(int argc, char **argv) {
         ds4_engine_options prefill_opt = cfg.engine;
         prefill_opt.backend = DS4_BACKEND_CUDA;
         prefill_opt.context_size = cfg.ctx_size;
+        prefill_opt.mtp_path = NULL;
+        prefill_opt.mtp_draft_tokens = 0;
+        prefill_opt.glm_mtp = false;
+        /* The prefill engine only builds the KV (no speculation at all):
+         * clearing mtp_path alone leaves dspark=true on the copied options,
+         * which trips the "--dspark requires --mtp-model" validation. */
+        prefill_opt.dspark = false;
+        prefill_opt.dspark_strict = false;
+        prefill_opt.dspark_exact_sampling = false;
         prefill_opt.ssd_streaming = true;
         prefill_opt.ssd_streaming_cold = false;
-        prefill_opt.ssd_streaming_cache_experts = 16;
-        if (prefill_opt.ssd_streaming_cache_bytes == 0) {
+        /* --ssd-streaming-cache-experts N|NGB is honored (e.g. a small
+         * dynamic cache frees real VRAM for the incremental slot table on
+         * 8GB cards). */
+        if (prefill_opt.ssd_streaming_cache_experts == 0 &&
+            prefill_opt.ssd_streaming_cache_bytes == 0) {
             prefill_opt.ssd_streaming_cache_bytes = 4ull << 30;
         }
         {

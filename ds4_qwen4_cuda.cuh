@@ -1103,7 +1103,8 @@ template<unsigned TYPE>
 __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n,
         const uint64_t *grid, const uint8_t *signs) {
     float acc = 0;
-    if (TYPE == 1 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
+    /* Q4_K's 16-byte-aligned rows take the vectorized value4 path. */
+    if ((TYPE == 1 || TYPE == 12) && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
         for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
             const float4 w = value4<TYPE>(row,i,grid,signs), v = *(const float4 *)(x+i);
             acc += w.x*v.x; acc += w.y*v.y; acc += w.z*v.z; acc += w.w*v.w;
@@ -1130,7 +1131,10 @@ __global__ void matvec_rows(float *out, const char *w, const float *x,
     if (row >= M) return;
     float a[ROWS] = {};
     const char *wr = w+(uint64_t)row*stride;
-    if (TYPE == 1 && !(K%4) && !((uintptr_t)x&15) && !((uintptr_t)wr&7)) {
+    /* Q4_K rows are 16-byte aligned (2880-byte stride) so the vectorized
+     * value4 path is legal; Q6_K rows (4200) are only 8-aligned and stay
+     * on the scalar path. */
+    if ((TYPE == 1 || TYPE == 12) && !(K%4) && !((uintptr_t)x&15) && !((uintptr_t)wr&7)) {
         for (unsigned i = lane*4; i < K; i += 128) {
             const float4 v = value4<TYPE>(wr,i,NULL,NULL);
             #pragma unroll

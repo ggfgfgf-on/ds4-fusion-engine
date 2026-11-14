@@ -507,6 +507,25 @@ void ds4_gpu_indexer_paging_table_set(const ds4_gpu_tensor *table);
 void ds4_gpu_router_prefetch_ids_set(const ds4_gpu_tensor *t);
 /* Free dedicated-VRAM bytes (cudaMemGetInfo); 0 = unknown/non-CUDA. */
 uint64_t ds4_gpu_free_bytes(void);
+
+/* Per-request reset for the prefill graph capture (DS4_CUDA_PREFILL_GRAPH):
+ * destroys the captured exec so each request captures afresh — no graph or
+ * stream state survives across requests.  request_assignments is the
+ * request's total selection count (tokens x experts); requests above 4096
+ * keep the plain launch path. */
+void ds4_gpu_pg_reset(uint64_t request_assignments);
+
+/* Measured compact-table capacity (the slot consumer's actual quota). */
+uint64_t ds4_gpu_slot_table_capacity_bytes(void);
+
+/* Peak per-layer union footprint since the last reset (scheduler telemetry;
+ * the adaptive sub-batch scheduler derives bytes-per-token from it). */
+uint64_t ds4_gpu_slot_peak_union_bytes(void);
+void ds4_gpu_slot_peak_reset(void);
+
+/* Measured VRAM charge of the pg graph instantiation (fee accounting). */
+uint64_t ds4_gpu_pg_fee_bytes(void);
+
 /* Windows stage-read LRU: reset the per-prefill page bitmap. */
 void ds4_gpu_stage_lru_reset(void);
 /* DS4_ROUTER_DELTA: install a per-layer router weight override on device. */
@@ -559,8 +578,9 @@ int ds4_gpu_sliminfer_scatter_active_tensor(ds4_gpu_tensor *next_hc,
                                             ds4_gpu_tensor *active_idx,
                                             uint32_t n_active, uint32_t row_elems);
 /* DS4_CUDA_KV_BITQ zero-prefix/raw-prefix routing: band-fused window
- * attention over the quantized raw ring. */
-int ds4_gpu_attention_prefill_raw_heads_window_tensor(
+ * attention over the quantized raw ring, and the STATIC-MIXED band variant
+ * (nonzero-prefix chunks on compressed layers, raw band + comp rows). */
+int ds4_gpu_attention_prefill_static_mixed_heads_window_tensor(
         ds4_gpu_tensor *heads,
         const void *model_map,
         uint64_t model_size,
@@ -573,10 +593,12 @@ int ds4_gpu_attention_prefill_raw_heads_window_tensor(
         uint32_t n_raw,
         uint32_t window,
         int64_t band_offset,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t n_comp,
+        int64_t comp_offset,
+        uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim);
-/* DS4_CUDA_KV_BITQ zero-prefix/raw-prefix routing: band-fused window
- * attention over the quantized raw ring. */
 int ds4_gpu_attention_prefill_raw_heads_window_tensor(
         ds4_gpu_tensor *heads,
         const void *model_map,

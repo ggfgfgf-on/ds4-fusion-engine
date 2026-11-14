@@ -191,6 +191,10 @@ typedef struct {
     uint64_t gate_capacity;
     uint64_t up_capacity;
     uint64_t down_capacity;
+    /* Peak per-layer compact footprint since the last
+     * ds4_gpu_slot_peak_reset (the adaptive sub-batch scheduler measures
+     * bytes-per-token from it). */
+    uint64_t peak_union_bytes;
     int32_t *slot_selected_ptr;
     uint64_t slot_selected_capacity;
     ds4_gpu_tensor slot_selected_tensor;
@@ -4804,6 +4808,109 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_window_tensor(
             band_offset,
             0);
     return cuda_ok(cudaGetLastError(), "attention raw window band launch");
+}
+
+/* Prefix-window STATIC-MIXED attention (nonzero-prefix chunks on compressed
+ * layers): the same band-fused trick as the raw window tensor, extended to
+ * the compressed rows.  Gathers the raw span [span_start, pos0+n_tokens)
+ * from the ring, then runs the zero-prefix online mixed kernel in band mode
+ * with band_offset = pos0+1-window (negative clips the raw band at buffer
+ * row 0 for early chunks) and comp_offset = pos0, so query t attends the
+ * same raw causal window plus the compressed rows [0, (pos0+t+1)/ratio)
+ * the whole-batch static-mixed path attends — bit-exact per row.  The
+ * compressed cache must be FP32 (checked by the caller via
+ * metal_graph_attn_comp_cache_is_f16). */
+extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_window_tensor(
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_ring,
+        uint32_t raw_cap,
+        uint32_t phys_start,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t window,
+        int64_t band_offset,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t n_comp,
+        int64_t comp_offset,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    if (!heads || !q || !raw_kv_ring || !model_map ||
+        sinks_offset > model_size ||
+        model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        !kv_ring_bytes_ok(raw_kv_ring, raw_cap, head_dim) ||
+        n_raw < n_tokens || n_raw > raw_cap ||
+        (int64_t)(n_tokens - 1) + band_offset + (int64_t)window > (int64_t)n_raw ||
+        band_offset + (int64_t)window <= 0 ||
+        n_tokens == 0 || window == 0 || window > 256 || head_dim != 512 ||
+        ratio == 0 || n_comp > 32768u ||
+        (n_comp != 0u && (!comp_kv ||
+         (kv_bitq_comp_on()
+              ? (g_indexer_paging_table
+                  ? !kv_comp_bytes_ok(comp_kv, 512u, head_dim)
+                  : !kv_comp_bytes_ok(comp_kv, n_comp, head_dim))
+              : comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float))))) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(heads);
+    const float *sinks = (const float *)cuda_resolve_weight_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+            logical_tier, "attn_sinks_window_mixed");
+    if (!sinks) return 0;
+    /* DS4_CUDA_KV_BITQ_COMP: the comp rows are packed; dequant them into a
+     * second FP32 temp so the online kernel keeps reading plain floats. */
+    const uint64_t raw_f32_bytes = (uint64_t)n_raw * head_dim * sizeof(float);
+    const uint64_t comp_f32_bytes = kv_bitq_comp_on()
+            ? (uint64_t)n_comp * head_dim * sizeof(float) : 0u;
+    float *kv = (float *)cuda_tmp_alloc_on(logical_tier,
+            raw_f32_bytes + comp_f32_bytes,
+            "attention mixed window gather");
+    if (!kv) return 0;
+    const float *comp_ptr = comp_kv ? (const float *)comp_kv->ptr : kv;
+    if (kv_bitq_comp_on() && n_comp != 0u) {
+        comp_ptr = (const float *)((char *)kv + raw_f32_bytes);
+        const uint32_t cn = n_comp * head_dim;
+        attention_raw_gather_window_bitq_kernel<<<(cn + 255u) / 256u, 256u>>>(
+                (float *)comp_ptr, (const unsigned char *)comp_kv->ptr,
+                n_comp, 0u, n_comp, head_dim, kv_bitq_comp_bits());
+        if (!cuda_ok(cudaGetLastError(), "attention mixed window comp bitq gather")) return 0;
+    }
+    const uint32_t n = n_raw * head_dim;
+    if (kv_bitq_on()) {
+        attention_raw_gather_window_bitq_kernel<<<(n + 255u) / 256u, 256u>>>(
+                kv, (const unsigned char *)raw_kv_ring->ptr, raw_cap,
+                phys_start, n_raw, head_dim, kv_bitq_raw_bits());
+        if (!cuda_ok(cudaGetLastError(), "attention mixed window bitq gather")) return 0;
+    } else {
+        attention_raw_gather_window_kernel<<<(n + 255u) / 256u, 256u>>>(
+                kv, (const float *)raw_kv_ring->ptr, raw_cap, phys_start, n_raw,
+                head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention mixed window gather")) return 0;
+    }
+    dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+    attention_static_mixed_heads8_online_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            kv,
+            n_comp ? comp_ptr : kv,
+            n_tokens,
+            n_comp,
+            window,
+            ratio,
+            n_head,
+            head_dim,
+            n_raw,
+            1,
+            band_offset,
+            comp_offset);
+    return cuda_ok(cudaGetLastError(), "attention mixed window band launch");
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -23708,7 +23815,8 @@ static int attention_decode_batch_launch(
         window == kTTRawWindow && ratio != 0u && n_comp <= 32768u &&
         n_raw >= n_tokens &&
         (uint64_t)n_raw <= (uint64_t)pos0 + n_tokens &&
-        !g_cuda_no_window_attention && ds4_cuda_attn_tokentile_arch_ok()) {
+        !g_cuda_no_window_attention && getenv("DS4_ATTN_TOKENTILE") != NULL &&
+        ds4_cuda_attn_tokentile_arch_ok()) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         cudaStream_t stream = cuda_decode_stream();
         if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
@@ -24003,6 +24111,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ratio != 0u && n_comp <= 32768u &&
         n_raw >= n_tokens &&
         (uint64_t)n_raw <= (uint64_t)pos0 + n_tokens &&
+        getenv("DS4_ATTN_TOKENTILE") != NULL &&
         ds4_cuda_attn_tokentile_arch_ok()) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         cudaStream_t stream = cuda_decode_stream();
@@ -24271,7 +24380,8 @@ static int attention_prefill_mixed_launch(
     if (!use_comp_mask && g_n_gpus == 1 && n_tokens >= 128u &&
         head_dim == kTTHeadDim && n_head == 64u &&
         window == kTTRawWindow && ratio != 0u && n_comp <= 32768u &&
-        !g_cuda_no_window_attention && ds4_cuda_attn_tokentile_arch_ok()) {
+        !g_cuda_no_window_attention && getenv("DS4_ATTN_TOKENTILE") != NULL &&
+        ds4_cuda_attn_tokentile_arch_ok()) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(cuda_decode_stream(), &capture) == cudaSuccess &&
             capture == cudaStreamCaptureStatusNone) {
@@ -30200,6 +30310,227 @@ __global__ static void moe_copy_owned_pairs_kernel(
     local_weights[i] = owned ? weights[i] : 0.0f;
 }
 
+/* Prefill graph capture over the MMQ tier (DS4_CUDA_PREFILL_GRAPH): the
+ * streaming compact prefill stage is a persistent fixed buffer whose
+ * contents are refreshed per layer, so the MMQ launch sequence has
+ * stable arguments across layers — capture once, replay per layer. */
+static cudaGraphExec_t g_pg_exec = NULL;
+static uint32_t g_pg_n_tokens = 0;
+static uint64_t g_pg_request_assign = 0;   /* request-level selection count */
+static int g_pg_tried = 0;
+static int g_pg_disabled = 0;
+static cudaStream_t g_pg_stream = NULL;
+static cudaEvent_t g_pg_ev_pre = NULL, g_pg_ev_post = NULL;
+/* Capture-time records: the graph bakes the compact-stage pointers and the
+ * n_experts bound, and replays are only valid while those still hold. */
+static const char *g_pg_cap_gate = NULL;
+static const char *g_pg_cap_up = NULL;
+static const char *g_pg_cap_down = NULL;
+static const char *g_pg_cap_sel = NULL;
+static int g_pg_cap_experts = 0;
+/* Measured VRAM charge of the pg graph instantiation (fee accounting). */
+static uint64_t g_pg_fee_bytes = 0;
+
+static int pg_mmq_tier(
+        const char *gate_w, const char *up_w, const char *down_w,
+        const int32_t *sel_ids,
+        const float *x_ptr, const float *weights_ptr,
+        float *gate_ptr, float *up_ptr, float *mid_ptr, float *down_ptr,
+        float *out_ptr,
+        uint32_t expert_mid_dim, uint32_t expert_in_dim,
+        uint32_t out_dim, uint32_t n_tokens, uint32_t n_expert,
+        int weight_experts, int cap_experts, float clamp,
+        uint64_t n_assignments, int owned_filtered) {
+    /* The decode-graph machinery captures on the legacy stream; the pg
+     * capture must live on its own stream to avoid colliding with it. */
+    if (!g_pg_stream) {
+        if (cudaStreamCreateWithFlags(&g_pg_stream, cudaStreamNonBlocking) !=
+                cudaSuccess ||
+            cudaEventCreateWithFlags(&g_pg_ev_pre, cudaEventDisableTiming) !=
+                cudaSuccess ||
+            cudaEventCreateWithFlags(&g_pg_ev_post, cudaEventDisableTiming) !=
+                cudaSuccess) {
+            fprintf(stderr, "ds4: pg stream create failed\n");
+            g_pg_disabled = 1;
+            return -1;
+        }
+    }
+    /* The graph bakes the request's n_tokens into the kernel grids: a
+     * different prompt length needs a fresh capture. */
+    if (g_pg_exec && g_pg_n_tokens != n_tokens) {
+        (void)cudaGraphExecDestroy(g_pg_exec);
+        g_pg_exec = NULL;
+        g_pg_tried = 0;
+    }
+    if (!g_pg_exec) {
+        if (g_pg_tried) return -1;
+        g_pg_tried = 1;
+        g_pg_n_tokens = n_tokens;
+        cudaError_t cerr = cudaStreamBeginCapture(
+                g_pg_stream, cudaStreamCaptureModeThreadLocal);
+        if (cerr != cudaSuccess) {
+            fprintf(stderr, "ds4: pg begin capture failed: %s\n",
+                    cudaGetErrorString(cerr));
+            g_pg_disabled = 1;
+            return -1;
+        }
+        int rc2 = ds4_mmq_iq2_xxs_moe_pair(
+                gate_w, up_w, x_ptr, sel_ids,
+                gate_ptr, up_ptr,
+                (int)expert_mid_dim, (int)expert_in_dim,
+                (int)n_tokens, cap_experts, (int)n_expert,
+                g_pg_stream);
+        if (rc2 == 0) {
+            const uint64_t mid_floats = n_assignments * expert_mid_dim;
+            moe_mmq_swiglu_weighted_clamp_kernel<<<
+                    (uint32_t)((mid_floats + 255) / 256), 256, 0,
+                    g_pg_stream>>>(
+                    mid_ptr, gate_ptr, up_ptr, weights_ptr,
+                    expert_mid_dim, n_tokens, n_expert, clamp);
+            rc2 = cuda_ok(cudaGetLastError(),
+                          "pg mmq swiglu capture") ? 0 : -1;
+        }
+        if (rc2 == 0) {
+            rc2 = ds4_mmq_q2_K_moe(
+                    down_w, mid_ptr, sel_ids, down_ptr,
+                    (int)out_dim, (int)expert_mid_dim,
+                    (int)n_assignments, cap_experts,
+                    /*n_expert_used=*/1, g_pg_stream);
+        }
+        if (rc2 == 0) {
+            const uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_mmq_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0,
+                    g_pg_stream>>>(
+                    out_ptr, down_ptr, owned_filtered ? sel_ids : NULL,
+                    out_dim, n_expert, n_tokens,
+                    /*guard_nonfinite=*/1);
+            rc2 = cuda_ok(cudaGetLastError(),
+                          "pg mmq sum capture") ? 0 : -1;
+        }
+        cudaGraph_t gph = NULL;
+        const cudaError_t cerr2 = cudaStreamEndCapture(g_pg_stream, &gph);
+        if (rc2 != 0 || cerr2 != cudaSuccess || !gph) {
+            fprintf(stderr, "ds4: pg capture failed rc=%d err=%s; "
+                    "falling back to the launch path\n",
+                    rc2, cudaGetErrorString(cerr2));
+            if (gph) (void)cudaGraphDestroy(gph);
+            g_pg_disabled = 1;
+            return -1;
+        }
+        cudaGraphExec_t ex = NULL;
+        {
+            size_t free_before = 0, total_b = 0;
+            (void)cudaMemGetInfo(&free_before, &total_b);
+            if (cudaGraphInstantiate(&ex, gph, NULL, NULL, 0) != cudaSuccess) {
+                fprintf(stderr, "ds4: pg graph instantiate failed\n");
+                (void)cudaGraphDestroy(gph);
+                g_pg_disabled = 1;
+                return -1;
+            }
+            size_t free_after = 0;
+            if (cudaMemGetInfo(&free_after, &total_b) == cudaSuccess &&
+                free_after < free_before) {
+                g_pg_fee_bytes = (uint64_t)(free_before - free_after);
+                if (getenv("DS4_LM_DEBUG")) {
+                    fprintf(stderr,
+                            "ds4: pg graph instantiate charged %.1f MiB\n",
+                            (double)g_pg_fee_bytes / 1048576.0);
+                }
+            }
+        }
+        (void)cudaGraphDestroy(gph);
+        g_pg_exec = ex;
+        g_pg_cap_gate = gate_w;
+        g_pg_cap_up = up_w;
+        g_pg_cap_down = down_w;
+        g_pg_cap_sel = (const char *)sel_ids;
+        g_pg_cap_experts = cap_experts;
+        fprintf(stderr, "ds4: pg graph captured (mmq tier)\n");
+    }
+    /* Replay validity tripwire: the captured graph bakes the compact-stage
+     * base pointers and the n_experts bound.  A mid-request realloc or a
+     * layer whose compact set exceeds the captured bound would make the
+     * replay read freed memory or write out of bounds.  Refuse the replay
+     * and let the caller fall back to the plain launch path for the rest
+     * of the request. */
+    if (g_pg_exec &&
+        (gate_w != g_pg_cap_gate || up_w != g_pg_cap_up ||
+         down_w != g_pg_cap_down || (const char *)sel_ids != g_pg_cap_sel ||
+         weight_experts > g_pg_cap_experts)) {
+        fprintf(stderr,
+                "ds4: pg replay guard tripped (ptr drift or experts %d > cap %d); "
+                "disabling graph for this request\n",
+                weight_experts, g_pg_cap_experts);
+        g_pg_disabled = 1;
+        return -1;
+    }
+    /* Ordering bridges: the replay must follow the upstream work on the
+     * legacy stream, and downstream consumers must follow the replay. */
+    (void)cudaEventRecord(g_pg_ev_pre, (cudaStream_t)0);
+    (void)cudaStreamWaitEvent(g_pg_stream, g_pg_ev_pre, 0);
+    if (cudaGraphLaunch(g_pg_exec, g_pg_stream) != cudaSuccess) {
+        fprintf(stderr, "ds4: pg graph replay failed; disabling\n");
+        (void)cudaGraphExecDestroy(g_pg_exec);
+        g_pg_exec = NULL;
+        g_pg_disabled = 1;
+        return -1;
+    }
+    (void)cudaEventRecord(g_pg_ev_post, g_pg_stream);
+    (void)cudaStreamWaitEvent((cudaStream_t)0, g_pg_ev_post, 0);
+    return 0;
+}
+
+/* Measured compact-table capacity (the slot consumer's actual quota). */
+extern "C" uint64_t ds4_gpu_slot_table_capacity_bytes(void) {
+    return (uint64_t)g_stream_selected_cache.gate_capacity +
+           (uint64_t)g_stream_selected_cache.up_capacity +
+           (uint64_t)g_stream_selected_cache.down_capacity;
+}
+
+/* Peak per-layer compact footprint since the last reset (scheduler
+ * telemetry). */
+extern "C" uint64_t ds4_gpu_slot_peak_union_bytes(void) {
+    return g_stream_selected_cache.peak_union_bytes;
+}
+
+extern "C" void ds4_gpu_slot_peak_reset(void) {
+    g_stream_selected_cache.peak_union_bytes = 0;
+}
+
+/* Measured VRAM charge of the pg graph instantiation (fee accounting). */
+extern "C" uint64_t ds4_gpu_pg_fee_bytes(void) {
+    return g_pg_fee_bytes;
+}
+
+extern "C" void ds4_gpu_pg_reset(uint64_t request_assignments) {
+    if (g_pg_exec) {
+        (void)cudaGraphExecDestroy(g_pg_exec);
+        g_pg_exec = NULL;
+    }
+    if (g_pg_ev_pre) {
+        (void)cudaEventDestroy(g_pg_ev_pre);
+        g_pg_ev_pre = NULL;
+    }
+    if (g_pg_ev_post) {
+        (void)cudaEventDestroy(g_pg_ev_post);
+        g_pg_ev_post = NULL;
+    }
+    if (g_pg_stream) {
+        (void)cudaStreamDestroy(g_pg_stream);
+        g_pg_stream = NULL;
+    }
+    g_pg_request_assign = request_assignments;
+    g_pg_tried = 0;
+    g_pg_disabled = 0;
+    g_pg_n_tokens = 0;
+    g_pg_fee_bytes = 0;
+    g_pg_cap_gate = NULL;
+    g_pg_cap_up = NULL;
+    g_pg_cap_down = NULL;
+    g_pg_cap_sel = NULL;
+    g_pg_cap_experts = 0;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -30796,6 +31127,35 @@ static int routed_moe_launch(
                                         &mmq_ids, &mmq_experts,
                                         aligned ? expert_in_dim : 0,
                                         expert_mid_dim, out_dim)) return 0;
+        /* Prefill graph capture over the MMQ tier: the compact stage
+         * pointers are stable across layers (keep-in-place), so capture
+         * once and replay per layer while the stage contents refresh.
+         * Only the pair/swiglu/q2k sequence is captured; the aligned
+         * fused path below keeps its own launch.  Request gate: the
+         * default bound (4096 assignments) exists only because the
+         * pre-OOB-fix builds poisoned large requests; with the replay
+         * guard + keep-in-place staging the gate is a proven-safe
+         * default, and DS4_CUDA_PREFILL_GRAPH_LARGE=1 lifts it. */
+        const bool pg_gate_open =
+            g_pg_request_assign <= 4096u ||
+            getenv("DS4_CUDA_PREFILL_GRAPH_LARGE") != NULL;
+        if (!aligned &&
+            getenv("DS4_CUDA_PREFILL_GRAPH") != NULL && !g_pg_disabled &&
+            use_stream_selected_cache && pg_gate_open &&
+            (g_pg_exec || !g_pg_tried)) {
+            if (pg_mmq_tier(mmq_gate, mmq_up, mmq_down, mmq_ids,
+                            (const float *)x->ptr,
+                            (const float *)weights->ptr,
+                            (float *)gate->ptr, (float *)up->ptr,
+                            (float *)mid->ptr, (float *)down->ptr,
+                            (float *)out->ptr,
+                            expert_mid_dim, expert_in_dim,
+                            out_dim, n_tokens, n_expert,
+                            (int)mmq_experts, (int)n_total_expert,
+                            clamp, n_assignments, owned_filtered) == 0) {
+                return 1;
+            }
+        }
         if (aligned) {
             size_t input_bytes = 0, down_bytes = 0, work_bytes = 0;
             int rc = 1;
@@ -33127,6 +33487,11 @@ static int cuda_stream_compact_prefill(const char **gate, const char **up,
         count * cache.down_expert_bytes;
     if (!gate_bytes || !down_bytes) return 0;
     const uint64_t weights_bytes = 2 * gate_bytes + down_bytes;
+    /* Scheduler telemetry: peak per-layer compact footprint since the last
+     * reset (the adaptive sub-batch scheduler derives bytes-per-token). */
+    if (weights_bytes > cache.peak_union_bytes) {
+        cache.peak_union_bytes = weights_bytes;
+    }
     const uint64_t ids_offset = (weights_bytes + 3u) & ~UINT64_C(3);
     const uint64_t slots_offset = ids_offset + (uint64_t)cache.slot_count * sizeof(int32_t);
     const uint64_t bytes = slots_offset + (in_dim ? count * sizeof(int32_t) : 0);

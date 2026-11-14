@@ -516,6 +516,11 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 uint64_t ds4_gpu_free_bytes(void) { return 0; }
+void ds4_gpu_pg_reset(uint64_t request_assignments) { (void)request_assignments; }
+uint64_t ds4_gpu_slot_table_capacity_bytes(void) { return 0; }
+uint64_t ds4_gpu_slot_peak_union_bytes(void) { return 0; }
+void ds4_gpu_slot_peak_reset(void) {}
+uint64_t ds4_gpu_pg_fee_bytes(void) { return 0; }
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) { (void)bytes; return NULL; }
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) { (void)bytes; return NULL; }
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
@@ -33917,20 +33922,72 @@ static bool metal_graph_encode_layer_attention_batch(
                     0, g->raw_window, 0,
                     attn_heads, DS4_N_HEAD_DIM) != 0;
         } else if (ok) {
-            ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(metal_graph_batch_heads(g),
-                                                                   model->map,
-                                                                   model->size,
-                                                                   sinks_offset,
-                                                                   metal_graph_batch_q(g),
-                                                                   g->layer_raw_cache[il],
-                                                                   n_tokens,
-                                                                   pos0,
-                                                                   n_raw,
-                                                                   g->raw_cap,
-                                                                   raw_start,
-                                                                   g->raw_window,
-                                                                   attn_heads,
-                                                                   DS4_N_HEAD_DIM) != 0;
+            /* Prefix-window fused path: reproduce the zero-prefix whole-batch
+             * numerics bit-exactly by gathering the SWA window + current
+             * batch from the ring and running the SAME online kernel with a
+             * band mask (boundary-move byte gates found the decode-style
+             * kernel here drifted ULP-level vs the whole batch).  Late
+             * chunks (pos0 >= win-1) gather [pos0+1-win, ...); early chunks
+             * whose prefix is shorter than the SWA window (scheduler
+             * splits, certified floor chunks) gather [0, pos0+n_tokens) and
+             * clip the band at buffer row 0 via a negative band_offset —
+             * the row set stays causal, so the band still reproduces the
+             * whole-batch rows.  Falls back to the decode kernel only when
+             * the span would overflow the ring. */
+            const uint32_t win = g->raw_window ? g->raw_window : DS4_N_SWA;
+            if (win != 0 && win <= 256u) {
+                const int64_t offset = (int64_t)pos0 + 1 - (int64_t)win; /* band offset = offset - span_start below (late chunks clip to 0) */
+                const uint32_t span_start = offset > 0 ? (uint32_t)offset : 0u;
+                const uint32_t span_rows =
+                        (uint32_t)((int64_t)pos0 + (int64_t)n_tokens - span_start);
+                if (span_rows <= g->raw_cap) {
+                    ok = ds4_gpu_attention_prefill_raw_heads_window_tensor(
+                            metal_graph_batch_heads(g),
+                            model->map,
+                            model->size,
+                            sinks_offset,
+                            metal_graph_batch_q(g),
+                            g->layer_raw_cache[il],
+                            g->raw_cap,
+                            span_start % g->raw_cap,
+                            n_tokens,
+                            span_rows,
+                            win,
+                            (offset - (int64_t)span_start),
+                            attn_heads,
+                            DS4_N_HEAD_DIM) != 0;
+                } else {
+                    ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(metal_graph_batch_heads(g),
+                                                                           model->map,
+                                                                           model->size,
+                                                                           sinks_offset,
+                                                                           metal_graph_batch_q(g),
+                                                                           g->layer_raw_cache[il],
+                                                                           n_tokens,
+                                                                           pos0,
+                                                                           n_raw,
+                                                                           g->raw_cap,
+                                                                           raw_start,
+                                                                           g->raw_window,
+                                                                           attn_heads,
+                                                                           DS4_N_HEAD_DIM) != 0;
+                }
+            } else {
+                ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(metal_graph_batch_heads(g),
+                                                                       model->map,
+                                                                       model->size,
+                                                                       sinks_offset,
+                                                                       metal_graph_batch_q(g),
+                                                                       g->layer_raw_cache[il],
+                                                                       n_tokens,
+                                                                       pos0,
+                                                                       n_raw,
+                                                                       g->raw_cap,
+                                                                       raw_start,
+                                                                       g->raw_window,
+                                                                       attn_heads,
+                                                                       DS4_N_HEAD_DIM) != 0;
+            }
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
@@ -34761,26 +34818,79 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         &index_stage_t0);
                     }
                 } else {
-                    ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(metal_graph_batch_heads(g),
-                                                                             model->map,
-                                                                             model->size,
-                                                                             sinks_offset,
-                                                                             metal_graph_batch_q(g),
-                                                                             g->layer_raw_cache[il],
-                                                                             g->layer_attn_comp_cache[il],
-                                                                             metal_graph_attn_comp_cache_is_f16(),
-                                                                             use_comp_mask ? metal_graph_comp_mask(g) : NULL,
-                                                                             use_comp_mask,
-                                                                             n_tokens,
-                                                                             pos0,
-                                                                             n_raw,
-                                                                             g->raw_cap,
-                                                                             raw_start,
-                                                                             n_comp,
-                                                                             g->raw_window,
-                                                                             ratio,
-                                                                             attn_heads,
-                                                                             DS4_N_HEAD_DIM) != 0;
+                    /* ds4 determinism: reproduce the zero-prefix whole-batch
+                     * static-mixed numerics for nonzero chunks by gathering
+                     * the raw span and running the SAME online mixed kernel
+                     * in band mode (the window-band trick extended to the
+                     * compressed rows via comp_offset).  The decode mixed
+                     * kernel remains the fallback when the span would
+                     * overflow the ring or the compressed cache is FP16. */
+                    const uint32_t win = g->raw_window ? g->raw_window : DS4_N_SWA;
+                    const int64_t offset = (int64_t)pos0 + 1 - (int64_t)win; /* band offset = offset - span_start below (late chunks clip to 0) */
+                    const uint32_t span_start = offset > 0 ? (uint32_t)offset : 0u;
+                    const uint32_t span_rows =
+                            (uint32_t)((int64_t)pos0 + (int64_t)n_tokens - span_start);
+                    if (win != 0 && win <= 256u && span_rows <= g->raw_cap &&
+                        (n_comp == 0 || !metal_graph_attn_comp_cache_is_f16())) {
+                        if (n_comp == 0) {
+                            ok = ds4_gpu_attention_prefill_raw_heads_window_tensor(
+                                    metal_graph_batch_heads(g),
+                                    model->map,
+                                    model->size,
+                                    sinks_offset,
+                                    metal_graph_batch_q(g),
+                                    g->layer_raw_cache[il],
+                                    g->raw_cap,
+                                    span_start % g->raw_cap,
+                                    n_tokens,
+                                    span_rows,
+                                    win,
+                                    (offset - (int64_t)span_start),
+                                    attn_heads,
+                                    DS4_N_HEAD_DIM) != 0;
+                        } else {
+                            ok = ds4_gpu_attention_prefill_static_mixed_heads_window_tensor(
+                                    metal_graph_batch_heads(g),
+                                    model->map,
+                                    model->size,
+                                    sinks_offset,
+                                    metal_graph_batch_q(g),
+                                    g->layer_raw_cache[il],
+                                    g->raw_cap,
+                                    span_start % g->raw_cap,
+                                    n_tokens,
+                                    span_rows,
+                                    win,
+                                    (offset - (int64_t)span_start),
+                                    g->layer_attn_comp_cache[il],
+                                    n_comp,
+                                    (int64_t)pos0,
+                                    ratio,
+                                    attn_heads,
+                                    DS4_N_HEAD_DIM) != 0;
+                        }
+                    } else {
+                        ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(metal_graph_batch_heads(g),
+                                                                                 model->map,
+                                                                                 model->size,
+                                                                                 sinks_offset,
+                                                                                 metal_graph_batch_q(g),
+                                                                                 g->layer_raw_cache[il],
+                                                                                 g->layer_attn_comp_cache[il],
+                                                                                 metal_graph_attn_comp_cache_is_f16(),
+                                                                                 use_comp_mask ? metal_graph_comp_mask(g) : NULL,
+                                                                                 use_comp_mask,
+                                                                                 n_tokens,
+                                                                                 pos0,
+                                                                                 n_raw,
+                                                                                 g->raw_cap,
+                                                                                 raw_start,
+                                                                                 n_comp,
+                                                                                 g->raw_window,
+                                                                                 ratio,
+                                                                                 attn_heads,
+                                                                                 DS4_N_HEAD_DIM) != 0;
+                    }
                 }
             }
             if (ok) batch_attention_done = true;
@@ -34935,6 +35045,42 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                                  ratio,
                                                                                  attn_heads,
                                                                                  DS4_N_HEAD_DIM) != 0;
+            } else if (ds4_kv_bitq_enabled() || ds4_kv_bitq_comp_enabled()) {
+                /* DS4_CUDA_KV_BITQ(_COMP): read the same quantized ring /
+                 * comp cache as the split window path via the mixed
+                 * window-tensor over the whole span [0, n_tokens),
+                 * comp_offset = 0 mirrors the zero-prefix whole batch
+                 * (comp rows [0, (t+1)/ratio)). */
+                const uint32_t win = g->raw_window != 0u ? g->raw_window : n_tokens;
+                if (win <= 256u && n_tokens <= g->raw_cap &&
+                    n_comp <= 32768u &&
+                    !metal_graph_attn_comp_cache_is_f16()) {
+                    ok = ds4_gpu_attention_prefill_static_mixed_heads_window_tensor(
+                            metal_graph_batch_heads(g),
+                            model->map,
+                            model->size,
+                            sinks_offset,
+                            metal_graph_batch_q(g),
+                            g->layer_raw_cache[il],
+                            g->raw_cap,
+                            0u,
+                            n_tokens,
+                            n_tokens,
+                            win,
+                            1 - (int64_t)win,
+                            g->layer_attn_comp_cache[il],
+                            n_comp,
+                            0,
+                            ratio,
+                            attn_heads,
+                            DS4_N_HEAD_DIM) != 0;
+                } else {
+                    fprintf(stderr,
+                            "ds4: DS4_CUDA_KV_BITQ cannot route whole mixed"
+                            " attention (win %u tokens %u cap %u comp %u)\n",
+                            win, n_tokens, g->raw_cap, n_comp);
+                    ok = false;
+                }
             } else {
                 ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(metal_graph_batch_heads(g),
                                                                            model->map,
@@ -40491,6 +40637,12 @@ static bool metal_graph_prefill_layer_major(
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
+    /* Per-request graph reset: pg state never survives across requests;
+     * pass the request-level selection count so oversized requests keep
+     * the plain launch path.  Only on the request's first sub-batch
+     * (start == 0): budget-driven sub-batch splits call back into this
+     * function per sub-batch and must keep the graph across them. */
+    if (start == 0) ds4_gpu_pg_reset((uint64_t)n_tokens * DS4_N_EXPERT_USED);
 
     g->prefill_host_tokens = (const int32_t *)(prompt->v + start);
     g->prefill_host_pos0 = start;
@@ -41354,6 +41506,167 @@ static bool metal_graph_prefill_layer_major(
     return ok;
 }
 
+/* Adaptive sub-batch scheduler (DS4_CUDA_PREFILL_GRAPH).  Every sizing
+ * parameter comes from runtime measurement or engine structure, never from
+ * per-machine constants:
+ *   floor  = structural minimum batch of the layer-major attention/FFN
+ *            path (tile-granular batches; the smallest byte-identical-proven
+ *            size — see the floor sweep; DS4_PG_MIN_SUB narrows it for
+ *            experiments only)
+ *   cap    = g->prefill_cap (engine/context limit; adapts per machine)
+ *   budget = measured slot-table capacity (the compact cache's real quota)
+ *   rate   = measured compact-cache bytes per token of the previous sub-batch
+ *   loop   = encode failure halves the sub-batch and retries the same range;
+ *            success with headroom grows stepwise (x2) toward budget/rate.
+ * The scheduler discovers this machine's safe operating point from its own
+ * measurements; no pre-tuning is needed. */
+static bool metal_graph_prefill_layer_major_budgeted(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        const token_vec *prompt,
+        uint32_t start,
+        uint32_t n_tokens,
+        float *logits,
+        bool show_progress,
+        ds4_session_progress_fn display_progress,
+        void *display_progress_ud) {
+    const uint32_t cap = g->prefill_cap != 0 ? g->prefill_cap
+                                             : (uint32_t)prompt->len;
+    /* Structural floor: the layer-major batch QKV/FFN path tiles tokens in
+     * 16-token granularity (q8_0 tile16 matmuls); 16 is the smallest legal
+     * tile-aligned batch.  The byte-identical-proven minimum is established
+     * by the floor sweep (DS4_PG_MIN_SUB + MATCH_REF); the sweep may raise
+     * this number, never by hand. */
+    uint32_t floor = 16u;
+    const char *min_env = getenv("DS4_PG_MIN_SUB");
+    if (min_env && min_env[0]) {
+        const uint32_t v = (uint32_t)atoi(min_env);
+        if (v >= 1u && v <= 4096u) floor = v;
+    }
+    /* Budget = the slot table's actual allocation (measured at runtime).
+     * A debug override (DS4_PG_BUDGET_MB) exists only for sweep/experiment
+     * runs that force the budget-bound regime. */
+    uint64_t budget = ds4_gpu_slot_table_capacity_bytes();
+    const char *budget_env = getenv("DS4_PG_BUDGET_MB");
+    const bool budget_forced = budget_env && budget_env[0];
+    if (budget_forced) {
+        const unsigned long mb = strtoul(budget_env, NULL, 10);
+        if (mb > 0) budget = (uint64_t)mb * 1048576ull;
+    }
+    if (getenv("DS4_LM_DEBUG")) {
+        fprintf(stderr,
+                "ds4-pg: budgeted entry tokens=%u start=%u cap=%u forced=%d "
+                "budget=%.1f MiB table=%.1f MiB\n",
+                n_tokens, start, cap, budget_forced ? 1 : 0,
+                (double)budget / 1048576.0,
+                (double)ds4_gpu_slot_table_capacity_bytes() / 1048576.0);
+    }
+    /* Whole range fits the engine cap and the budget is not being forced:
+     * no split (the common case — with the full-table prealloc the union
+     * can never exceed the table, so the scheduler only binds when a
+     * registry shrank the slot quota, or under the experiment override). */
+    if (n_tokens <= cap && !budget_forced) {
+        return metal_graph_prefill_layer_major(g, model, weights, prompt,
+                start, n_tokens, logits, show_progress, NULL,
+                display_progress, display_progress_ud);
+    }
+    /* Split gate history: the layer-major nonzero-prefix attention path was
+     * unified with the whole-batch path (window-band + comp-offset kernels,
+     * the ratio-4 state refresh on unaligned chunks, the corrected late-band
+     * offset, and the tokentile HMMA path moved behind DS4_ATTN_TOKENTILE so
+     * the whole batch and the chunks share the online kernel) and certified
+     * byte-equal at the floor-16/32 split matrix across the tiers
+     * 118/223/1240/1605/1782/1974/2094 tokens (the last past the indexer
+     * top-k threshold), all whole==split byte-identical.  The split now runs
+     * by default for every length; the n>127 refusal is removed.
+     * DS4_PG_MIN_SUB / DS4_PG_BUDGET_MB remain the experiment hooks for the
+     * offline matrices. */
+    /* First sub-batch: the engine cap for over-cap requests, the structural
+     * floor when the budget is forced (no rate measured yet — the floor is
+     * the only non-measured legal starting point). */
+    uint32_t sub = budget_forced ? floor : (cap < n_tokens ? cap : n_tokens);
+    if (sub < floor) sub = floor;
+    fprintf(stderr,
+            "ds4: pg adaptive split tokens=%u cap=%u floor=%u budget=%.1f MiB\n",
+            n_tokens, cap, floor, (double)budget / 1048576.0);
+    /* FUSION_REPORT ㉑十六续: the union peak is the CONTENT-dependent unique
+     * expert set of the sub just run -- the rate follower + x2 growth forms a
+     * limit cycle around the content spikes (16→...→3704→192→...→3704...).
+     * Remember the largest size whose rate spike shrank us and never grow
+     * past it again: the growth then converges to the largest stable size.
+     * Scheduler-only (no numerics); the 8k floor-16 gates never grow, so
+     * their trajectory is untouched. */
+    uint32_t ascent_cap = cap;
+    const uint32_t end = start + n_tokens;
+    for (uint32_t pos0 = start; pos0 < end; ) {
+        const uint32_t remaining = end - pos0;
+        if (sub > remaining) sub = remaining;
+        ds4_gpu_slot_peak_reset();
+        float *sub_logits = (pos0 + sub == end) ? logits : NULL;
+        const bool ok = metal_graph_prefill_layer_major(g, model, weights,
+                prompt, pos0, sub, sub_logits, show_progress, NULL,
+                display_progress, display_progress_ud);
+        if (!ok) {
+            /* Fail-loud safety net (FUSION_REPORT ㉑): the old self-correction
+             * halved the batch and silently retried the same range.  Re-chunking
+             * moves the split boundaries and silently flips the numeric family
+             * (the 286B/281B "GPU 失败→回退" trap).  A batch encode failure is
+             * now a hard error: the request fails visibly instead of returning
+             * a different byte family. */
+            fprintf(stderr,
+                    "ds4: FATAL pg sub-batch encode failed at pos0=%u (size %u); "
+                    "aborting instead of silently re-chunking (re-chunking "
+                    "flips the numeric family)\n",
+                    pos0, sub);
+            fflush(stderr);
+            return false;
+        }
+        pos0 += sub;
+        /* Union rate = measured compact-cache bytes per token of the batch
+         * just run; the next size targets budget / rate. */
+        const uint64_t peak = ds4_gpu_slot_peak_union_bytes();
+        if (budget > 0 && peak > 0) {
+            const uint64_t rate = peak / (uint64_t)sub;
+            if (rate > 0) {
+                const uint64_t target = budget / rate;
+                uint32_t next = target > (uint64_t)cap
+                                    ? cap : (uint32_t)target;
+                /* Stepwise growth (x2) so an overshoot corrects before it
+                 * costs a full failed batch; shrink only on failure. */
+                if (next > sub * 2u) next = sub * 2u;
+                if (next > ascent_cap) next = ascent_cap;
+                /* ds4 determinism: keep every sub-batch a multiple of 4 so
+                 * the ratio-4 compressor layers stay chunk-aligned (the
+                 * aligned replay path is the certified byte-equal one); an
+                 * off-grid pos0 chain would fall into the per-token
+                 * unaligned compressor and drift from the whole batch
+                 * (the 2094-token growth matrix caught this at sub 107). */
+                if ((next & 3u) != 0u) next &= ~3u;
+                if (next < floor) next = floor;
+                if (next != sub) {
+                    if (next < sub) {
+                        /* Shrink: never re-ascend into this size again. */
+                        uint32_t cap2 = sub;
+                        if ((cap2 & 3u) == 0u) cap2 = cap2 > 4u ? cap2 - 4u : cap2;
+                        else cap2 &= ~3u;
+                        if (cap2 < ascent_cap) ascent_cap = cap2;
+                        fprintf(stderr,
+                                "ds4: pg union rate %.2f KiB/token -> next sub %u (ascent cap %u)\n",
+                                (double)rate / 1024.0, next, ascent_cap);
+                    } else {
+                        fprintf(stderr,
+                                "ds4: pg union rate %.2f KiB/token -> next sub %u\n",
+                                (double)rate / 1024.0, next);
+                    }
+                    sub = next;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -41399,17 +41712,23 @@ static bool metal_graph_prefill_raw_swa(
      * its per-layer boundaries may recycle completed layers' weight ranges
      * under arena pressure. */
     if (g->ssd_streaming) ds4_gpu_arena_prefill_begin();
-    const bool ok = metal_graph_prefill_layer_major(g,
-                                           model,
-                                           weights,
-                                           prompt,
-                                           0,
-                                           (uint32_t)n_tokens,
-                                           logits,
-                                           show_progress,
-                                           NULL,
-                                           display_progress,
-                                           display_progress_ud);
+    bool ok =
+        (getenv("DS4_CUDA_PREFILL_GRAPH") != NULL ||
+         getenv("DS4_PG_BUDGET_MB") != NULL) ?
+        metal_graph_prefill_layer_major_budgeted(g, model, weights,
+                prompt, 0, (uint32_t)n_tokens, logits, show_progress,
+                display_progress, display_progress_ud) :
+        metal_graph_prefill_layer_major(g,
+                                        model,
+                                        weights,
+                                        prompt,
+                                        0,
+                                        (uint32_t)n_tokens,
+                                        logits,
+                                        show_progress,
+                                        NULL,
+                                        display_progress,
+                                        display_progress_ud);
     if (g->ssd_streaming) ds4_gpu_arena_prefill_end();
     return ok;
 }
@@ -41529,17 +41848,32 @@ static bool metal_graph_prefill_chunked_range(
         if (chunk == 0) return false;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
+        /* The adaptive sub-batch scheduler owns every chunk when the pg
+         * env is set (long prompts reach the measured split/grow loop
+         * instead of the fixed chunk). */
+        bool ok = (getenv("DS4_CUDA_PREFILL_GRAPH") != NULL ||
+                   getenv("DS4_PG_BUDGET_MB") != NULL) ?
+            metal_graph_prefill_layer_major_budgeted(g,
+                                                     model,
+                                                     weights,
+                                                     prompt,
+                                                     pos0,
+                                                     chunk,
+                                                     chunk_logits,
+                                                     show_progress,
+                                                     display_progress,
+                                                     display_progress_ud) :
+            metal_graph_prefill_layer_major(g,
+                                            model,
+                                            weights,
+                                            prompt,
+                                            pos0,
+                                            chunk,
+                                            chunk_logits,
+                                            show_progress,
+                                            imatrix,
+                                            display_progress,
+                                            display_progress_ud);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
@@ -67126,21 +67460,77 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     int rc = 0;
     for (uint32_t il = layer_start; rc == 0 && il <= layer_end; il++) {
         const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
-        for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
-            const uint32_t pos = raw_first + r;
-            const uint32_t phys = pos % g->raw_cap;
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_raw_cache[il],
-                                           (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                           (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+        if (ds4_kv_bitq_enabled()) {
+            /* DS4_CUDA_KV_BITQ: dequant the packed ring rows into FP32 for
+             * the stable external format (see ds4_session_save_payload). */
+            float *rows = (float *)xmalloc((uint64_t)raw_live *
+                                           DS4_N_HEAD_DIM * sizeof(float));
+            if (!rows) {
+                payload_set_err(err, errlen,
+                                "out of memory staging bitq raw rows");
+                rc = 1;
+                break;
+            }
+            if (!ds4_gpu_bitq_dequant_rows_dump(g->layer_raw_cache[il],
+                                                g->raw_cap, raw_first,
+                                                raw_live, DS4_N_HEAD_DIM,
+                                                ds4_kv_bitq_raw_bits(),
+                                                rows)) {
+                free(rows);
+                payload_set_err(err, errlen,
+                                "failed to dequant bitq raw rows for layer payload");
+                rc = 1;
+                break;
+            }
+            rc = payload_write_bytes(fp, rows,
+                                     (uint64_t)raw_live * DS4_N_HEAD_DIM *
+                                             sizeof(float),
+                                     err, errlen);
+            free(rows);
+        } else {
+            for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
+                const uint32_t pos = raw_first + r;
+                const uint32_t phys = pos % g->raw_cap;
+                rc = payload_write_tensor_span(fp,
+                                               g->layer_raw_cache[il],
+                                               (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                               (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                               buf,
+                                               DS4_SESSION_IO_CHUNK,
+                                               err,
+                                               errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_kv_bitq_comp_enabled() && g->layer_n_comp[il] != 0u) {
+            /* DS4_CUDA_KV_BITQ_COMP: dequant the packed comp rows into FP32
+             * for the stable external format. */
+            const uint32_t ncomp = g->layer_n_comp[il];
+            float *rows = (float *)xmalloc((uint64_t)ncomp *
+                                           DS4_N_HEAD_DIM * sizeof(float));
+            if (!rows) {
+                payload_set_err(err, errlen,
+                                "out of memory staging bitq comp rows");
+                rc = 1;
+                continue;
+            }
+            if (!ds4_gpu_bitq_dequant_rows_dump(g->layer_attn_comp_cache[il],
+                                                g->layer_comp_cap[il], 0u,
+                                                ncomp, DS4_N_HEAD_DIM,
+                                                ds4_kv_bitq_comp_bits(), rows)) {
+                free(rows);
+                payload_set_err(err, errlen,
+                                "failed to dequant bitq comp rows for layer payload");
+                rc = 1;
+                continue;
+            }
+            rc = payload_write_bytes(fp, rows,
+                                     (uint64_t)ncomp * DS4_N_HEAD_DIM *
+                                             sizeof(float),
+                                     err, errlen);
+            free(rows);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_write_tensor_span_f16_as_f32(fp,
                                                       g->layer_attn_comp_cache[il],
                                                       0,
@@ -69317,22 +69707,92 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
          * why the file stores rows in logical order instead of dumping bytes from
          * the old ring layout. */
         const uint32_t raw_first = saved_tokens - saved_raw_live;
-        for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
-            const uint32_t pos = raw_first + r;
-            const uint32_t phys = pos % g->raw_cap;
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_raw_cache[il],
-                                          (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
-                                          (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+        if (ds4_kv_bitq_enabled()) {
+            /* DS4_CUDA_KV_BITQ: the ring holds packed rows at row_bytes
+             * stride; read the payload's FP32 rows then pack them in. */
+            const uint64_t rows_bytes =
+                (uint64_t)saved_raw_live * DS4_N_HEAD_DIM * sizeof(float);
+            float *rows = (float *)xmalloc(rows_bytes);
+            if (!rows) {
+                payload_set_err(err, errlen,
+                                "out of memory staging bitq raw rows");
+                rc = 1;
+                break;
+            }
+            if (payload_read_bytes(fp, rows, rows_bytes, &remaining,
+                                   err, errlen) != 0) {
+                free(rows);
+                rc = 1;
+                break;
+            }
+            if (!ds4_gpu_bitq_pack_rows_upload(g->layer_raw_cache[il],
+                                               g->raw_cap, raw_first,
+                                               saved_raw_live,
+                                               DS4_N_HEAD_DIM,
+                                               ds4_kv_bitq_raw_bits(), rows)) {
+                free(rows);
+                payload_set_err(err, errlen,
+                                "failed to pack bitq raw rows on restore");
+                rc = 1;
+                break;
+            }
+            free(rows);
+        } else {
+            for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
+                const uint32_t pos = raw_first + r;
+                const uint32_t phys = pos % g->raw_cap;
+                rc = payload_read_tensor_span(fp,
+                                              g->layer_raw_cache[il],
+                                              (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                              (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                              buf,
+                                              DS4_SESSION_IO_CHUNK,
+                                              &remaining,
+                                              err,
+                                              errlen);
+            }
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+        if (ds4_kv_bitq_comp_enabled() && n_comp[il] != 0u) {
+            /* DS4_CUDA_KV_BITQ_COMP: read the payload's FP32 comp rows and
+             * pack them into the packed cache. */
+            const uint64_t rows_bytes =
+                (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+            float *rows = (float *)xmalloc(rows_bytes);
+            if (!rows) {
+                payload_set_err(err, errlen,
+                                "out of memory staging bitq comp rows");
+                rc = 1;
+                break;
+            }
+            if (payload_read_bytes(fp, rows, rows_bytes, &remaining,
+                                   err, errlen) != 0) {
+                free(rows);
+                rc = 1;
+                break;
+            }
+            if (ds4_indexer_paging_enabled()) {
+                payload_set_err(err, errlen,
+                                "session restore is not supported under "
+                                "DS4_CUDA_INDEXER_PAGING (v1)");
+                free(rows);
+                rc = 1;
+                break;
+            }
+            if (!ds4_gpu_bitq_pack_rows_upload(g->layer_attn_comp_cache[il],
+                                               g->layer_comp_cap[il], 0u,
+                                               n_comp[il], DS4_N_HEAD_DIM,
+                                               ds4_kv_bitq_comp_bits(),
+                                               rows)) {
+                free(rows);
+                payload_set_err(err, errlen,
+                                "failed to pack bitq comp rows on restore");
+                rc = 1;
+                break;
+            }
+            free(rows);
+        } else if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             rc = payload_read_tensor_span_f32_as_f16(fp,
                                                      g->layer_attn_comp_cache[il],
                                                      0,
@@ -80033,6 +80493,13 @@ static int ds4_session_tp_register(ds4_session *s) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    /* DS4_CUDA_KV_BITQ_AUTO: settle the bit-width profile once, before the
+     * prefill budget and raw-cap planner read the bitq getters (idempotent;
+     * manual bitq envs make it a no-op). */
+#ifndef DS4_NO_GPU
+    ds4_kv_bitq_scheduler_settle((uint32_t)ctx_size,
+                                 e->prefill_chunk ? e->prefill_chunk : 0u);
+#endif
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");

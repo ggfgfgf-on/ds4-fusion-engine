@@ -62526,7 +62526,8 @@ typedef struct ds4_qwen4_gpu_graph {
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 ||
+                 t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q6_K);
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -62544,6 +62545,23 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
 
 /* The Metal graph runs a subset of what the loader accepts. */
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        /* qwen35: single-stream dense graph; no n-grams, no hc head. */
+        if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
+            !qwen4_graph_dense_ok(w->output_norm)) {
+            fprintf(stderr, "ds4: Qwen35 GPU graph needs Q8_0/Q4_0/F16/BF16/F32/Q4_K/Q6_K dense weights\n");
+            return false;
+        }
+        if (DS4_N_NEXTN_PREDICT != 0) {
+            const ds4_layer_weights *l = &w->layer[DS4_N_LAYER - 1u];
+            if (!l->nextn_shared_head_norm ||
+                !qwen4_graph_dense_ok(l->nextn_shared_head_norm)) {
+                fprintf(stderr, "ds4: Qwen35 MTP head tensors are missing or unsupported\n");
+                return false;
+            }
+        }
+        return true;
+    }
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
@@ -63818,6 +63836,8 @@ static bool qwen4_graph_stage_ple(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         }
         if (!prefetched_ple && (t % 256u == 255u || t + 1 == T)) {
             const uint32_t start = t / 256u * 256u;
+            /* qwen35: no PLE n-gram layer; the ple_emb stays zeroed. */
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) continue;
             if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
                                   row + (uint64_t)start * E)) {
                 fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
@@ -82552,7 +82572,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                               prefetch_ready ? prefetch.rows : NULL);
                 prefetch_ready = false;
                 bool reading = false;
-                if (ok && i + (int)chunk < prompt->len) {
+                if (ok && i + (int)chunk < prompt->len &&
+                    DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35) {
                     prefetch.model = &e->model;
                     prefetch.tokens = prompt->v + i + (int)chunk;
                     prefetch.count = (uint32_t)(prompt->len - i - (int)chunk);

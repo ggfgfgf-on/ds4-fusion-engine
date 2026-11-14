@@ -62743,8 +62743,14 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(ple_val, T * E);
     QWEN4_ALLOC(ple_gated, T * hc_dim);
     QWEN4_ALLOC(ple_normed, T * hc_dim);
-    QWEN4_ALLOC(qg, T * 2u * q_dim);
-    QWEN4_ALLOC(kp, T * kv_dim);
+    /* qwen35: the dense FFN (17408) is wider than the attention buffers;
+     * size qg/kp for the wider of the two. */
+    const uint64_t qg_row = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35
+        ? (uint64_t)DS4_N_FF_DENSE : 2u * q_dim;
+    const uint64_t kp_row = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35
+        ? (uint64_t)DS4_N_FF_DENSE : kv_dim;
+    QWEN4_ALLOC(qg, T * qg_row);
+    QWEN4_ALLOC(kp, T * kp_row);
     QWEN4_ALLOC(vp, T * kv_dim);
     QWEN4_ALLOC(iq, T * iq_dim);
     QWEN4_ALLOC(ik, T * DS4_N_INDEXER_HEAD_DIM);
@@ -85637,11 +85643,14 @@ static void qwen4_batch_rows_free(qwen4_batch_row *rows, int count) {
  * serve. */
 static bool qwen4_batch_rows_build(qwen4_batch_row *rows, int count,
                                    const ds4_qwen4_gpu_graph *g) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * (DS4_N_HC ? DS4_N_HC : 1u);
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const bool qwen35 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
+    const uint64_t qg_row = qwen35 ? (uint64_t)DS4_N_FF_DENSE : 2u * q_dim;
+    const uint64_t kp_row = qwen35 ? (uint64_t)DS4_N_FF_DENSE : kv_dim;
     memset(rows, 0, (size_t)count * sizeof(rows[0]));
     for (int i = 0; i < count; i++) {
         const uint32_t r = (uint32_t)i;
@@ -85652,8 +85661,8 @@ static bool qwen4_batch_rows_build(qwen4_batch_row *rows, int count,
         rows[i].ga = qwen4_row_view(g->ga, r, DS4_N_LIN_V_HEAD);
         rows[i].gb = qwen4_row_view(g->gb, r, DS4_N_LIN_V_HEAD);
         rows[i].lin_o = qwen4_row_view(g->lin_o, r, v_dim);
-        rows[i].qg = qwen4_row_view(g->qg, r, 2u * q_dim);
-        rows[i].kp = qwen4_row_view(g->kp, r, kv_dim);
+        rows[i].qg = qwen4_row_view(g->qg, r, qg_row);
+        rows[i].kp = qwen4_row_view(g->kp, r, kp_row);
         rows[i].vp = qwen4_row_view(g->vp, r, kv_dim);
         rows[i].iq = qwen4_row_view(g->iq, r, iq_dim);
         rows[i].ik = qwen4_row_view(g->ik, r, DS4_N_INDEXER_HEAD_DIM);

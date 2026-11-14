@@ -8218,7 +8218,16 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (ds4_model_is_qwen4()) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        /* qwen35: single-stream output head (output_norm + output). */
+        if (required) {
+            w->output_norm = required_tensor(m, "output_norm.weight");
+            w->output      = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_norm = model_find_tensor(m, "output_norm.weight");
+            w->output      = model_find_tensor(m, "output.weight");
+        }
+    } else if (ds4_model_is_qwen4()) {
         if (required) {
             w->output_hc_norm = required_tensor(m, "output_hc_norm.weight");
             w->output_hc_down = required_tensor(m, "output_hc_down.weight");

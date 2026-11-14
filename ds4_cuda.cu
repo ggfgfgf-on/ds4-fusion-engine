@@ -22101,6 +22101,9 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_QWEN35_DEBUG") != NULL;
+    if (dbg) { fprintf(stderr, "ds4: rms_rows enter off=%llu n=%u rows=%u\n", (unsigned long long)weight_offset, n, rows); fflush(stderr); }
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||

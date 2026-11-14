@@ -1214,7 +1214,9 @@ static bool ds4_qwen4_layer_is_linear(uint32_t il) {
 }
 
 static bool ds4_qwen4_layer_is_ple(uint32_t il) {
-    return ds4_model_is_qwen4() && il == DS4_N_PLE_LAYER;
+    /* Only the Flash-Next has the PLE n-gram layer; the qwen35 dense
+     * sibling must never match (its DS4_N_PLE_LAYER is 0). */
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP && il == DS4_N_PLE_LAYER;
 }
 
 static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
@@ -1232,6 +1234,8 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
  * exceed the budget. Share this boundary between query preparation and its
  * consumer so a chunk crossing it cannot omit an indexer query. */
 static uint32_t qwen4_attention_dense_rows(uint32_t pos0, uint32_t n_tokens, uint32_t k_blocks) {
+    /* qwen35: plain GQA attends densely over every visible token. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) return n_tokens;
     const uint64_t sparse_pos = ((uint64_t)k_blocks + 1u) * 4u - 1u;
     if ((uint64_t)pos0 >= sparse_pos) return 0;
     const uint64_t n_dense = sparse_pos - pos0;
@@ -63263,6 +63267,11 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
             l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T) != 0;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        fprintf(stderr, "ds4: qwen35 linear w_qkv=%p w_gate=%p out=%p x=%p\n",
+                (void *)l->lin_qkv, (void *)l->lin_gate, (void *)g->qkv, (void *)g->mixed);
+        fflush(stderr);
+    }
     if (!paired && !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
           qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
         return false;
@@ -63422,8 +63431,17 @@ static bool qwen4_graph_attention_cache(ds4_qwen4_gpu_graph *g, const ds4_model 
         bool ok = cache_only || qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
         if (ok) ok = qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
                      qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+            fprintf(stderr, "ds4: qwen35 attn cache done il=%u ok=%d\n", il, (int)ok);
+            fflush(stderr);
+        }
         if (!ok) return false;
-        return qwen4_graph_attention_prepare(g, m, l, il, pos0, T, cache_only, false);
+        ok = qwen4_graph_attention_prepare(g, m, l, il, pos0, T, cache_only, false);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+            fprintf(stderr, "ds4: qwen35 attn prepare done il=%u ok=%d\n", il, (int)ok);
+            fflush(stderr);
+        }
+        return ok;
     }
     {
         /* Historical predictor rows need keys and values only. Keep their
@@ -64005,8 +64023,18 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g,
         }
         QWEN4_PROF(0);
         if (ok && !qwen35) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
+        if (qwen35 && getenv("DS4_QWEN35_DEBUG")) {
+            fprintf(stderr, "ds4: qwen35 pre-norm il=%u norm=%p off=%llu\n", il,
+                    (void *)l->attn_norm,
+                    (unsigned long long)(l->attn_norm ? l->attn_norm->abs_offset : 0));
+            fflush(stderr);
+        }
         if (ok && qwen35) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size,
                                l->attn_norm->abs_offset, DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
+        if (qwen35 && getenv("DS4_QWEN35_DEBUG")) {
+            fprintf(stderr, "ds4: qwen35 norm done il=%u ok=%d\n", il, (int)ok);
+            fflush(stderr);
+        }
         QWEN4_PROF(1);
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)

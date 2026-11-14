@@ -1076,7 +1076,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
         QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
-        QWEN_TC(12); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
+        QWEN_TC(12); QWEN_TC(14); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
         default: return 0;
         }
 #undef QWEN_TC
@@ -1088,7 +1088,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     else matrix<TYPE,false,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
     QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
-    QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
+    QWEN_MM(12); QWEN_MM(14); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
     default: return 0;
     }
 #undef QWEN_MM
@@ -1963,15 +1963,18 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
     using namespace qwen4_cuda;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
-    if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
-        Di < 32 || Di > 128 || Di % 32 || nrot > 64 || nrot > D || nrot > Di || nrot % 2 ||
+    /* qwen35: Hi/Di are zero (no QSA indexer); the indexer terms degrade. */
+    if (!T || !H || !Hkv || H % Hkv || D < 32 || D > 256 || D % 32 ||
+        (Hi && (Di < 32 || Di > 128 || Di % 32)) || nrot > 64 || nrot > D ||
+        (Hi && nrot > Di) || nrot % 2 ||
         (uint64_t)pos0 + T > cap || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
         !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
         !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4) ||
         !tensor(kc, (uint64_t)cap * Hkv * D * 2) || !tensor(vc, (uint64_t)cap * Hkv * D * 2) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
-    const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
-    if (!gq || !gk || !giq) return 0;
+    const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4);
+    const char *giq = Hi ? weight(map, size, io, Di * 4) : NULL;
+    if (!gq || !gk || (Hi && !giq)) return 0;
     attn_prep<<<dim3(H + Hkv + Hi + 1, T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr,
         (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
         (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
@@ -2037,11 +2040,15 @@ extern "C" uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t T, uint32_t H, uint3
 extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
     using namespace qwen4_cuda;
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_QWEN35_MM_DEBUG") != NULL;
+    if (dbg) { fprintf(stderr, "ds4: dense_mm enter type=%u T=%u K=%u M=%u\n", type, T, K, M); fflush(stderr); }
     if (!T || !K || !M || !tensor(x, (uint64_t)T*K*4) || !tensor(out, (uint64_t)T*M*4)) return 0;
     const uint64_t rb = row_bytes(type,K);
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
+    if (dbg) { fprintf(stderr, "ds4: dense_mm weight ok rb=%llu\n", (unsigned long long)rb); fflush(stderr); }
     if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
     if (type == 1 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
@@ -2052,6 +2059,7 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX &&
         (type == 0 || type == 1 || type == 8))
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
+    if (dbg) { fprintf(stderr, "ds4: dense_mm matrix_dispatch type=%u\n", type); fflush(stderr); }
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);
 }

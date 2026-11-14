@@ -73314,6 +73314,35 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
+    case DS4_TENSOR_Q6_K: {
+        const uint64_t blocks = n / 256u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 210u;
+        for (uint64_t b = 0; b < blocks; b++, p += 210u) {
+            const uint8_t *ql = p, *qh = p + 128;
+            const int8_t *sc = (const int8_t *)(p + 192);
+            uint16_t dh;
+            memcpy(&dh, p + 208, 2);
+            const float d = f16_to_f32(dh);
+            for (uint32_t half = 0; half < 2u; half++) {
+                for (uint32_t l = 0; l < 32u; l++) {
+                    const int is_ = (int)(l / 16u);
+                    const int8_t q1 = (int8_t)((ql[half * 64u + l] & 0xF) |
+                                               (((qh[half * 32u + l] >> 0) & 3) << 4)) - 32;
+                    const int8_t q2 = (int8_t)((ql[half * 64u + 32u + l] & 0xF) |
+                                               (((qh[half * 32u + l] >> 2) & 3) << 4)) - 32;
+                    const int8_t q3 = (int8_t)((ql[half * 64u + l] >> 4) |
+                                               (((qh[half * 32u + l] >> 4) & 3) << 4)) - 32;
+                    const int8_t q4 = (int8_t)((ql[half * 64u + 32u + l] >> 4) |
+                                               (((qh[half * 32u + l] >> 6) & 3) << 4)) - 32;
+                    out[b * 256u + half * 128u + l] = d * (float)sc[is_] * (float)q1;
+                    out[b * 256u + half * 128u + l + 32u] = d * (float)sc[is_ + 2] * (float)q2;
+                    out[b * 256u + half * 128u + l + 64u] = d * (float)sc[is_ + 4] * (float)q3;
+                    out[b * 256u + half * 128u + l + 96u] = d * (float)sc[is_ + 6] * (float)q4;
+                }
+            }
+        }
+        break;
+    }
     case DS4_TENSOR_MXFP4: {
         const uint64_t blocks = n / 32u;
         const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 17u;
@@ -83516,7 +83545,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      errlen);
     }
 #ifdef DS4_HAS_QWEN4_GPU
-    if (ds4_session_is_qwen4(s)) {
+    if (ds4_session_is_qwen4(s) && !ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         const int prepare_mtp = qwen4_mtp_prefill_resolve(s->qwen4_graph.mtp_R != NULL,
             s->qwen4_graph.ssd_streaming, getenv("DS4_QWEN4_MTP_PREFILL"));

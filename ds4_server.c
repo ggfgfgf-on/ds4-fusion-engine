@@ -13876,6 +13876,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
     if (prompt_sync_rc != 0) {
+        server_log(DS4_LOG_WARNING, "ds4-server: prompt sync failed: %s",
+                   err[0] ? err : "unknown error");
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);

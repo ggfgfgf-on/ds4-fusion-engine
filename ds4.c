@@ -80614,8 +80614,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * when no live session borrows it (a new context size once the
          * previous sessions closed) and keeps private transients otherwise. */
         const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
+        /* CUDA batch sharing is opt-in (DS4_QWEN4_CUDA_BATCH): the shared
+         * arena feeds the multi-session batch decode. */
         const bool share = e->share_session_prefill_workspace &&
-                           e->backend == DS4_BACKEND_METAL && !e->ssd_streaming;
+            (e->backend == DS4_BACKEND_METAL ||
+             (e->backend == DS4_BACKEND_CUDA &&
+              getenv("DS4_QWEN4_CUDA_BATCH") != NULL)) &&
+            !e->ssd_streaming;
         const bool arena_fits = e->qwen4_shared_workspace &&
             e->qwen4_shared_workspace->cap_tokens >= cap_tokens &&
             e->qwen4_shared_workspace->n_block_cap >= block_cap;
@@ -87592,9 +87597,11 @@ static int ds4_sessions_eval_batch_native(
         glm53_graph_native_session_batch_supported(items, count);
 #ifdef DS4_HAS_QWEN4_METAL
     const bool native_qwen4 = ok && !prefill &&
-        ds4_session_is_qwen4(items[0].session);
+        ds4_session_is_qwen4(items[0].session) && e->qwen4_shared_workspace != NULL;
 #else
-    const bool native_qwen4 = false;
+    const bool native_qwen4 = ok && !prefill &&
+        ds4_session_is_qwen4(items[0].session) && e->qwen4_shared_workspace != NULL &&
+        getenv("DS4_QWEN4_CUDA_BATCH") != NULL;
 #endif
     const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);

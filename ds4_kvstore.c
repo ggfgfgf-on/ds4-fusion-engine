@@ -1240,7 +1240,12 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
                                            ds4_session_ctx(session));
-    if (idx < 0) return 0;
+    if (idx < 0) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache miss text quant=%d entries=%d (no prefix match)",
+                kv_log_name(kc), quant_bits, kc->len);
+        return 0;
+    }
 
     ds4_kvstore_entry e = kc->entry[idx];
     char *path = kv_xstrdup(e.path);

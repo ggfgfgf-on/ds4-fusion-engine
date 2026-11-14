@@ -63303,8 +63303,7 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
-                                          DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
+        ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) != 0;
     }
     if (ok) ok = qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
     return ok;
@@ -63939,11 +63938,38 @@ static bool qwen4_graph_ffn_dense(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         !qwen4_gemv(g->kp, m, l->ffn_up, g->mixed, T)) {
         return false;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        ds4_gpu_synchronize();
+        float probe[8], probeb[8];
+        ds4_gpu_tensor_read(g->qg, 0, probe, 8u * sizeof(float));
+        ds4_gpu_tensor_read(g->kp, 0, probeb, 8u * sizeof(float));
+        fprintf(stderr, "ds4: ffn gate: %f %f %f %f %f %f %f %f\n", probe[0], probe[1],
+                probe[2], probe[3], probe[4], probe[5], probe[6], probe[7]);
+        fprintf(stderr, "ds4: ffn up:   %f %f %f %f %f %f %f %f\n", probeb[0], probeb[1],
+                probeb[2], probeb[3], probeb[4], probeb[5], probeb[6], probeb[7]);
+        fflush(stderr);
+    }
     if (!ds4_gpu_qwen4_ffn_dense_act_tensor(g->kp, g->qg, T, DS4_N_FF_DENSE)) {
         return false;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        ds4_gpu_synchronize();
+        float probe[8];
+        ds4_gpu_tensor_read(g->kp, 0, probe, 8u * sizeof(float));
+        fprintf(stderr, "ds4: ffn post-act: %f %f %f %f %f %f %f %f\n", probe[0], probe[1],
+                probe[2], probe[3], probe[4], probe[5], probe[6], probe[7]);
+        fflush(stderr);
+    }
     if (!qwen4_gemv(g->attn_o, m, l->ffn_down, g->kp, T)) {
         return false;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        ds4_gpu_synchronize();
+        float probe[8];
+        ds4_gpu_tensor_read(g->attn_o, 0, probe, 8u * sizeof(float));
+        fprintf(stderr, "ds4: ffn post-down: %f %f %f %f %f %f %f %f\n", probe[0], probe[1],
+                probe[2], probe[3], probe[4], probe[5], probe[6], probe[7]);
+        fflush(stderr);
     }
     return ds4_gpu_qwen4_residual_add_tensor(g->R, g->attn_o, T, DS4_N_EMBD) != 0;
 }
@@ -86065,7 +86091,8 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
     }
     return ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size,
                                         l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD,
-                                        DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                                        DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS,
+                                        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) != 0 &&
            qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
 }
 
@@ -86456,8 +86483,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                                                              grows, (uint32_t)count, T, DS4_N_LIN_K_HEAD,
                                                              DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV_DIM,
                                                              (uint32_t)v_dim) &&
-                         ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
-                                                      DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+                         ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) != 0 &&
                          qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
         } else if (ok) {
             ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&

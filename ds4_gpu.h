@@ -3847,7 +3847,8 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps);
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps,
+        bool swish);
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,

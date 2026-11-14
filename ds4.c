@@ -85734,7 +85734,9 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
                                          const ds4_model *m, const ds4_weights *w,
                                          ds4_qwen4_gpu_graph *g,
                                          uint32_t *ids) {
-    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
+    const uint32_t E = DS4_N_EMBD;
+    const uint32_t hc = DS4_N_HC ? DS4_N_HC : 1u; /* qwen35: single stream */
+    const uint32_t hc_dim = E * hc;
     float *row = g->host_row;
     for (int i = 0; i < count; i++) {
         ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
@@ -85745,7 +85747,9 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
         qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
         pos3[3] = 0;
         if (!ds4_gpu_tensor_write(rg->pos3, (uint64_t)rg->pos * 16u, pos3, 16u)) return false;
-        qwen4_ple_step(items[i].token, rg->ple_prev, ids + (uint64_t)i * DS4_N_PLE_HEADS);
+        if (DS4_N_PLE_HEADS != 0) {
+            qwen4_ple_step(items[i].token, rg->ple_prev, ids + (uint64_t)i * DS4_N_PLE_HEADS);
+        }
     }
     return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)count * hc_dim * sizeof(float)) != 0;
 }
@@ -85923,11 +85927,14 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
 static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                   ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t T) {
+    const bool qwen35 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
     bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
               qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
-              qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
-              qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
-              qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+              qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T);
+    if (ok && !qwen35) {
+        ok = qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
+             qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    }
     const bool rows_path = getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
                            getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
                            (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
@@ -86076,9 +86083,16 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     }
     /* The output matrix is the single largest weight read of a decode step,
      * so it serves every row in one pass. */
-    if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down,
-                                    w->output_hc_up, NULL, T) &&
-                 qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
+    if (ok && qwen35) {
+        ok = ds4_gpu_rms_norm_weight_tensor(g->mixed, g->R, m->map, m->size,
+                                            w->output_norm->abs_offset, T,
+                                            DS4_N_EMBD, DS4_RMS_EPS) &&
+             qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
+    } else if (ok) {
+        ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down,
+                                w->output_hc_up, NULL, T) &&
+             qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
+    }
 
     if (timing) {
         fprintf(stderr, "ds4: Qwen3.8 batch(T=%u) ms: stage %.1f ple %.1f hc_attn %.1f "

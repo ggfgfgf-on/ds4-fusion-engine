@@ -68541,7 +68541,14 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
+#ifdef _WIN32
+    char tmpl[1024];
+    const char *tdir = getenv("TEMP");
+    if (!tdir || !tdir[0]) tdir = ".";
+    snprintf(tmpl, sizeof(tmpl), "%s\\ds4-session-payload.XXXXXX", tdir);
+#else
     char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+#endif
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");

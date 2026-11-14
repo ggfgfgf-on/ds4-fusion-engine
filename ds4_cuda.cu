@@ -4421,6 +4421,52 @@ extern "C" int ds4_gpu_probe_sampled_ce(
 /* Forward decl: dp4a/plain dot helper defined later in this file. */
 __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a);
 
+/* qwen35 dense FFN: up = swiglu(gate) * up, elementwise. */
+__global__ static void qwen4_ffn_dense_act_kernel(
+        float *up, const float *gate, uint32_t n, uint32_t ff_dim) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const uint32_t row = i / ff_dim;
+        const uint32_t col = i % ff_dim;
+        const float x = gate[(uint64_t)row * ff_dim + col];
+        const float s = x / (1.0f + expf(-x)); /* swiglu */
+        up[i] *= s;
+    }
+}
+
+extern "C" int ds4_gpu_qwen4_ffn_dense_act_tensor(
+        ds4_gpu_tensor *up, const ds4_gpu_tensor *gate,
+        uint32_t n_rows, uint32_t ff_dim) {
+    if (!up || !gate || n_rows == 0 || ff_dim == 0) return 0;
+    if (up->bytes < (uint64_t)n_rows * ff_dim * sizeof(float) ||
+        gate->bytes < (uint64_t)n_rows * ff_dim * sizeof(float)) return 0;
+    const uint32_t n = n_rows * ff_dim;
+    qwen4_ffn_dense_act_kernel<<<(n + 255u) / 256u, 256u>>>(
+            (float *)up->ptr, (const float *)gate->ptr, n, ff_dim);
+    return cuda_ok(cudaGetLastError(), "qwen4 dense ffn act launch");
+}
+
+/* qwen35 residual: R += layer_out, elementwise per row. */
+__global__ static void qwen4_residual_add_kernel(
+        float *r, const float *out, uint32_t n) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        r[i] += out[i];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4_residual_add_tensor(
+        ds4_gpu_tensor *r, const ds4_gpu_tensor *out,
+        uint32_t n_rows, uint32_t embd) {
+    if (!r || !out || n_rows == 0 || embd == 0) return 0;
+    if (r->bytes < (uint64_t)n_rows * embd * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * embd * sizeof(float)) return 0;
+    const uint32_t n = n_rows * embd;
+    qwen4_residual_add_kernel<<<(n + 255u) / 256u, 256u>>>(
+            (float *)r->ptr, (const float *)out->ptr, n);
+    return cuda_ok(cudaGetLastError(), "qwen4 residual add launch");
+}
+
 extern "C" int ds4_gpu_stage_model_range_owned(
         const void *model_map,
         uint64_t    offset,

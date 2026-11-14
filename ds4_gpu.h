@@ -4045,3 +4045,12 @@ int ds4_gpu_qwen4_mtp_combine_tensor(
 #endif
 
 #endif
+
+/* qwen35 dense FFN: swiglu activation + residual add. */
+int ds4_gpu_qwen4_ffn_dense_act_tensor(
+        ds4_gpu_tensor *up, const ds4_gpu_tensor *gate,
+        uint32_t n_rows, uint32_t ff_dim);
+int ds4_gpu_qwen4_residual_add_tensor(
+        ds4_gpu_tensor *r, const ds4_gpu_tensor *out,
+        uint32_t n_rows, uint32_t embd);
+

@@ -1234,7 +1234,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
+    /* Dense models (qwen35) report 0 routed bits; their KV is plain FP32. */
+    if (!ds4_kvstore_quant_bits_supported(quant_bits) && quant_bits != 0) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,

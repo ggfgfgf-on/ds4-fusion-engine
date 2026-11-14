@@ -16041,7 +16041,9 @@ int main(int argc, char **argv) {
         prefill_opt.dspark = false;
         prefill_opt.dspark_strict = false;
         prefill_opt.dspark_exact_sampling = false;
-        prefill_opt.ssd_streaming = true;
+        /* Resident models (e.g. Qwen3.8-27B, 15.7GB) prefill without the SSD
+         * streaming; the V4's 80GB needs --ssd-streaming on the CLI. */
+        prefill_opt.ssd_streaming = cfg.engine.ssd_streaming;
         prefill_opt.ssd_streaming_cold = false;
         /* --ssd-streaming-cache-experts N|NGB is honored (e.g. a small
          * dynamic cache frees real VRAM for the incremental slot table on

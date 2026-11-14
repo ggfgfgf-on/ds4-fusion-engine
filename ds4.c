@@ -77348,6 +77348,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_HAS_QWEN4_GPU
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
 #endif
+            /* qwen35 has a full CPU driver (hybrid decode). */
+            (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && e->backend == DS4_BACKEND_CPU) ||
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||

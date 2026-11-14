@@ -62774,6 +62774,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        fprintf(stderr, "ds4: qwen35 graph alloc enter ctx=%u cap=%u\n", ctx_cap, cap_tokens);
+    }
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -62863,6 +62866,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
     g->host_row = xmalloc(T * hc_dim * sizeof(float));
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        fprintf(stderr, "ds4: qwen35 alloc scratch done ok=%d\n", (int)ok);
+    }
 
 private_state:
     /* The PLE conv history carries across calls and the logits belong to the
@@ -62904,12 +62910,18 @@ private_state:
             g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
             g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
-            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
+            /* qwen35: no indexer; keep a 1-slot placeholder (0-byte CUDA allocs crash). */
+            g->layer_block_key[il] = ds4_gpu_tensor_alloc(
+                (uint64_t)g->n_block_cap *
+                (DS4_N_INDEXER_HEAD_DIM ? DS4_N_INDEXER_HEAD_DIM : 1u) * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
     }
     g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
     ok = ok && g->pos3;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+        fprintf(stderr, "ds4: qwen35 alloc loop done ok=%d\n", (int)ok);
+    }
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
     if (!ok) {
@@ -80043,6 +80055,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->qwen4_graph.ssd_streaming = e->ssd_streaming;
         qwen4_graph_reset(&s->qwen4_graph);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && getenv("DS4_QWEN35_DEBUG")) {
+            fprintf(stderr, "ds4: qwen35 session graph ready\n");
+        }
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
                                        e->directional_steering_attn_scale,

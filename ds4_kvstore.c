@@ -444,7 +444,8 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
+    return e->tokens != 0 &&
+           (ds4_kvstore_quant_bits_supported(e->quant_bits) || e->quant_bits == 0);
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -477,17 +478,29 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
     DIR *d = opendir(kc->dir);
-    if (!d) return;
+    if (!d) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache refresh opendir failed dir=[%s]: %s",
+                kv_log_name(kc), kc->dir ? kc->dir : "(null)", strerror(errno));
+        return;
+    }
     struct dirent *de;
+    int seen = 0, parsed = 0;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        seen++;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        if (ds4_kvstore_read_entry_file(path, sha, &e)) { kv_cache_push(kc, e); parsed++; }
         free(path);
     }
     closedir(d);
+    if (seen != parsed) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache refresh dir=[%s] seen=%d parsed=%d",
+                kv_log_name(kc), kc->dir, seen, parsed);
+    }
 }
 
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {

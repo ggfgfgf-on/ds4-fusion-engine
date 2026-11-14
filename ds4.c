@@ -68746,8 +68746,34 @@ static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint3
         payload_set_err(err, errlen, "qwen35 CPU state is not ready for restore");
         return 1;
     }
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t tok;
+        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (tok >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "KV checkpoint token id is outside the vocabulary");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)tok);
+    }
+    s->checkpoint_valid = false;
+    if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+                           remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    uint32_t mtp_rows = 0, tail = 0;
+    int rc = payload_read_u32(fp, &mtp_rows, remaining, err, errlen);
+    if (!rc && !legacy) rc = payload_read_u32(fp, &tail, remaining, err, errlen);
+    if (rc) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             rc = payload_read_bytes(fp, s->qwen35_cpu_ssm_state[il],
@@ -68761,15 +68787,30 @@ static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint3
                                         remaining, err, errlen);
             }
         } else {
-            const uint64_t kvb = (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
-            rc = payload_read_bytes(fp, s->qwen35_cpu_kv[il], kvb, remaining, err, errlen);
-            if (rc == 0) {
-                rc = payload_read_bytes(fp,
-                                        s->qwen35_cpu_kv[il] +
-                                                (uint64_t)s->ctx_size * DS4_N_HEAD_KV *
-                                                        DS4_N_HEAD_DIM,
-                                        kvb, remaining, err, errlen);
+            /* The payload stores the KV caches as FP16 halves. */
+            const uint64_t nkv = (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+            uint16_t *half_buf = (uint16_t *)xmalloc(nkv * sizeof(uint16_t));
+            if (!half_buf) {
+                rc = 1;
+                payload_set_err(err, errlen, "out of memory staging KV halves");
+                break;
             }
+            rc = payload_read_bytes(fp, half_buf, nkv * sizeof(uint16_t),
+                                    remaining, err, errlen);
+            if (rc == 0) {
+                for (uint64_t i = 0; i < nkv; i++)
+                    s->qwen35_cpu_kv[il][i] = f16_to_f32(half_buf[i]);
+            }
+            if (rc == 0) {
+                rc = payload_read_bytes(fp, half_buf, nkv * sizeof(uint16_t),
+                                        remaining, err, errlen);
+            }
+            if (rc == 0) {
+                for (uint64_t i = 0; i < nkv; i++)
+                    s->qwen35_cpu_kv[il][(uint64_t)s->ctx_size * DS4_N_HEAD_KV * DS4_N_HEAD_DIM + i] =
+                            f16_to_f32(half_buf[i]);
+            }
+            free(half_buf);
         }
     }
     if (rc == 0) {
@@ -68789,6 +68830,14 @@ static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint3
                 rc = payload_read_bytes(fp, buf, 16u, remaining, err, errlen);
             }
         }
+    }
+    if (rc == 0) {
+        token_vec_free(&s->checkpoint);
+        s->checkpoint = new_checkpoint;
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+    } else {
+        token_vec_free(&new_checkpoint);
     }
     free(buf);
     return rc;

@@ -68726,6 +68726,74 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
     return rc;
 }
 
+static int qwen35_session_load_payload_cpu(ds4_session *s, FILE *fp, const uint32_t *h,
+                                           uint64_t *remaining, char *err, size_t errlen) {
+    /* Hybrid handoff: the GPU session's payload, restored into the CPU
+     * decode state (the same layout: lin_state -> ssm_state, lin_hist ->
+     * conv_hist, k/v -> qwen35_cpu_kv; the qwen35 has no indexer/PLE rows). */
+    const uint32_t rows = h[7];
+    const bool legacy = h[12] == DS4_QWEN4_PAYLOAD_V2;
+    if ((!legacy && h[12] != DS4_QWEN4_PAYLOAD_TAG) || h[8] != DS4_N_LAYER ||
+        h[9] != DS4_N_HEAD_DIM || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (rows > (uint32_t)s->ctx_size) {
+        payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
+        return 1;
+    }
+    if (!s->qwen35_cpu_ready) {
+        payload_set_err(err, errlen, "qwen35 CPU state is not ready for restore");
+        return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) {
+            rc = payload_read_bytes(fp, s->qwen35_cpu_ssm_state[il],
+                                    (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                            DS4_N_LIN_HEAD_DIM * sizeof(float),
+                                    remaining, err, errlen);
+            if (rc == 0) {
+                rc = payload_read_bytes(fp, s->qwen35_cpu_conv_hist[il],
+                                        (uint64_t)(DS4_N_LIN_CONV - 1u) *
+                                                DS4_N_LIN_CONV_DIM * sizeof(float),
+                                        remaining, err, errlen);
+            }
+        } else {
+            const uint64_t kvb = (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+            rc = payload_read_bytes(fp, s->qwen35_cpu_kv[il], kvb, remaining, err, errlen);
+            if (rc == 0) {
+                rc = payload_read_bytes(fp,
+                                        s->qwen35_cpu_kv[il] +
+                                                (uint64_t)s->ctx_size * DS4_N_HEAD_KV *
+                                                        DS4_N_HEAD_DIM,
+                                        kvb, remaining, err, errlen);
+            }
+        }
+    }
+    if (rc == 0) {
+        /* the qwen35 has no PLE rows; consume the zero-length spans. */
+        uint32_t ple_prev[DS4_MAX_PLE_NGRAM];
+        for (uint32_t i = 0; i < DS4_MAX_PLE_NGRAM; i++) ple_prev[i] = 0;
+        for (uint32_t i = 0; rc == 0 && i < DS4_MAX_PLE_NGRAM; i++) {
+            rc = payload_read_u32(fp, &ple_prev[i], remaining, err, errlen);
+        }
+        if (rc == 0) {
+            uint32_t mrope_delta = 0;
+            rc = payload_read_u32(fp, &mrope_delta, remaining, err, errlen);
+        }
+        if (rc == 0) {
+            /* pos3 rows: consume and discard (the CPU driver recomputes). */
+            for (uint32_t r = 0; rc == 0 && r < rows; r++) {
+                rc = payload_read_bytes(fp, buf, 16u, remaining, err, errlen);
+            }
+        }
+    }
+    free(buf);
+    return rc;
+}
+
 static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                       char *err, size_t errlen) {
     if (!s->qwen4_graph_ready) {
@@ -69259,6 +69327,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "graph backend support is not compiled in");
         return 1;
 #else
+        if (ds4_session_is_cpu(s) && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+            return qwen35_session_load_payload_cpu(s, fp, h, &remaining, err, errlen);
+        }
         return qwen4_session_load_payload(s, fp, h, &remaining, err, errlen);
 #endif
     }

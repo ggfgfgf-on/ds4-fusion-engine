@@ -83706,6 +83706,24 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 0;
         }
 
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+            /* Fresh CPU sync for the qwen35: the same per-token forward as
+             * the incremental path, from an empty checkpoint. */
+            for (int i = 0; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                qwen35_cpu_forward_token(s->logits, &e->model, &e->weights,
+                                         s, prompt->v[i], (uint32_t)i);
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            return 0;
+        }
+
         session_cpu_reset_cache(s);
         prefill_layer_major_cpu(s->logits,
                                 &e->model,

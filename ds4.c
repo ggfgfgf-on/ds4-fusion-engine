@@ -66077,6 +66077,13 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    /* qwen35 CPU decode state (hybrid): per-GDN-layer conv history
+     * ((conv-1) x conv_dim) and the ssm state (Hv x D x D). */
+    float *qwen35_cpu_conv_hist[DS4_MAX_LAYER];
+    float *qwen35_cpu_ssm_state[DS4_MAX_LAYER];
+    float *qwen35_cpu_kv[DS4_MAX_LAYER]; /* (cap x KV x HD) k and v halves */
+    float *qwen35_cpu_buf[12]; /* scratch: qkv,z,tmp,lin_o,ff_a,ff_b,blk,xn,q,k,v,score */
+    bool qwen35_cpu_ready;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -73229,6 +73236,200 @@ static void qwen4_ref_matvec_rows(
 
 static void qwen4_ref_matvec(const ds4_model *m, const ds4_tensor *w, const float *x, float *out) {
     qwen4_ref_matvec_rows(m, w, 0, w->ndim >= 2 ? w->dim[1] : 1u, x, out);
+}
+
+/* qwen35 rope: plain rotary over DS4_N_ROT dims, freq base 10M. */
+static void qwen4_ref_rms(float *out, const float *x, const float *g, uint32_t n, float eps);
+static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t);
+static void qwen4_ref_grouped_rms(float *out, const float *x, const float *g,
+                                  uint32_t groups, uint32_t n, float eps);
+
+static void qwen35_cpu_rope(float *row, int32_t pos) {
+    static float freq[32];
+    static bool init;
+    if (!init) {
+        init = true;
+        for (unsigned i = 0; i < DS4_N_ROT / 2u; i++)
+            freq[i] = powf(DS4_ROPE_FREQ_BASE, -2.0f * (float)i / (float)DS4_N_ROT);
+    }
+    for (unsigned i = 0; i < DS4_N_ROT / 2u; i++) {
+        const float theta = (float)pos * freq[i];
+        const float c = cosf(theta), sn = sinf(theta);
+        const float a = row[i], b = row[i + DS4_N_ROT / 2u];
+        row[i] = a * c - b * sn;
+        row[i + DS4_N_ROT / 2u] = a * sn + b * c;
+    }
+}
+
+static float qwen35_cpu_softplus(float x) {
+    return x > 20.0f ? x : log1pf(expf(x));
+}
+
+/* qwen35 CPU decode (hybrid): one token through the 64 trunk layers,
+ * mirroring the GPU graph's single-stream flow bit-for-bit:
+ *   attn_norm -> layer(GDN or gated GQA) -> residual
+ *   post_attn_norm -> dense FFN(silu) -> residual
+ * The GDN's output gate is silu(z) (the qwen35 form, see the GPU driver). */
+static void qwen35_cpu_forward_token(
+        float *logits, const ds4_model *m, const ds4_weights *w,
+        ds4_session *s, int token, uint32_t pos) {
+    const uint32_t E = DS4_N_EMBD;
+    const uint32_t C = DS4_N_LIN_CONV_DIM;
+    const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
+    const uint32_t KV = DS4_N_HEAD_KV, HD = DS4_N_HEAD_DIM, H = DS4_N_HEAD;
+    const uint32_t FF = DS4_N_FF_DENSE;
+    const float eps = DS4_RMS_EPS;
+    float *qkv = s->qwen35_cpu_buf[0];
+    float *z   = s->qwen35_cpu_buf[1];
+    float *tmp = s->qwen35_cpu_buf[2];
+    float *lin_o = s->qwen35_cpu_buf[3];
+    float *ff_a = s->qwen35_cpu_buf[4];
+    float *ff_b = s->qwen35_cpu_buf[5];
+    float *blk = s->qwen35_cpu_buf[6];
+    float *xn  = s->qwen35_cpu_buf[7];
+    float *q2  = s->qwen35_cpu_buf[8];
+    float *k2  = s->qwen35_cpu_buf[9];
+    float *v2  = s->qwen35_cpu_buf[10];
+    float *score = s->qwen35_cpu_buf[11];
+    float *gate = z; /* reuse the 6144-wide z slot for the attention gate */
+    float *ga = ff_a;  /* 48-wide views into the FFN slots (free during GDN) */
+    float *gb = ff_b;
+    float *cur = blk;
+
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, cur);
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t il = 0; il < n_trunk; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        qwen4_ref_rms(xn, cur, qwen4_ref_f32(m, l->attn_norm), E, eps);
+        if (ds4_qwen4_layer_is_linear(il)) {
+            /* GDN: qkv + gate projections, causal conv (silu), scan. */
+            qwen4_ref_matvec(m, l->lin_qkv, xn, qkv);
+            qwen4_ref_matvec(m, l->lin_gate, xn, z);
+            const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
+            float *hist = s->qwen35_cpu_conv_hist[il];
+            for (uint32_t c = 0; c < C; c++) {
+                float v = conv_w[c * 4u + 3u] * qkv[c];
+                for (uint32_t i = 0; i < DS4_N_LIN_CONV - 1u; i++)
+                    v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
+                for (uint32_t i = 0; i + 1u < DS4_N_LIN_CONV - 1u; i++)
+                    hist[(uint64_t)i * C + c] = hist[(uint64_t)(i + 1u) * C + c];
+                hist[(uint64_t)(DS4_N_LIN_CONV - 2u) * C + c] = qkv[c];
+                qkv[c] = v / (1.0f + expf(-v)); /* silu */
+            }
+            qwen4_ref_matvec(m, l->lin_alpha, xn, ga);
+            qwen4_ref_matvec(m, l->lin_beta, xn, gb);
+            const float *A = qwen4_ref_f32(m, l->lin_a);
+            const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
+            /* prep: per-head q/k norms + a/b parameters. */
+            for (uint32_t h = 0; h < Hk; h++) {
+                double ss = 0.0;
+                float *q = qkv + (uint64_t)h * D, *k = qkv + (uint64_t)(Hk + h) * D;
+                for (uint32_t i = 0; i < D; i++) { ss += (double)q[i] * q[i]; }
+                float qs = 1.0f / sqrtf((float)(ss / D) + 1e-6f) * (1.0f / sqrtf((float)D));
+                ss = 0.0;
+                for (uint32_t i = 0; i < D; i++) ss += (double)k[i] * k[i];
+                const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
+                for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
+            }
+            for (uint32_t h = 0; h < Hv; h++) {
+                const float sp = qwen35_cpu_softplus(ga[h] + bias[h]);
+                ga[h] = expf(A[h] * sp);
+                gb[h] = 1.0f / (1.0f + expf(-gb[h])); /* sigmoid */
+            }
+            /* scan: per (v-head, dim) recurrence. */
+            float *state = s->qwen35_cpu_ssm_state[il];
+            for (uint32_t h = 0; h < Hv; h++) {
+                const uint32_t kh = h % Hk;
+                const float decay = ga[h], beta = gb[h];
+                const float *k = qkv + (uint64_t)(Hk + kh) * D;
+                const float *q = qkv + (uint64_t)kh * D;
+                float *sv = state + (uint64_t)h * D * D;
+                for (uint32_t dv = 0; dv < D; dv++) {
+                    float *srow = sv + (uint64_t)dv * D;
+                    const float v = qkv[(uint64_t)(2u * Hk + h) * D + dv];
+                    float u = 0.0f;
+                    for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
+                    const float delta = (v - u) * beta;
+                    float o = 0.0f;
+                    for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
+                    lin_o[(uint64_t)h * D + dv] = o;
+                }
+            }
+            /* out: grouped RMS + weight + silu(z) gate, then lin_out. */
+            qwen4_ref_grouped_rms(tmp, lin_o, qwen4_ref_f32(m, l->lin_norm), Hv, D, eps);
+            for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
+                tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
+            }
+            qwen4_ref_matvec(m, l->lin_out, tmp, blk);
+        } else {
+            /* Full attention: q/k/v projections, per-head norms, rope, GQA. */
+            qwen4_ref_matvec(m, l->attn_q, xn, qkv); /* 2*H*HD: q + gate */
+            qwen4_ref_matvec(m, l->attn_k, xn, k2);
+            qwen4_ref_matvec(m, l->attn_v, xn, v2);
+            for (uint32_t h = 0; h < H; h++) {
+                qwen4_ref_rms(q2 + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD,
+                              qwen4_ref_f32(m, l->attn_q_norm), HD, eps);
+                gate[h * HD] = qkv[(uint64_t)h * 2u * HD + HD]; /* raw gate */
+            }
+            for (uint32_t h = 0; h < KV; h++) {
+                qwen4_ref_rms(k2 + (uint64_t)h * HD, k2 + (uint64_t)h * HD,
+                              qwen4_ref_f32(m, l->attn_k_norm), HD, eps);
+            }
+            /* rope (the qwen35 plain rotary, base 10M, 64 dims). */
+            for (uint32_t h = 0; h < H; h++)
+                qwen35_cpu_rope(q2 + (uint64_t)h * HD, (int32_t)pos);
+            for (uint32_t h = 0; h < KV; h++)
+                qwen35_cpu_rope(k2 + (uint64_t)h * HD, (int32_t)pos);
+            ds4_layer_cache *cache = &s->cpu_cache.layer[il];
+            (void)cache;
+            float *kv = s->qwen35_cpu_kv[il];
+            const uint32_t kv_cap = (uint32_t)s->ctx_size;
+            const uint32_t kv_pos = pos % kv_cap;
+            memcpy(kv + (uint64_t)kv_pos * KV * HD, k2, (size_t)KV * HD * sizeof(float));
+            memcpy(kv + (uint64_t)(kv_cap * KV * HD) + (uint64_t)kv_pos * KV * HD,
+                   v2, (size_t)KV * HD * sizeof(float));
+            const uint32_t visible = pos + 1u;
+            const float scale = 1.0f / sqrtf((float)HD);
+            for (uint32_t h = 0; h < H; h++) {
+                const uint32_t kh = h % KV;
+                for (uint32_t t = 0; t < visible; t++) {
+                    const uint32_t p = t % kv_cap;
+                    float d = 0.0f;
+                    for (uint32_t i = 0; i < HD; i++)
+                        d += q2[(uint64_t)h * HD + i] *
+                             kv[(uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+                    score[t] = d * scale;
+                }
+                float mx = score[0];
+                for (uint32_t t = 1; t < visible; t++) mx = fmaxf(mx, score[t]);
+                double ss = 0.0;
+                for (uint32_t t = 0; t < visible; t++) { score[t] = expf(score[t] - mx); ss += score[t]; }
+                for (uint32_t i = 0; i < HD; i++) {
+                    float o = 0.0f;
+                    for (uint32_t t = 0; t < visible; t++) {
+                        const uint32_t p = t % kv_cap;
+                        o += score[t] * kv[(uint64_t)(kv_cap * KV * HD) +
+                                            (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+                    }
+                    ff_b[(uint64_t)h * HD + i] = o / (float)ss *
+                            (1.0f / (1.0f + expf(-gate[h * HD + i])));
+                }
+            }
+            qwen4_ref_matvec(m, l->attn_output, ff_b, blk);
+        }
+        /* residual */
+        for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
+        /* dense FFN: post_attn_norm -> gate/up -> silu -> down -> residual */
+        qwen4_ref_rms(xn, cur, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+        qwen4_ref_matvec(m, l->ffn_gate, xn, ff_a);
+        qwen4_ref_matvec(m, l->ffn_up, xn, ff_b);
+        for (uint32_t i = 0; i < FF; i++)
+            ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
+        qwen4_ref_matvec(m, l->ffn_down, ff_b, blk);
+        for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
+    }
+    qwen4_ref_rms(xn, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
+    qwen4_ref_matvec(m, w->output, xn, logits);
 }
 
 static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {
@@ -80505,8 +80706,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
             return 1;
         }
-        if (ds4_model_is_qwen4()) {
-            fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) {
+            fprintf(stderr, "ds4: Qwen3.8 Flash-Next sessions require Metal or CUDA\n");
             return 1;
         }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
@@ -80520,6 +80721,41 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                      e->prefill_chunk);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        /* qwen35 CPU decode state: conv history + ssm state per GDN layer. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+            const uint64_t buf_sizes[12] = {
+                DS4_N_LIN_CONV_DIM,                  /* qkv */
+                (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* z/lin_o */
+                (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* tmp */
+                (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* lin_o */
+                DS4_N_FF_DENSE,                      /* ff_a (gate) */
+                DS4_N_FF_DENSE,                      /* ff_b (up/down in) */
+                DS4_N_EMBD,                          /* blk */
+                DS4_N_EMBD,                          /* xn */
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, /* q2 */
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, /* k2 */
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, /* v2 */
+                (uint64_t)ctx_size,                  /* score */
+            };
+            for (int b = 0; b < 12; b++)
+                s->qwen35_cpu_buf[b] = xmalloc(buf_sizes[b] * sizeof(float));
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (ds4_qwen4_layer_is_linear(il)) {
+                    s->qwen35_cpu_conv_hist[il] = xcalloc(
+                            (size_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM,
+                            sizeof(float));
+                    s->qwen35_cpu_ssm_state[il] = xcalloc(
+                            (size_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                    DS4_N_LIN_HEAD_DIM,
+                            sizeof(float));
+                } else {
+                    s->qwen35_cpu_kv[il] = xcalloc(
+                            (size_t)ctx_size * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u,
+                            sizeof(float));
+                }
+            }
+            s->qwen35_cpu_ready = true;
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -81024,6 +81260,14 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+        if (s->qwen35_cpu_ready) {
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                free(s->qwen35_cpu_conv_hist[il]);
+                free(s->qwen35_cpu_ssm_state[il]);
+                free(s->qwen35_cpu_kv[il]);
+            }
+            for (int b = 0; b < 12; b++) free(s->qwen35_cpu_buf[b]);
+        }
     }
 #ifndef DS4_NO_GPU
     else {
@@ -83294,16 +83538,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->mtp_draft_valid = false;
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                         &e->model,
-                                                         &e->weights,
-                                                         &s->cpu_cache,
-                                                         prompt->v[i],
-                                                         (uint32_t)s->checkpoint.len,
-                                                         e->directional_steering_dirs,
-                                                         e->directional_steering_attn_scale,
-                                                         e->directional_steering_ffn_scale,
-                                                         &s->cpu_scratch);
+                if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+                    qwen35_cpu_forward_token(s->logits, &e->model, &e->weights,
+                                             s, prompt->v[i],
+                                             (uint32_t)s->checkpoint.len);
+                } else {
+                    forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                             &e->model,
+                                                             &e->weights,
+                                                             &s->cpu_cache,
+                                                             prompt->v[i],
+                                                             (uint32_t)s->checkpoint.len,
+                                                             e->directional_steering_dirs,
+                                                             e->directional_steering_attn_scale,
+                                                             e->directional_steering_ffn_scale,
+                                                             &s->cpu_scratch);
+                }
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }
@@ -85409,16 +85659,21 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             }
         }
         ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+            qwen35_cpu_forward_token(s->logits, &e->model, &e->weights,
+                                     s, token, (uint32_t)s->checkpoint.len);
+        } else {
+            forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &s->cpu_cache,
+                                                     token,
+                                                     (uint32_t)s->checkpoint.len,
+                                                     e->directional_steering_dirs,
+                                                     e->directional_steering_attn_scale,
+                                                     e->directional_steering_ffn_scale,
+                                                     &s->cpu_scratch);
+        }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;

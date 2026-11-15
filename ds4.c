@@ -74156,11 +74156,12 @@ static void qwen35_cpu_forward_batch(
         s->qwen35_mtp_draft = dmx;
         s->qwen35_mtp_draft_valid = true;
         int prev = dmx;
-        float *hsrc = hb;
+        /* variant: keep the h norm from the trunk's own hidden for every chain
+         * step (the llama draft ctx keeps the h input at the last verified
+         * target's features and only advances the token). */
+        const float *hsrc = blk + (uint64_t)(n_tok - 1) * E;
         s->qwen35_mtp_chain_n = 0;
         for (int k = 0; k < 2; k++) {
-            /* the chain: the previous step's h_nextn (post-output-norm) is the
-             * next step's input hidden, exactly like llama's draft loop. */
             qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
                                      draft, hb);
             int cmx = 0;
@@ -74168,7 +74169,6 @@ static void qwen35_cpu_forward_batch(
                 if (draft[i] > draft[cmx]) cmx = i;
             s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
             prev = cmx;
-            hsrc = hb;
         }
         free(hb);
         free(draft);

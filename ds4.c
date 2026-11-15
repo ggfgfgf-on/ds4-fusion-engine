@@ -74173,14 +74173,25 @@ static void qwen35_cpu_forward_token(
     if (getenv("DS4_QWEN35_MTP_TEST")) {
         static int prev_draft = -1;
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-        qwen35_cpu_mtp_forward(m, w, s, cur, token, pos, draft);
+        /* The llama's h_nextn = the POST-output-norm hidden (the blk here). */
+        qwen35_cpu_mtp_forward(m, w, s, blk, token, pos, draft);
         int dmx = 0, lmx = 0;
+        int top5[5] = {0, 0, 0, 0, 0};
         for (int i = 1; i < DS4_N_VOCAB; i++) {
             if (draft[i] > draft[dmx]) dmx = i;
             if (logits[i] > logits[lmx]) lmx = i;
+            for (int t = 0; t < 5; t++) {
+                if (draft[i] > draft[top5[t]]) {
+                    for (int u = 4; u > t; u--) top5[u] = top5[u - 1];
+                    top5[t] = i;
+                    break;
+                }
+            }
         }
-        fprintf(stderr, "[mtp] pos=%u prev_hit=%d draft=%d main=%d\n",
-                pos, prev_draft >= 0 && prev_draft == lmx, dmx, lmx);
+        int in5 = 0;
+        for (int t = 0; t < 5; t++) if (top5[t] == lmx) in5 = 1;
+        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d\n",
+                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx);
         fflush(stderr);
         prev_draft = dmx;
         free(draft);

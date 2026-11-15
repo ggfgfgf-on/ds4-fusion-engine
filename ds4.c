@@ -73453,6 +73453,168 @@ typedef struct {
 /* Correct Q6_K x Q8_K dot: the engine's ds4_vec_dot_q6_K_q8_K omits the
  * -32 baseline correction (the bsums term), so the qwen35 path carries its
  * own. value = d*scale*(q-32) -> sum = d*(sum scale*q*y - 32*sum scale*bsum). */
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+static inline int32_t qwen35_hsum_i32(__m256i v) {
+    __m256i s = _mm256_add_epi32(v, _mm256_permute2x128_si256(v, v, 1));
+    __m128i lo = _mm256_castsi256_si128(s);
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2,3,0,1)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1,0,3,2)));
+    return _mm_cvtsi128_si32(lo);
+}
+
+static inline float qwen35_hsum_f32(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_shuffle_ps(s, s, _MM_SHUFFLE(2,3,0,1)));
+    s = _mm_add_ps(s, _mm_shuffle_ps(s, s, _MM_SHUFFLE(1,0,3,2)));
+    return _mm_cvtss_f32(s);
+}
+
+/* AVX2 Q4_K x Q8_K per block: 16-bit-lane nibble extraction (correct per-byte
+ * shifts) + madd, mirroring the scalar's exact integer math. */
+static float qwen35_dot_q4_K_q8_K_avx2(const block_q4_K *x, const block_q8_K *y) {
+    const float d = y->d * f16_to_f32(x->d);
+    const float dm = -y->d * f16_to_f32(x->dmin);
+    const uint8_t *qs = x->qs;
+    const int8_t *q8 = y->qs;
+    __m256i acc = _mm256_setzero_si256();
+    int64_t summs = 0;
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc_val, m_val;
+        q4_k_get_scale_min(j, x->scales, &sc_val, &m_val);
+        summs += (int64_t)m_val * ((int32_t)y->bsums[2*j] + (int32_t)y->bsums[2*j+1]);
+        const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
+        for (int c = 0; c < 2; c++) {
+            __m128i qb = _mm_loadu_si128((const __m128i *)(qs + byte_off + c*16));
+            __m256i q16 = _mm256_cvtepu8_epi16(qb);
+            q16 = _mm256_and_si256(_mm256_srli_epi16(q16, shift), _mm256_set1_epi16(0x0F));
+            q16 = _mm256_mullo_epi16(q16, _mm256_set1_epi16((short)sc_val));
+            __m128i q8b = _mm_loadu_si128((const __m128i *)(q8 + j*32 + c*16));
+            __m256i q8_16 = _mm256_cvtepi8_epi16(q8b);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q16, q8_16));
+        }
+    }
+    return d * (float)qwen35_hsum_i32(acc) + dm * (float)summs;
+}
+
+/* AVX2 Q6_K x Q8_K per block (the -32 baseline inline per value). */
+static float qwen35_dot_q6_K_q8_K_avx2(const block_q6_K *x, const block_q8_K *y) {
+    const float d = y->d * f16_to_f32(x->d);
+    const __m256i m0F = _mm256_set1_epi16(0x0F), m3 = _mm256_set1_epi16(3), m32 = _mm256_set1_epi16(32);
+    __m256i acc = _mm256_setzero_si256();
+    for (int half = 0; half < 2; half++) {
+        const uint8_t *ql = x->ql + (uint64_t)half * 64u;
+        const uint8_t *qh = x->qh + (uint64_t)half * 32u;
+        const int8_t *sc = x->scales + (uint64_t)half * 8u;
+        const int8_t *q8 = y->qs + (uint64_t)half * 128u;
+        for (int c = 0; c < 2; c++) {
+            const __m256i qll = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(ql + c*16)));
+            const __m256i qlh = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(ql + 32 + c*16)));
+            const __m256i qhv = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(qh + c*16)));
+            __m256i q1 = _mm256_or_si256(_mm256_and_si256(qll, m0F),
+                                         _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4));
+            __m256i q2 = _mm256_or_si256(_mm256_and_si256(qlh, m0F),
+                                         _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), m3), 4));
+            __m256i q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), m0F),
+                                         _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), m3), 4));
+            __m256i q4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), m0F),
+                                         _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), m3), 4));
+            q1 = _mm256_sub_epi16(q1, m32);
+            q2 = _mm256_sub_epi16(q2, m32);
+            q3 = _mm256_sub_epi16(q3, m32);
+            q4 = _mm256_sub_epi16(q4, m32);
+            q1 = _mm256_mullo_epi16(q1, _mm256_set1_epi16((short)sc[0 + c]));
+            q2 = _mm256_mullo_epi16(q2, _mm256_set1_epi16((short)sc[2 + c]));
+            q3 = _mm256_mullo_epi16(q3, _mm256_set1_epi16((short)sc[4 + c]));
+            q4 = _mm256_mullo_epi16(q4, _mm256_set1_epi16((short)sc[6 + c]));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q1, _mm256_cvtepi8_epi16(
+                    _mm_loadu_si128((const __m128i *)(q8 + 0 + c*16)))));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q2, _mm256_cvtepi8_epi16(
+                    _mm_loadu_si128((const __m128i *)(q8 + 32 + c*16)))));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q3, _mm256_cvtepi8_epi16(
+                    _mm_loadu_si128((const __m128i *)(q8 + 64 + c*16)))));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q4, _mm256_cvtepi8_epi16(
+                    _mm_loadu_si128((const __m128i *)(q8 + 96 + c*16)))));
+        }
+    }
+    return d * (float)qwen35_hsum_i32(acc);
+}
+
+/* AVX2 Q4_K x f32 per block (the exact path for the GDN). */
+static float qwen35_dot_q4_K_f32_avx2(const block_q4_K *x, const float *y) {
+    const float d = f16_to_f32(x->d), dmin = f16_to_f32(x->dmin);
+    __m256 sum = _mm256_setzero_ps();
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc_val, m_val;
+        q4_k_get_scale_min(j, x->scales, &sc_val, &m_val);
+        const __m256 svec = _mm256_set1_ps(d * (float)sc_val);
+        const __m256 mvec = _mm256_set1_ps(dmin * (float)m_val);
+        const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
+        const float *yb = y + j*32;
+        for (int c = 0; c < 2; c++) {
+            __m128i qb = _mm_loadu_si128((const __m128i *)(x->qs + byte_off + c*16));
+            __m256i q16 = _mm256_and_si256(
+                    _mm256_srli_epi16(_mm256_cvtepu8_epi16(qb), shift),
+                    _mm256_set1_epi16(0x0F));
+            __m256 flo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(q16)));
+            __m256 fhi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(q16, 1)));
+            flo = _mm256_sub_ps(_mm256_mul_ps(flo, svec), mvec);
+            fhi = _mm256_sub_ps(_mm256_mul_ps(fhi, svec), mvec);
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(flo, _mm256_loadu_ps(yb + c*16)));
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(fhi, _mm256_loadu_ps(yb + c*16 + 8)));
+        }
+    }
+    return qwen35_hsum_f32(sum);
+}
+
+/* AVX2 Q6_K x f32 per block (the exact path for the GDN). */
+static float qwen35_dot_q6_K_f32_avx2(const block_q6_K *x, const float *y) {
+    const float d = f16_to_f32(x->d);
+    const __m256i m0F = _mm256_set1_epi16(0x0F), m3 = _mm256_set1_epi16(3), m32 = _mm256_set1_epi16(32);
+    __m256 sum = _mm256_setzero_ps();
+    for (int half = 0; half < 2; half++) {
+        const uint8_t *ql = x->ql + (uint64_t)half * 64u;
+        const uint8_t *qh = x->qh + (uint64_t)half * 32u;
+        const int8_t *sc = x->scales + (uint64_t)half * 8u;
+        const float *yb = y + (uint64_t)half * 128u;
+        for (int c = 0; c < 2; c++) {
+            const __m256i qll = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(ql + c*16)));
+            const __m256i qlh = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(ql + 32 + c*16)));
+            const __m256i qhv = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(qh + c*16)));
+            __m256i q1 = _mm256_sub_epi16(_mm256_or_si256(
+                    _mm256_and_si256(qll, m0F), _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4)), m32);
+            __m256i q2 = _mm256_sub_epi16(_mm256_or_si256(
+                    _mm256_and_si256(qlh, m0F), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), m3), 4)), m32);
+            __m256i q3 = _mm256_sub_epi16(_mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(qll, 4), m0F), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), m3), 4)), m32);
+            __m256i q4 = _mm256_sub_epi16(_mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(qlh, 4), m0F), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), m3), 4)), m32);
+            const __m256 s1 = _mm256_set1_ps(d * (float)sc[0 + c]);
+            const __m256 s2 = _mm256_set1_ps(d * (float)sc[2 + c]);
+            const __m256 s3 = _mm256_set1_ps(d * (float)sc[4 + c]);
+            const __m256 s4 = _mm256_set1_ps(d * (float)sc[6 + c]);
+            for (int h8 = 0; h8 < 2; h8++) {
+                const int o = h8 * 8;
+                __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(h8 ?
+                        _mm256_extracti128_si256(q1, 1) : _mm256_castsi256_si128(q1)));
+                __m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(h8 ?
+                        _mm256_extracti128_si256(q2, 1) : _mm256_castsi256_si128(q2)));
+                __m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(h8 ?
+                        _mm256_extracti128_si256(q3, 1) : _mm256_castsi256_si128(q3)));
+                __m256 f4 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(h8 ?
+                        _mm256_extracti128_si256(q4, 1) : _mm256_castsi256_si128(q4)));
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_mul_ps(f1, s1), _mm256_loadu_ps(yb + 0 + c*16 + o)));
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_mul_ps(f2, s2), _mm256_loadu_ps(yb + 32 + c*16 + o)));
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_mul_ps(f3, s3), _mm256_loadu_ps(yb + 64 + c*16 + o)));
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_mul_ps(f4, s4), _mm256_loadu_ps(yb + 96 + c*16 + o)));
+            }
+        }
+    }
+    return qwen35_hsum_f32(sum);
+}
+#endif
 static float qwen35_dot_q6_K_q8_K(const block_q6_K *x, const block_q8_K *y) {
     /* Direct per-position float accumulation mirroring the reference decode;
      * the reconstruction d*q8 reproduces the quantized activation. */
@@ -73480,6 +73642,40 @@ static float qwen35_dot_q6_K_q8_K(const block_q6_K *x, const block_q8_K *y) {
 
 static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
     qwen35_cpu_matvec_ctx *ctx = vctx;
+    const uint64_t blocks = ctx->in_dim / QK_K;
+#if defined(__AVX2__)
+    if (ctx->exact) {
+        for (uint64_t row = row0; row < row1; row++) {
+            const uint8_t *rdata = ctx->data + row * ctx->row_bytes;
+            _mm_prefetch((const char *)(ctx->data + (row + 8u) * ctx->row_bytes), _MM_HINT_T0);
+            float acc = 0.0f;
+            if (ctx->type == DS4_TENSOR_Q4_K) {
+                for (uint64_t b = 0; b < blocks; b++)
+                    acc += qwen35_dot_q4_K_f32_avx2((const block_q4_K *)rdata + b,
+                                                    ctx->xraw + b * QK_K);
+            } else {
+                for (uint64_t b = 0; b < blocks; b++)
+                    acc += qwen35_dot_q6_K_f32_avx2((const block_q6_K *)rdata + b,
+                                                    ctx->xraw + b * QK_K);
+            }
+            ctx->out[row] = acc;
+        }
+        return;
+    }
+    for (uint64_t row = row0; row < row1; row++) {
+        const uint8_t *rdata = ctx->data + row * ctx->row_bytes;
+        _mm_prefetch((const char *)(ctx->data + (row + 8u) * ctx->row_bytes), _MM_HINT_T0);
+        float acc = 0.0f;
+        if (ctx->type == DS4_TENSOR_Q4_K) {
+            for (uint64_t b = 0; b < blocks; b++)
+                acc += qwen35_dot_q4_K_q8_K_avx2((const block_q4_K *)rdata + b, ctx->xq + b);
+        } else {
+            for (uint64_t b = 0; b < blocks; b++)
+                acc += qwen35_dot_q6_K_q8_K_avx2((const block_q6_K *)rdata + b, ctx->xq + b);
+        }
+        ctx->out[row] = acc;
+    }
+#else
     if (ctx->exact) {
         /* Exact f32 dots against the raw activations: no quantization noise,
          * used on the recurrent GDN path where noise compounds. */
@@ -73509,6 +73705,7 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
         }
         ctx->out[row] = acc;
     }
+#endif
 }
 
 static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const float *x,
@@ -73526,6 +73723,24 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
                                               ? (uint64_t)sizeof(block_q4_K)
                                               : (uint64_t)sizeof(block_q6_K));
     if (!exact) ds4_quantize_row_q8_K(x, q8_scratch, (int64_t)in_dim);
+    if (getenv("DS4_QWEN35_TRACE0") && rows > 5000u && !exact) {
+        float av = 0, sv = 0;
+        const uint8_t *r0 = (const uint8_t *)tensor_data(m, w);
+        const uint64_t nb = in_dim / QK_K;
+        for (uint64_t b = 0; b < nb; b++) {
+            if (w->type == DS4_TENSOR_Q4_K) {
+                av += qwen35_dot_q4_K_q8_K_avx2((const block_q4_K *)r0 + b, q8_scratch + b);
+                float svb = 0;
+                ds4_vec_dot_q4_K_q8_K((int)QK_K, &svb, (const block_q4_K *)r0 + b, q8_scratch + b);
+                sv += svb;
+            } else {
+                av += qwen35_dot_q6_K_q8_K_avx2((const block_q6_K *)r0 + b, q8_scratch + b);
+                sv += qwen35_dot_q6_K_q8_K((const block_q6_K *)r0 + b, q8_scratch + b);
+            }
+        }
+        fprintf(stderr, "[avxdbg] type=%u avx=%.4f scalar=%.4f\n", w->type, (double)av, (double)sv);
+        fflush(stderr);
+    }
     qwen35_cpu_matvec_ctx ctx = {
         .out = out,
         .data = (const uint8_t *)tensor_data(m, w),

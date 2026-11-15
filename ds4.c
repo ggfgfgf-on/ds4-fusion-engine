@@ -66145,6 +66145,8 @@ struct ds4_session {
     /* qwen35 CPU MTP speculation: the draft is produced by the forward that
      * just ran; the next eval compares it with the new argmax. */
     int qwen35_mtp_draft;
+    int qwen35_mtp_chain[2];
+    int qwen35_mtp_chain_n;
     bool qwen35_mtp_draft_valid;
 };
 
@@ -73947,9 +73949,10 @@ static void qwen35_cpu_matvec_batch(
  * conv/scan and the attention stay per-token (recurrent / causal by nature).
  * The logits are written for every position (n_tok rows) so the speculative
  * verify can check each draft against the target's argmax. */
-static void qwen35_cpu_mtp_forward(
+static void qwen35_cpu_mtp_forward_h(
         const ds4_model *m, const ds4_weights *w, ds4_session *s,
-        const float *h_hidden, int token, uint32_t pos, float *draft_logits);
+        const float *h_hidden, int token, uint32_t pos, float *draft_logits,
+        float *out_hidden);
 
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
@@ -74139,16 +74142,35 @@ static void qwen35_cpu_forward_batch(
                           s->qwen35_cpu_q8, false);
     }
     /* the MTP draft for the position after the batch's last token (blk holds
-     * that token's output-normed hidden). */
+     * that token's output-normed hidden), plus a short chained chain of drafts
+     * for the following positions (each step is a cheap nextn-layer pass). */
     if (n_tok > 0 && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-        qwen35_cpu_mtp_forward(m, w, s, blk + (uint64_t)(n_tok - 1) * E,
-                               tokens[n_tok - 1], pos0 + n_tok - 1, draft);
+        float *hb = xmalloc((size_t)E * sizeof(float));
+        float *hb2 = xmalloc((size_t)E * sizeof(float));
+        const uint32_t last_pos = pos0 + n_tok - 1;
+        qwen35_cpu_mtp_forward_h(m, w, s, blk + (uint64_t)(n_tok - 1) * E,
+                                 tokens[n_tok - 1], last_pos, draft, hb);
         int dmx = 0;
         for (int i = 1; i < (int)DS4_N_VOCAB; i++)
             if (draft[i] > draft[dmx]) dmx = i;
         s->qwen35_mtp_draft = dmx;
         s->qwen35_mtp_draft_valid = true;
+        int prev = dmx;
+        float *hsrc = hb, *hdst = hb2;
+        s->qwen35_mtp_chain_n = 0;
+        for (int k = 0; k < 2; k++) {
+            qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
+                                     draft, hdst);
+            int cmx = 0;
+            for (int i = 1; i < (int)DS4_N_VOCAB; i++)
+                if (draft[i] > draft[cmx]) cmx = i;
+            s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
+            prev = cmx;
+            float *t = hsrc; hsrc = hdst; hdst = t;
+        }
+        free(hb2);
+        free(hb);
         free(draft);
     }
     free(score); free(gb); free(ga); free(v2); free(k2); free(q2);
@@ -74164,9 +74186,10 @@ static void qwen35_cpu_forward_batch(
  *   KV) -> +residual -> post_norm -> dense FFN -> +residual -> head_norm ->
  *   shared head. The draft's K/V lands at pos+1 in the MTP layer's cache; the
  *   verify's main forward overwrites it before anything reads it back. */
-static void qwen35_cpu_mtp_forward(
+static void qwen35_cpu_mtp_forward_h(
         const ds4_model *m, const ds4_weights *w, ds4_session *s,
-        const float *h_hidden, int token, uint32_t pos, float *draft_logits) {
+        const float *h_hidden, int token, uint32_t pos, float *draft_logits,
+        float *out_hidden) {
     const uint32_t E = DS4_N_EMBD, KV = DS4_N_HEAD_KV, HD = DS4_N_HEAD_DIM;
     const uint32_t H = DS4_N_HEAD, FF = DS4_N_FF_DENSE;
     const float eps = DS4_RMS_EPS;
@@ -74259,8 +74282,15 @@ static void qwen35_cpu_mtp_forward(
     for (uint32_t i = 0; i < E; i++) blk[i] += xn[i];
 
     const ds4_tensor *head_norm_t = l->nextn_shared_head_norm ? l->nextn_shared_head_norm : w->output_norm;
+    if (out_hidden) memcpy(out_hidden, blk, (size_t)E * sizeof(float));
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, head_norm_t), E, eps);
     qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
+}
+
+static void qwen35_cpu_mtp_forward(
+        const ds4_model *m, const ds4_weights *w, ds4_session *s,
+        const float *h_hidden, int token, uint32_t pos, float *draft_logits) {
+    qwen35_cpu_mtp_forward_h(m, w, s, h_hidden, token, pos, draft_logits, NULL);
 }
 
 /* qwen35 CPU decode (hybrid): one token through the 64 trunk layers,
@@ -95082,26 +95112,85 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             const int t1 = ds4_session_argmax(s);
             const int d = s->qwen35_mtp_draft;
             if (t1 >= 0 && t1 != eos_token && d >= 0 && t1 == d) {
-                /* The MTP draft and the target argmax agree on the next token.
-                 * Run the verified token through the batched forward: it
-                 * advances the state, produces the logits and refreshes the
-                 * MTP draft for the following position. */
-                int toks[1] = { t1 };
-                float *lg = xmalloc((size_t)V * sizeof(float));
+                /* Batched verify over [t1] + the chained drafts. The batch
+                 * advances every token in one weight pass; the per-position
+                 * logits decide how many drafts survive. */
+                int toks[3];
+                int nt = 1;
+                toks[0] = t1;
+                /* The chain: d = the draft for pos0+1 (already verified equal
+                 * to t1), chain[0] = the draft for pos0+2. Verify one chained
+                 * draft only - the chain's own-hidden recursion degrades fast. */
+                if (d >= 0) toks[nt++] = d;
+                if (s->qwen35_mtp_chain_n > 0) toks[nt++] = s->qwen35_mtp_chain[0];
+                if (accepted_cap < nt) nt = accepted_cap;
+                if (nt < 1) nt = 1;
+                const uint64_t ssm_f = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                       DS4_N_LIN_HEAD_DIM;
+                const uint64_t conv_f = 3ull * DS4_N_LIN_CONV_DIM;
+                const uint32_t n_trunk_s = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+                const uint64_t per = ssm_f + conv_f;
+                uint32_t n_lin = 0;
+                for (uint32_t il = 0; il < n_trunk_s; il++)
+                    if (ds4_qwen4_layer_is_linear(il)) n_lin++;
+                float *snap = xmalloc((size_t)(n_lin * per) * sizeof(float));
+                uint32_t nl = 0;
+                for (uint32_t il = 0; il < n_trunk_s; il++) {
+                    if (!ds4_qwen4_layer_is_linear(il)) continue;
+                    memcpy(snap + (uint64_t)nl * per, s->qwen35_cpu_ssm_state[il],
+                           (size_t)ssm_f * sizeof(float));
+                    memcpy(snap + (uint64_t)nl * per + ssm_f, s->qwen35_cpu_conv_hist[il],
+                           (size_t)conv_f * sizeof(float));
+                    nl++;
+                }
+                float *lg = xmalloc((size_t)nt * (size_t)V * sizeof(float));
                 qwen35_cpu_forward_batch(lg, &e2->model, &e2->weights, s,
-                                         toks, 1, (uint32_t)s->checkpoint.len);
-                token_vec_push(&s->checkpoint, t1);
-                s->checkpoint_valid = true;
-                s->mtp_draft_valid = false;
-                int a1 = 0;
+                                         toks, (uint32_t)nt,
+                                         (uint32_t)s->checkpoint.len);
+                /* verify: the first position's argmax must match toks[1], etc. */
+                int n_ok = 1;
+                int a_prev = 0;
                 for (int i = 1; i < V; i++)
-                    if (lg[i] > lg[a1]) a1 = i;
-                accepted[0] = t1;
-                if (accepted_cap > 1) accepted[1] = a1;
-                memcpy(s->logits, lg, (size_t)V * sizeof(float));
+                    if (lg[i] > lg[a_prev]) a_prev = i;
+                while (n_ok < nt && a_prev == toks[n_ok]) {
+                    const int base = n_ok * V;
+                    int am = 0;
+                    for (int i = 1; i < V; i++)
+                        if (lg[base + i] > lg[base + am]) am = i;
+                    a_prev = am;
+                    n_ok++;
+                }
+                if (n_ok == nt) {
+                    for (int k = 0; k < n_ok; k++)
+                        token_vec_push(&s->checkpoint, toks[k]);
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    memcpy(s->logits, lg + (size_t)(nt - 1) * V, (size_t)V * sizeof(float));
+                    free(snap);
+                    free(lg);
+                    return n_ok;
+                }
+                /* partial accept: restore the state and re-run only the
+                 * survivors so their contribution lands exactly once. */
+                nl = 0;
+                for (uint32_t il = 0; il < n_trunk_s; il++) {
+                    if (!ds4_qwen4_layer_is_linear(il)) continue;
+                    memcpy(s->qwen35_cpu_ssm_state[il], snap + (uint64_t)nl * per,
+                           (size_t)ssm_f * sizeof(float));
+                    memcpy(s->qwen35_cpu_conv_hist[il], snap + (uint64_t)nl * per + ssm_f,
+                           (size_t)conv_f * sizeof(float));
+                    nl++;
+                }
+                free(snap);
                 free(lg);
-                /* only t1 is emitted: the sampled token must consume the
-                 * logits that predict the token AFTER t1. */
+                accepted[0] = t1;
+                if (n_ok > 1 && accepted_cap > 1) {
+                    accepted[1] = toks[1];
+                    if (ds4_session_eval(s, t1, err, errlen) != 0) return -1;
+                    if (ds4_session_eval(s, toks[1], err, errlen) != 0) return -1;
+                    return 2;
+                }
+                if (ds4_session_eval(s, t1, err, errlen) != 0) return -1;
                 return 1;
             }
         }

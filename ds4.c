@@ -74162,7 +74162,9 @@ static void qwen35_cpu_forward_batch(
         const float *hsrc = blk + (uint64_t)(n_tok - 1) * E;
         s->qwen35_mtp_chain_n = 0;
         for (int k = 0; k < 2; k++) {
-            qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
+            /* d covers last_pos+1 (the position the NEXT cycle's t1 fills), so
+             * the first batch element after t1 must target last_pos+2. */
+            qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 2u + (uint32_t)k,
                                      draft, NULL);
             int cmx = 0;
             for (int i = 1; i < (int)DS4_N_VOCAB; i++)
@@ -95166,10 +95168,14 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     memcpy(s->logits, lg + (size_t)(nt - 1) * V, (size_t)V * sizeof(float));
+                    if (getenv("DS4_QWEN35_SPEC_DBG"))
+                        fprintf(stderr, "[spec] nt=%d n_ok=%d FULL\n", nt, n_ok);
                     free(snap);
                     free(lg);
                     return n_ok;
                 }
+                if (getenv("DS4_QWEN35_SPEC_DBG"))
+                    fprintf(stderr, "[spec] nt=%d n_ok=%d PARTIAL\n", nt, n_ok);
                 /* partial accept: restore the state and re-run only the
                  * survivors so their contribution lands exactly once. */
                 nl = 0;

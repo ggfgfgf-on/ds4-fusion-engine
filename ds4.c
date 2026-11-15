@@ -66142,6 +66142,10 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    /* qwen35 CPU MTP speculation: the draft is produced by the forward that
+     * just ran; the next eval compares it with the new argmax. */
+    int qwen35_mtp_draft;
+    bool qwen35_mtp_draft_valid;
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
@@ -68112,6 +68116,11 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
+            e->backend == DS4_BACKEND_CPU) {
+            /* qwen35 dense nextn layer runs on the CPU spec path. */
+            return getenv("DS4_QWEN35_MTP_SPEC") != NULL ? 2 : 0;
+        }
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;
     }
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -74176,7 +74185,7 @@ static void qwen35_cpu_forward_token(
     PROF_TICK();
     qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
-    if (getenv("DS4_QWEN35_MTP_TEST")) {
+    if (getenv("DS4_QWEN35_MTP_TEST") || getenv("DS4_QWEN35_MTP_SPEC")) {
         static int prev_draft = -1;
         static float prev_h[8192];
         static bool have_prev_h = false;
@@ -74201,6 +74210,13 @@ static void qwen35_cpu_forward_token(
                     break;
                 }
             }
+        }
+        s->qwen35_mtp_draft = dmx;
+        s->qwen35_mtp_draft_valid = true;
+        if (!getenv("DS4_QWEN35_MTP_TEST")) {
+            prev_draft = dmx;
+            free(draft);
+            goto mtp_probe_done;
         }
         int in5 = 0;
         for (int t = 0; t < 5; t++) if (top5[t] == lmx) in5 = 1;
@@ -74230,6 +74246,7 @@ static void qwen35_cpu_forward_token(
         have_prev_h = true;
         free(draft);
     }
+mtp_probe_done:
     PROF_TOCK(t_mv);
     if (prof) {
         fprintf(stderr, "[prof] pos=%u mv=%.3f conv=%.3f ps=%.3f att=%.3f norm=%.3f total=%.3f\n",
@@ -94749,6 +94766,27 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng, accepted, err, errlen);
 #endif
     if (s->distributed || ds4_session_is_cpu(s)) {
+        if (ds4_session_is_cpu(s) && !s->distributed &&
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
+            s->qwen35_mtp_draft_valid && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
+            /* qwen35 CPU speculation: eval(first_token) produces the logits for
+             * the next position and the MTP draft for the position after it
+             * (stored by the forward). When that draft equals the newly
+             * produced argmax, the draft is confirmed - emit it without
+             * another argmax decision. */
+            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+            accepted[0] = first_token;
+            int n = 1;
+            while (n < accepted_cap) {
+                if (!s->qwen35_mtp_draft_valid) break;
+                const int t = ds4_session_argmax(s);
+                if (t < 0 || t == eos_token) break;
+                if (s->qwen35_mtp_draft != t) break;
+                accepted[n++] = t;
+                if (ds4_session_eval(s, t, err, errlen) != 0) return -1;
+            }
+            return n;
+        }
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;

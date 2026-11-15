@@ -73762,6 +73762,11 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
 static void qwen35_cpu_forward_token(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
+    const bool prof = getenv("DS4_QWEN35_PROFILE") != NULL;
+    double t_mv = 0, t_conv = 0, t_ps = 0, t_att = 0, t_norm = 0;
+    double _pt;
+#define PROF_TICK() do { _pt = prof ? now_sec() : 0.0; } while (0)
+#define PROF_TOCK(acc) do { if (prof) acc += now_sec() - _pt; } while (0)
     const uint32_t E = DS4_N_EMBD;
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
@@ -73793,11 +73798,16 @@ static void qwen35_cpu_forward_token(
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     for (uint32_t il = 0; il < n_trunk; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        PROF_TICK();
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->attn_norm), E, eps);
+        PROF_TOCK(t_norm);
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: qkv + gate projections, causal conv (silu), scan. */
+            PROF_TICK();
             qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
             qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
+            PROF_TOCK(t_mv);
+            PROF_TICK();
             const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
             float *hist = s->qwen35_cpu_conv_hist[il];
             for (uint32_t c = 0; c < C; c++) {
@@ -73809,6 +73819,8 @@ static void qwen35_cpu_forward_token(
                 hist[(uint64_t)(DS4_N_LIN_CONV - 2u) * C + c] = qkv[c];
                 qkv[c] = v / (1.0f + expf(-v)); /* silu */
             }
+            PROF_TOCK(t_conv);
+            PROF_TICK();
             qwen4_ref_matvec(m, l->lin_alpha, blk, ga);
             qwen4_ref_matvec(m, l->lin_beta, blk, gb);
             const float *A = qwen4_ref_f32(m, l->lin_a);
@@ -73848,9 +73860,11 @@ static void qwen35_cpu_forward_token(
                     lin_o[(uint64_t)h * D + dv] = o;
                 }
             }
+            PROF_TOCK(t_ps);
             /* out: per-head RMS with the SHARED 128-wide norm weight (the
              * Mamba-style norm reuses one weight vector across the v heads,
              * mirroring the GPU's gdn_out w[k0+i]) + silu(z) gate. */
+            PROF_TICK();
             const float *nw = qwen4_ref_f32(m, l->lin_norm);
             for (uint32_t s = 0; s < Hv; s++) {
                 qwen4_ref_rms(tmp + (uint64_t)s * D, lin_o + (uint64_t)s * D, nw, D, eps);
@@ -73858,19 +73872,25 @@ static void qwen35_cpu_forward_token(
             for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
                 tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
             }
+            PROF_TOCK(t_norm);
+            PROF_TICK();
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);
+            PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
-                const float *nw = qwen4_ref_f32(m, l->lin_norm);
+                const float *nw2 = qwen4_ref_f32(m, l->lin_norm);
                 fprintf(stderr, "[t0] p1857: tmp=%.4e lo=%.4e z=%.4f nw=%.4e | nw[0..3]=%.3f,%.3f,%.3f,%.3f\n",
-                        (double)tmp[1857], (double)lin_o[1857], z[1857], (double)nw[1857],
-                        nw[0], nw[1], nw[2], nw[3]);
+                        (double)tmp[1857], (double)lin_o[1857], z[1857], (double)nw2[1857],
+                        nw2[0], nw2[1], nw2[2], nw2[3]);
                 fflush(stderr);
             }
         } else {
             /* Full attention: q/k/v projections, per-head norms, rope, GQA. */
+            PROF_TICK();
             qwen35_cpu_matvec(m, l->attn_q, blk, qkv, s->qwen35_cpu_q8, false); /* 2*H*HD: q + gate */
             qwen35_cpu_matvec(m, l->attn_k, blk, k2, s->qwen35_cpu_q8, false);
             qwen35_cpu_matvec(m, l->attn_v, blk, v2, s->qwen35_cpu_q8, false);
+            PROF_TOCK(t_mv);
+            PROF_TICK();
             for (uint32_t h = 0; h < H; h++) {
                 qwen4_ref_rms(q2 + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD,
                               qwen4_ref_f32(m, l->attn_q_norm), HD, eps);
@@ -73921,18 +73941,10 @@ static void qwen35_cpu_forward_token(
                             (1.0f / (1.0f + expf(-gate[h * HD + i])));
                 }
             }
-            if (il == 3u && getenv("DS4_QWEN35_TRACE0")) {
-                fprintf(stderr, "[attn] v0=%.4f,%.4f,%.4f,%.4f preo=%.4f,%.4f,%.4f,%.4f\n",
-                        v2[0], v2[1], v2[2], v2[3], ff_b[0], ff_b[1], ff_b[2], ff_b[3]);
-                fflush(stderr);
-            }
+            PROF_TOCK(t_att);
+            PROF_TICK();
             qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, false);
-            if (il == 3u && getenv("DS4_QWEN35_TRACE0")) {
-                fprintf(stderr, "[attn] q0=%.4f,%.4f,%.4f,%.4f k0=%.4f,%.4f,%.4f,%.4f gate0=%.4f,%.4f o=%.4f,%.4f,%.4f,%.4f\n",
-                        q2[0], q2[1], q2[2], q2[3], k2[0], k2[1], k2[2], k2[3],
-                        gate[0], gate[1], blk[0], blk[1], blk[2], blk[3]);
-                fflush(stderr);
-            }
+            PROF_TOCK(t_mv);
         }
         {
             /* Layer-output dump matching the GPU's qwen4_graph_dump_last_attn
@@ -73951,22 +73963,30 @@ static void qwen35_cpu_forward_token(
         /* residual */
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
         /* dense FFN: post_attn_norm -> gate/up -> silu -> down -> residual */
+        PROF_TICK();
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+        PROF_TOCK(t_norm);
+        PROF_TICK();
         qwen35_cpu_matvec(m, l->ffn_gate, blk, ff_a, s->qwen35_cpu_q8, false);
         qwen35_cpu_matvec(m, l->ffn_up, blk, ff_b, s->qwen35_cpu_q8, false);
-        if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
-            fprintf(stderr, "[ffn] xn=%.4f,%.4f,%.4f,%.4f gate=%.4f,%.4f,%.4f,%.4f up=%.4f,%.4f,%.4f,%.4f\n",
-                    xn[0], xn[1], xn[2], xn[3], ff_a[0], ff_a[1], ff_a[2], ff_a[3],
-                    ff_b[0], ff_b[1], ff_b[2], ff_b[3]);
-            fflush(stderr);
-        }
+        PROF_TOCK(t_mv);
+        PROF_TICK();
         for (uint32_t i = 0; i < FF; i++)
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
         qwen35_cpu_matvec(m, l->ffn_down, ff_b, blk, s->qwen35_cpu_q8, false);
+        PROF_TOCK(t_mv);
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
     }
+    PROF_TICK();
     qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
+    PROF_TOCK(t_mv);
+    if (prof) {
+        fprintf(stderr, "[prof] pos=%u mv=%.3f conv=%.3f ps=%.3f att=%.3f norm=%.3f total=%.3f\n",
+                pos, t_mv, t_conv, t_ps, t_att, t_norm,
+                t_mv + t_conv + t_ps + t_att + t_norm);
+        fflush(stderr);
+    }
 }
 
 static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {

@@ -73896,6 +73896,10 @@ static void qwen35_cpu_mtp_forward(
     }
     for (uint32_t h = 0; h < H; h++) qwen35_cpu_rope(q2 + (uint64_t)h * HD, (int32_t)dpos);
     for (uint32_t h = 0; h < KV; h++) qwen35_cpu_rope(k2 + (uint64_t)h * HD, (int32_t)dpos);
+    if (getenv("DS4_QWEN35_MTP_NOATTN")) {
+        /* ablation: skip the attention, the eh_proj output feeds the FFN */
+        memcpy(blk, inpSA, E * sizeof(float));
+    } else {
     float *kv = s->qwen35_cpu_kv[DS4_N_LAYER - 1u];
     const uint32_t kv_cap = (uint32_t)s->ctx_size;
     const uint32_t kv_pos = dpos % kv_cap;
@@ -73931,6 +73935,7 @@ static void qwen35_cpu_mtp_forward(
     }
     qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t i = 0; i < E; i++) blk[i] += inpSA[i];
+    }
 
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
     qwen35_cpu_matvec(m, l->ffn_gate, xn, ff_a, s->qwen35_cpu_q8, mtp_exact);
@@ -74204,8 +74209,11 @@ static void qwen35_cpu_forward_token(
         double ss = 0.0;
         for (int i = 0; i < DS4_N_VOCAB; i++) ss += (double)expf(draft[i] - mx);
         const float p1 = expf(draft[dmx] - mx) / (float)ss;
-        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d p1=%.3f\n",
-                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx, (double)p1);
+        int rank = 1;
+        for (int i = 0; i < DS4_N_VOCAB; i++)
+            if (i != lmx && draft[i] > draft[lmx]) rank++;
+        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d p1=%.3f rank=%d\n",
+                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx, (double)p1, rank);
         fflush(stderr);
         prev_draft = dmx;
         memcpy(prev_h, blk, E * sizeof(float));

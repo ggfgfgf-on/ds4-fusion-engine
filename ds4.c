@@ -95176,6 +95176,23 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 }
                 if (getenv("DS4_QWEN35_SPEC_DBG"))
                     fprintf(stderr, "[spec] nt=%d n_ok=%d PARTIAL\n", nt, n_ok);
+                if (getenv("DS4_QWEN35_SPEC_DBG") && nt > 1) {
+                    /* how close is the first chained draft to the target's
+                     * argmax at that position? */
+                    const int base = V;
+                    int rank = 0;
+                    for (int i = 0; i < V; i++)
+                        if (lg[base + i] > lg[base + toks[1]]) rank++;
+                    int am = 0;
+                    for (int i = 1; i < V; i++)
+                        if (lg[base + i] > lg[base + am]) am = i;
+                    char *dt = ds4_token_text(e2, toks[1], NULL);
+                    char *at2 = ds4_token_text(e2, am, NULL);
+                    fprintf(stderr, "[spec]   draft '%s' (rank %d) vs target '%s'\n",
+                            dt ? dt : "?", rank, at2 ? at2 : "?");
+                    free(dt);
+                    free(at2);
+                }
                 /* partial accept: restore the state and re-run only the
                  * survivors so their contribution lands exactly once. */
                 nl = 0;

@@ -74212,8 +74212,18 @@ static void qwen35_cpu_forward_token(
         int rank = 1;
         for (int i = 0; i < DS4_N_VOCAB; i++)
             if (i != lmx && draft[i] > draft[lmx]) rank++;
-        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d p1=%.3f rank=%d\n",
-                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx, (double)p1, rank);
+        size_t mlen = 0;
+        char *mpc = ds4_token_text(s->engine, lmx, &mlen);
+        fprintf(stderr, "[mtp] pos=%u same_hit=%d draft=%d main=%d'%.*s' p1=%.3f rank=%d",
+                pos, dmx == lmx, dmx, lmx, (int)mlen, mpc, (double)p1, rank);
+        free(mpc);
+        for (int t = 0; t < 3; t++) {
+            size_t plen = 0;
+            char *pc = ds4_token_text(s->engine, top5[t], &plen);
+            fprintf(stderr, " t%d=%d '%.*s'", t, top5[t], (int)plen, pc);
+            free(pc);
+        }
+        fprintf(stderr, "\n");
         fflush(stderr);
         prev_draft = dmx;
         memcpy(prev_h, blk, E * sizeof(float));

@@ -73876,13 +73876,14 @@ static void qwen35_cpu_mtp_forward(
     qwen4_ref_row(m, w->token_embd, (uint64_t)token, qkv);
     qwen4_ref_rms(qkv, qkv, qwen4_ref_f32(m, l->nextn_enorm), E, eps);
     memcpy(qkv + E, xn, E * sizeof(float)); /* [e_norm; h_norm] */
-    qwen35_cpu_matvec(m, l->nextn_eh_proj, qkv, blk, s->qwen35_cpu_q8, false);
+    const bool mtp_exact = getenv("DS4_QWEN35_MTP_EXACT") != NULL;
+    qwen35_cpu_matvec(m, l->nextn_eh_proj, qkv, blk, s->qwen35_cpu_q8, mtp_exact);
     memcpy(inpSA, blk, E * sizeof(float));
 
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, l->attn_norm), E, eps);
-    qwen35_cpu_matvec(m, l->attn_q, xn, qkv, s->qwen35_cpu_q8, false);
-    qwen35_cpu_matvec(m, l->attn_k, xn, k2, s->qwen35_cpu_q8, false);
-    qwen35_cpu_matvec(m, l->attn_v, xn, v2, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->attn_q, xn, qkv, s->qwen35_cpu_q8, mtp_exact);
+    qwen35_cpu_matvec(m, l->attn_k, xn, k2, s->qwen35_cpu_q8, mtp_exact);
+    qwen35_cpu_matvec(m, l->attn_v, xn, v2, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t h = 0; h < H; h++) {
         qwen4_ref_rms(q2 + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD,
                       qwen4_ref_f32(m, l->attn_q_norm), HD, eps);
@@ -73901,7 +73902,7 @@ static void qwen35_cpu_mtp_forward(
     memcpy(kv + (uint64_t)kv_pos * KV * HD, k2, (size_t)KV * HD * sizeof(float));
     memcpy(kv + (uint64_t)(kv_cap * KV * HD) + (uint64_t)kv_pos * KV * HD,
            v2, (size_t)KV * HD * sizeof(float));
-    const uint32_t visible = dpos + 1u;
+    const uint32_t visible = getenv("DS4_QWEN35_MTP_SELFONLY") ? 1u : dpos + 1u;
     const float scale = 1.0f / sqrtf((float)HD);
     for (uint32_t h = 0; h < H; h++) {
         const uint32_t kh = h / (H / KV);
@@ -73928,20 +73929,20 @@ static void qwen35_cpu_mtp_forward(
                     (1.0f / (1.0f + expf(-gate[h * HD + i])));
         }
     }
-    qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t i = 0; i < E; i++) blk[i] += inpSA[i];
 
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
-    qwen35_cpu_matvec(m, l->ffn_gate, xn, ff_a, s->qwen35_cpu_q8, false);
-    qwen35_cpu_matvec(m, l->ffn_up, xn, ff_b, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->ffn_gate, xn, ff_a, s->qwen35_cpu_q8, mtp_exact);
+    qwen35_cpu_matvec(m, l->ffn_up, xn, ff_b, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t i = 0; i < FF; i++)
         ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
-    qwen35_cpu_matvec(m, l->ffn_down, ff_b, xn, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->ffn_down, ff_b, xn, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t i = 0; i < E; i++) blk[i] += xn[i];
 
     const ds4_tensor *head_norm_t = l->nextn_shared_head_norm ? l->nextn_shared_head_norm : w->output_norm;
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, head_norm_t), E, eps);
-    qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
 }
 
 /* qwen35 CPU decode (hybrid): one token through the 64 trunk layers,

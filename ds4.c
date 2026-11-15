@@ -74147,7 +74147,6 @@ static void qwen35_cpu_forward_batch(
     if (n_tok > 0 && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));
-        float *hb2 = xmalloc((size_t)E * sizeof(float));
         const uint32_t last_pos = pos0 + n_tok - 1;
         qwen35_cpu_mtp_forward_h(m, w, s, blk + (uint64_t)(n_tok - 1) * E,
                                  tokens[n_tok - 1], last_pos, draft, hb);
@@ -74157,19 +74156,20 @@ static void qwen35_cpu_forward_batch(
         s->qwen35_mtp_draft = dmx;
         s->qwen35_mtp_draft_valid = true;
         int prev = dmx;
-        float *hsrc = hb, *hdst = hb2;
+        /* the chained drafts run off the MAIN model's hidden state at the last
+         * position (post-output-norm - exactly what h_nextn means). Feeding the
+         * nextn layer's own output back degenerates within one step. */
+        const float *hsrc = blk + (uint64_t)(n_tok - 1) * E;
         s->qwen35_mtp_chain_n = 0;
         for (int k = 0; k < 2; k++) {
             qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
-                                     draft, hdst);
+                                     draft, NULL);
             int cmx = 0;
             for (int i = 1; i < (int)DS4_N_VOCAB; i++)
                 if (draft[i] > draft[cmx]) cmx = i;
             s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
             prev = cmx;
-            float *t = hsrc; hsrc = hdst; hdst = t;
         }
-        free(hb2);
         free(hb);
         free(draft);
     }
@@ -95118,11 +95118,11 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 int toks[3];
                 int nt = 1;
                 toks[0] = t1;
-                /* The chain: d = the draft for pos0+1 (already verified equal
-                 * to t1), chain[0] = the draft for pos0+2. Verify one chained
-                 * draft only - the chain's own-hidden recursion degrades fast. */
-                if (d >= 0) toks[nt++] = d;
+                /* d is the draft for pos0 (the same position as t1) - it is
+                 * only the ACCEPT CHECK, never a batch element. The batch's
+                 * extra tokens are the chained drafts for pos0+1, pos0+2. */
                 if (s->qwen35_mtp_chain_n > 0) toks[nt++] = s->qwen35_mtp_chain[0];
+                if (s->qwen35_mtp_chain_n > 1) toks[nt++] = s->qwen35_mtp_chain[1];
                 if (accepted_cap < nt) nt = accepted_cap;
                 if (nt < 1) nt = 1;
                 const uint64_t ssm_f = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *

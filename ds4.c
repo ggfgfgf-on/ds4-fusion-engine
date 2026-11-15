@@ -73443,9 +73443,11 @@ typedef struct {
     float *out;
     const uint8_t *data;
     const block_q8_K *xq;
+    const float *xraw;
     uint64_t in_dim;
     uint64_t row_bytes;
     uint32_t type;
+    bool exact;
 } qwen35_cpu_matvec_ctx;
 
 /* Correct Q6_K x Q8_K dot: the engine's ds4_vec_dot_q6_K_q8_K omits the
@@ -73478,6 +73480,20 @@ static float qwen35_dot_q6_K_q8_K(const block_q6_K *x, const block_q8_K *y) {
 
 static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
     qwen35_cpu_matvec_ctx *ctx = vctx;
+    if (ctx->exact) {
+        /* Exact f32 dots against the raw activations: no quantization noise,
+         * used on the recurrent GDN path where noise compounds. */
+        for (uint64_t row = row0; row < row1; row++) {
+            ctx->out[row] = ctx->type == DS4_TENSOR_Q4_K ?
+                ds4_vec_dot_q4_K_f32((int)ctx->in_dim,
+                                     (const block_q4_K *)(ctx->data + row * ctx->row_bytes),
+                                     ctx->xraw) :
+                ds4_vec_dot_q6_K_f32((int)ctx->in_dim,
+                                     (const block_q6_K *)(ctx->data + row * ctx->row_bytes),
+                                     ctx->xraw);
+        }
+        return;
+    }
     for (uint64_t row = row0; row < row1; row++) {
         float acc = 0.0f;
         if (ctx->type == DS4_TENSOR_Q4_K) {
@@ -73496,7 +73512,7 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
 }
 
 static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const float *x,
-                              float *out, block_q8_K *q8_scratch) {
+                              float *out, block_q8_K *q8_scratch, bool exact) {
     if (getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) ||
         w->dim[0] % QK_K != 0) {
@@ -73509,14 +73525,16 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
     const uint64_t row_bytes = blocks * (w->type == DS4_TENSOR_Q4_K
                                               ? (uint64_t)sizeof(block_q4_K)
                                               : (uint64_t)sizeof(block_q6_K));
-    ds4_quantize_row_q8_K(x, q8_scratch, (int64_t)in_dim);
+    if (!exact) ds4_quantize_row_q8_K(x, q8_scratch, (int64_t)in_dim);
     qwen35_cpu_matvec_ctx ctx = {
         .out = out,
         .data = (const uint8_t *)tensor_data(m, w),
         .xq = q8_scratch,
+        .xraw = x,
         .in_dim = in_dim,
         .row_bytes = row_bytes,
         .type = w->type,
+        .exact = exact,
     };
     ds4_parallel_for(rows, qwen35_cpu_matvec_worker, &ctx);
 }
@@ -73563,8 +73581,8 @@ static void qwen35_cpu_forward_token(
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->attn_norm), E, eps);
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: qkv + gate projections, causal conv (silu), scan. */
-            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8);
-            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8);
+            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
+            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
             const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
             float *hist = s->qwen35_cpu_conv_hist[il];
             for (uint32_t c = 0; c < C; c++) {
@@ -73625,7 +73643,7 @@ static void qwen35_cpu_forward_token(
             for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
                 tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
             }
-            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8);
+            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
                 const float *nw = qwen4_ref_f32(m, l->lin_norm);
                 fprintf(stderr, "[t0] p1857: tmp=%.4e lo=%.4e z=%.4f nw=%.4e | nw[0..3]=%.3f,%.3f,%.3f,%.3f\n",
@@ -73635,9 +73653,9 @@ static void qwen35_cpu_forward_token(
             }
         } else {
             /* Full attention: q/k/v projections, per-head norms, rope, GQA. */
-            qwen35_cpu_matvec(m, l->attn_q, blk, qkv, s->qwen35_cpu_q8); /* 2*H*HD: q + gate */
-            qwen35_cpu_matvec(m, l->attn_k, blk, k2, s->qwen35_cpu_q8);
-            qwen35_cpu_matvec(m, l->attn_v, blk, v2, s->qwen35_cpu_q8);
+            qwen35_cpu_matvec(m, l->attn_q, blk, qkv, s->qwen35_cpu_q8, false); /* 2*H*HD: q + gate */
+            qwen35_cpu_matvec(m, l->attn_k, blk, k2, s->qwen35_cpu_q8, false);
+            qwen35_cpu_matvec(m, l->attn_v, blk, v2, s->qwen35_cpu_q8, false);
             for (uint32_t h = 0; h < H; h++) {
                 qwen4_ref_rms(q2 + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD,
                               qwen4_ref_f32(m, l->attn_q_norm), HD, eps);
@@ -73693,7 +73711,7 @@ static void qwen35_cpu_forward_token(
                         v2[0], v2[1], v2[2], v2[3], ff_b[0], ff_b[1], ff_b[2], ff_b[3]);
                 fflush(stderr);
             }
-            qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8);
+            qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, false);
             if (il == 3u && getenv("DS4_QWEN35_TRACE0")) {
                 fprintf(stderr, "[attn] q0=%.4f,%.4f,%.4f,%.4f k0=%.4f,%.4f,%.4f,%.4f gate0=%.4f,%.4f o=%.4f,%.4f,%.4f,%.4f\n",
                         q2[0], q2[1], q2[2], q2[3], k2[0], k2[1], k2[2], k2[3],
@@ -73719,8 +73737,8 @@ static void qwen35_cpu_forward_token(
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
         /* dense FFN: post_attn_norm -> gate/up -> silu -> down -> residual */
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
-        qwen35_cpu_matvec(m, l->ffn_gate, blk, ff_a, s->qwen35_cpu_q8);
-        qwen35_cpu_matvec(m, l->ffn_up, blk, ff_b, s->qwen35_cpu_q8);
+        qwen35_cpu_matvec(m, l->ffn_gate, blk, ff_a, s->qwen35_cpu_q8, false);
+        qwen35_cpu_matvec(m, l->ffn_up, blk, ff_b, s->qwen35_cpu_q8, false);
         if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
             fprintf(stderr, "[ffn] xn=%.4f,%.4f,%.4f,%.4f gate=%.4f,%.4f,%.4f,%.4f up=%.4f,%.4f,%.4f,%.4f\n",
                     xn[0], xn[1], xn[2], xn[3], ff_a[0], ff_a[1], ff_a[2], ff_a[3],
@@ -73729,11 +73747,11 @@ static void qwen35_cpu_forward_token(
         }
         for (uint32_t i = 0; i < FF; i++)
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
-        qwen35_cpu_matvec(m, l->ffn_down, ff_b, blk, s->qwen35_cpu_q8);
+        qwen35_cpu_matvec(m, l->ffn_down, ff_b, blk, s->qwen35_cpu_q8, false);
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
     }
     qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
-    qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8);
+    qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
 }
 
 static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {

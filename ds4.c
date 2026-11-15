@@ -73854,6 +73854,99 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
     ds4_parallel_for(rows, qwen35_cpu_matvec_worker, &ctx);
 }
 
+/* Batched qwen35 matvec: quantize the n_tok activations once, then scan each
+ * weight row once and accumulate the dots for all tokens. The weight read is
+ * the dominant cost (15.66GB/token on the dense 27B), so N tokens cost about
+ * the same bandwidth as one - this is the speculative-verify amortization. */
+typedef struct {
+    const uint8_t *data;
+    block_q8_K *xq;          /* the n_tok * blocks, token-major */
+    const float *xraw;       /* the n_tok * in_dim for the exact path */
+    float *out;              /* the n_tok * out_dim, token-major */
+    uint64_t n_tok;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t row_bytes;
+    uint32_t type;
+    bool exact;
+} qwen35_cpu_matvec_batch_ctx;
+
+static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    qwen35_cpu_matvec_batch_ctx *ctx = vctx;
+    const uint64_t blocks = ctx->in_dim / QK_K;
+#if defined(__AVX2__)
+    for (uint64_t row = row0; row < row1; row++) {
+        const uint8_t *rdata = ctx->data + row * ctx->row_bytes;
+        _mm_prefetch((const char *)(ctx->data + (row + 8u) * ctx->row_bytes), _MM_HINT_T0);
+        for (uint64_t t = 0; t < ctx->n_tok; t++) {
+            const block_q8_K *q8 = ctx->xq + t * blocks;
+            const float *xr = ctx->xraw + t * ctx->in_dim;
+            float acc = 0.0f;
+            if (ctx->exact) {
+                if (ctx->type == DS4_TENSOR_Q4_K) {
+                    for (uint64_t b = 0; b < blocks; b++)
+                        acc += qwen35_dot_q4_K_f32_avx2((const block_q4_K *)rdata + b,
+                                                        xr + b * QK_K);
+                } else {
+                    for (uint64_t b = 0; b < blocks; b++)
+                        acc += qwen35_dot_q6_K_f32_avx2((const block_q6_K *)rdata + b,
+                                                        xr + b * QK_K);
+                }
+            } else if (ctx->type == DS4_TENSOR_Q4_K) {
+                for (uint64_t b = 0; b < blocks; b++)
+                    acc += qwen35_dot_q4_K_q8_K_maddubs((const block_q4_K *)rdata + b, q8 + b);
+            } else {
+                for (uint64_t b = 0; b < blocks; b++)
+                    acc += qwen35_dot_q6_K_q8_K_avx2((const block_q6_K *)rdata + b, q8 + b);
+            }
+            ctx->out[t * ctx->out_dim + row] = acc;
+        }
+    }
+#else
+    (void)ctx;
+    (void)row0;
+    (void)row1;
+    ds4_die("qwen35 batched matvec requires AVX2");
+#endif
+}
+
+static void qwen35_cpu_matvec_batch(
+        const ds4_model *m, const ds4_tensor *w,
+        const float *x, float *out, uint64_t n_tok, bool exact) {
+    if (n_tok == 0) return;
+    if (n_tok == 1) {
+        qwen35_cpu_matvec(m, w, x, out, NULL, exact);
+        return;
+    }
+    if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
+        ds4_die("qwen35 batched matvec: unexpected tensor type");
+    }
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t rows = w->ndim >= 2 ? w->dim[1] : 1u;
+    const uint64_t blocks = in_dim / QK_K;
+    const uint64_t row_bytes = blocks * (w->type == DS4_TENSOR_Q4_K
+                                              ? (uint64_t)sizeof(block_q4_K)
+                                              : (uint64_t)sizeof(block_q6_K));
+    block_q8_K *xq = xmalloc((size_t)(n_tok * blocks) * sizeof(block_q8_K));
+    for (uint64_t t = 0; t < n_tok; t++)
+        ds4_quantize_row_q8_K(x + t * in_dim, xq + t * blocks, (int64_t)in_dim);
+    qwen35_cpu_matvec_batch_ctx ctx = {
+        .data = (const uint8_t *)tensor_data(m, w),
+        .xq = xq,
+        .xraw = x,
+        .out = out,
+        .n_tok = n_tok,
+        .in_dim = in_dim,
+        .out_dim = rows,
+        .row_bytes = row_bytes,
+        .type = w->type,
+        .exact = exact,
+    };
+    ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
+    free(xq);
+}
+
+
 /* qwen35 MTP draft: one nextn layer over the main model's final hidden state
  * (pre-output-norm), mirroring llama.cpp's graph_mtp:
  *   hnorm(h) ++ enorm(embd) -> eh_proj -> attn_norm -> gated GQA(pos+1, shared

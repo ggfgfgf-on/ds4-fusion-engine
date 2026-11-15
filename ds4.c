@@ -73914,10 +73914,6 @@ static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
     if (n_tok == 0) return;
-    if (n_tok == 1) {
-        qwen35_cpu_matvec(m, w, x, out, NULL, exact);
-        return;
-    }
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
@@ -73945,6 +73941,221 @@ static void qwen35_cpu_matvec_batch(
     ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
     free(xq);
 }
+
+/* Batched CPU forward: n_tok tokens through the trunk layers. The projections
+ * use the batched matvec (weight rows read once for all tokens); the GDN
+ * conv/scan and the attention stay per-token (recurrent / causal by nature).
+ * The logits are written for every position (n_tok rows) so the speculative
+ * verify can check each draft against the target's argmax. */
+static void qwen35_cpu_mtp_forward(
+        const ds4_model *m, const ds4_weights *w, ds4_session *s,
+        const float *h_hidden, int token, uint32_t pos, float *draft_logits);
+
+static void qwen35_cpu_forward_batch(
+        float *logits_all, const ds4_model *m, const ds4_weights *w,
+        ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
+    const uint32_t E = DS4_N_EMBD;
+    const uint32_t C = DS4_N_LIN_CONV_DIM;
+    const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
+    const uint32_t KV = DS4_N_HEAD_KV, HD = DS4_N_HEAD_DIM, H = DS4_N_HEAD;
+    const uint32_t FF = DS4_N_FF_DENSE;
+    const float eps = DS4_RMS_EPS;
+    const uint64_t NT = n_tok;
+    const uint32_t QW = 2u * H * HD;      /* the q|gate width */
+    const uint32_t OW = Hv * D;           /* the GDN output width */
+
+    float *xb    = xmalloc((size_t)(NT * E) * sizeof(float));
+    float *blk   = xmalloc((size_t)(NT * E) * sizeof(float));
+    float *qkv   = xmalloc((size_t)(NT * QW) * sizeof(float));
+    float *z     = xmalloc((size_t)(NT * C) * sizeof(float));
+    float *lin_o = xmalloc((size_t)(NT * OW) * sizeof(float));
+    float *ff_a  = xmalloc((size_t)(NT * FF) * sizeof(float));
+    float *ff_b  = xmalloc((size_t)(NT * FF) * sizeof(float));
+    float *tmp   = xmalloc((size_t)(NT * OW) * sizeof(float));
+    float *q2    = xmalloc((size_t)(NT * H * HD) * sizeof(float));
+    float *k2    = xmalloc((size_t)(NT * KV * HD) * sizeof(float));
+    float *v2    = xmalloc((size_t)(NT * KV * HD) * sizeof(float));
+    float *ga    = xmalloc((size_t)(NT * Hv) * sizeof(float));
+    float *gb    = xmalloc((size_t)(NT * Hv) * sizeof(float));
+    float *score = xmalloc((size_t)n_tok * (size_t)s->ctx_size * sizeof(float));
+    float *gate  = z;   /* the attention gate view (C >= H*HD) */
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+
+    for (uint32_t t = 0; t < n_tok; t++)
+        qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], xb + (uint64_t)t * E);
+
+    for (uint32_t il = 0; il < n_trunk; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        for (uint32_t t = 0; t < n_tok; t++)
+            qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
+                          qwen4_ref_f32(m, l->attn_norm), E, eps);
+        if (ds4_qwen4_layer_is_linear(il)) {
+            /* GDN: the batched qkv/gate projections. */
+            qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, true);
+            qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, true);
+            const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
+            const float *A = qwen4_ref_f32(m, l->lin_a);
+            const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
+            const float *nw = qwen4_ref_f32(m, l->lin_norm);
+            float *hist = s->qwen35_cpu_conv_hist[il];
+            float *state = s->qwen35_cpu_ssm_state[il];
+            for (uint32_t t = 0; t < n_tok; t++) {
+                float *qk = qkv + (uint64_t)t * QW;
+                float *zz = z + (uint64_t)t * C;
+                float *gv = gate + (uint64_t)t * C;
+                for (uint32_t c = 0; c < C; c++) {
+                    float v = conv_w[c * 4u + 3u] * qk[c];
+                    for (uint32_t i = 0; i < 3; i++)
+                        v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
+                    hist[(uint64_t)0 * C + c] = hist[(uint64_t)1 * C + c];
+                    hist[(uint64_t)1 * C + c] = hist[(uint64_t)2 * C + c];
+                    hist[(uint64_t)2 * C + c] = qk[c];
+                    qk[c] = v / (1.0f + expf(-v));
+                }
+                qwen4_ref_matvec(m, l->lin_alpha, blk + (uint64_t)t * E, ga + (uint64_t)t * Hv);
+                qwen4_ref_matvec(m, l->lin_beta, blk + (uint64_t)t * E, gb + (uint64_t)t * Hv);
+                for (uint32_t h = 0; h < Hv; h++) {
+                    const float sp = qwen35_cpu_softplus(ga[(uint64_t)t * Hv + h] + bias[h]);
+                    ga[(uint64_t)t * Hv + h] = expf(A[h] * sp);
+                    gb[(uint64_t)t * Hv + h] = 1.0f / (1.0f + expf(-gb[(uint64_t)t * Hv + h]));
+                }
+                for (uint32_t h = 0; h < Hk; h++) {
+                    double ss = 0.0;
+                    float *q = qk + (uint64_t)h * D, *k = qk + (uint64_t)(Hk + h) * D;
+                    for (uint32_t i = 0; i < D; i++) ss += (double)q[i] * q[i];
+                    float qs = 1.0f / sqrtf((float)ss + 1e-6f) * (1.0f / sqrtf((float)D));
+                    ss = 0.0;
+                    for (uint32_t i = 0; i < D; i++) ss += (double)k[i] * k[i];
+                    const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
+                    for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
+                }
+                for (uint32_t h = 0; h < Hv; h++) {
+                    const uint32_t kh = h % Hk;
+                    const float decay = ga[(uint64_t)t * Hv + h], beta = gb[(uint64_t)t * Hv + h];
+                    const float *kptr = qk + (uint64_t)(Hk + kh) * D;
+                    const float *qptr = qk + (uint64_t)kh * D;
+                    float *sv = state + (uint64_t)h * D * D;
+                    for (uint32_t dv = 0; dv < D; dv++) {
+                        float *srow = sv + (uint64_t)dv * D;
+                        const float v = qk[(uint64_t)(2u * Hk + h) * D + dv];
+                        float u = 0.0f;
+                        for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * kptr[i]; }
+                        const float delta = (v - u) * beta;
+                        float o = 0.0f;
+                        for (uint32_t i = 0; i < D; i++) { srow[i] += kptr[i] * delta; o += srow[i] * qptr[i]; }
+                        lin_o[(uint64_t)t * OW + (uint64_t)h * D + dv] = o;
+                    }
+                }
+                for (uint32_t sh = 0; sh < Hv; sh++)
+                    qwen4_ref_rms(tmp + (uint64_t)t * OW + (uint64_t)sh * D,
+                                  lin_o + (uint64_t)t * OW + (uint64_t)sh * D, nw, D, eps);
+                for (uint32_t i = 0; i < OW; i++) {
+                    const float zv = zz[i];
+                    tmp[(uint64_t)t * OW + i] *= zv / (1.0f + expf(-zv));
+                }
+            }
+            /* the batched out projection + the residual. */
+            qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, true);
+            /* (no residual: the GDN path adds it below) */
+            for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+        } else {
+            /* full attention: the batched q|gate, k, v projections. */
+            qwen35_cpu_matvec_batch(m, l->attn_q, blk, qkv, NT, false);
+            qwen35_cpu_matvec_batch(m, l->attn_k, blk, k2, NT, false);
+            qwen35_cpu_matvec_batch(m, l->attn_v, blk, v2, NT, false);
+            const float *qnorm = qwen4_ref_f32(m, l->attn_q_norm);
+            const float *knorm = qwen4_ref_f32(m, l->attn_k_norm);
+            float *kv = s->qwen35_cpu_kv[il];
+            const uint32_t kv_cap = (uint32_t)s->ctx_size;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                const uint32_t pos = pos0 + t;
+                float *qk = qkv + (uint64_t)t * QW;
+                float *gt = gate + (uint64_t)t * C;
+                float *kt = k2 + (uint64_t)t * KV * HD;
+                float *vt = v2 + (uint64_t)t * KV * HD;
+                float *q2t = q2 + (uint64_t)t * H * HD;
+                for (uint32_t h = 0; h < H; h++) {
+                    qwen4_ref_rms(q2t + (uint64_t)h * HD, qk + (uint64_t)h * 2u * HD, qnorm, HD, eps);
+                    memcpy(gt + (uint64_t)h * HD, qk + (uint64_t)h * 2u * HD + HD,
+                           HD * sizeof(float));
+                }
+                for (uint32_t h = 0; h < KV; h++)
+                    qwen4_ref_rms(kt + (uint64_t)h * HD, kt + (uint64_t)h * HD, knorm, HD, eps);
+                for (uint32_t h = 0; h < H; h++) qwen35_cpu_rope(q2t + (uint64_t)h * HD, (int32_t)pos);
+                for (uint32_t h = 0; h < KV; h++) qwen35_cpu_rope(kt + (uint64_t)h * HD, (int32_t)pos);
+                const uint32_t kv_pos = pos % kv_cap;
+                memcpy(kv + (uint64_t)kv_pos * KV * HD, kt, (size_t)KV * HD * sizeof(float));
+                memcpy(kv + (uint64_t)(kv_cap * KV * HD) + (uint64_t)kv_pos * KV * HD,
+                       vt, (size_t)KV * HD * sizeof(float));
+                const uint32_t visible = pos + 1u;
+                const float scale = 1.0f / sqrtf((float)HD);
+                float *sc_t = score + (uint64_t)t * kv_cap;
+                for (uint32_t h = 0; h < H; h++) {
+                    const uint32_t kh = h / (H / KV);
+                    for (uint32_t u = 0; u < visible; u++) {
+                        const uint32_t p = u % kv_cap;
+                        float dd = 0.0f;
+                        for (uint32_t i = 0; i < HD; i++)
+                            dd += q2t[(uint64_t)h * HD + i] *
+                                  kv[(uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+                        sc_t[u] = dd * scale;
+                    }
+                    float mx = sc_t[0];
+                    for (uint32_t u = 1; u < visible; u++) mx = fmaxf(mx, sc_t[u]);
+                    double ss = 0.0;
+                    for (uint32_t u = 0; u < visible; u++) { sc_t[u] = expf(sc_t[u] - mx); ss += sc_t[u]; }
+                    for (uint32_t i = 0; i < HD; i++) {
+                        float o = 0.0f;
+                        for (uint32_t u = 0; u < visible; u++) {
+                            const uint32_t p = u % kv_cap;
+                            o += sc_t[u] * kv[(uint64_t)(kv_cap * KV * HD) +
+                                              (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+                        }
+                        ff_b[(uint64_t)t * FF + (uint64_t)h * HD + i] = o / (float)ss *
+                                (1.0f / (1.0f + expf(-gt[h * HD + i])));
+                    }
+                }
+            }
+            qwen35_cpu_matvec_batch(m, l->attn_output, ff_b, blk, NT, false);
+            for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+        }
+        /* the dense FFN: the batched post norm, gate/up/down. */
+        for (uint32_t t = 0; t < n_tok; t++)
+            qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
+                          qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+        qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, false);
+        qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, false);
+        for (uint64_t i = 0; i < NT * FF; i++)
+            ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
+        qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, false);
+        for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+    }
+    /* the output head per position. */
+    for (uint32_t t = 0; t < n_tok; t++) {
+        float *row = logits_all + (uint64_t)t * DS4_N_VOCAB;
+        qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
+                      qwen4_ref_f32(m, w->output_norm), E, eps);
+        qwen35_cpu_matvec(m, w->output, blk + (uint64_t)t * E, row,
+                          s->qwen35_cpu_q8, false);
+    }
+    /* the MTP draft for the position after the batch's last token (blk holds
+     * that token's output-normed hidden). */
+    if (n_tok > 0 && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
+        float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        qwen35_cpu_mtp_forward(m, w, s, blk + (uint64_t)(n_tok - 1) * E,
+                               tokens[n_tok - 1], pos0 + n_tok - 1, draft);
+        int dmx = 0;
+        for (int i = 1; i < (int)DS4_N_VOCAB; i++)
+            if (draft[i] > draft[dmx]) dmx = i;
+        s->qwen35_mtp_draft = dmx;
+        s->qwen35_mtp_draft_valid = true;
+        free(draft);
+    }
+    free(score); free(gb); free(ga); free(v2); free(k2); free(q2);
+    free(tmp); free(ff_b); free(ff_a); free(lin_o); free(z); free(qkv);
+    free(blk); free(xb);
+}
+
 
 
 /* qwen35 MTP draft: one nextn layer over the main model's final hidden state
@@ -94861,24 +95072,38 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     if (s->distributed || ds4_session_is_cpu(s)) {
         if (ds4_session_is_cpu(s) && !s->distributed &&
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
-            s->qwen35_mtp_draft_valid && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
-            /* qwen35 CPU speculation: eval(first_token) produces the logits for
-             * the next position and the MTP draft for the position after it
-             * (stored by the forward). When that draft equals the newly
-             * produced argmax, the draft is confirmed - emit it without
-             * another argmax decision. */
-            if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-            accepted[0] = first_token;
-            int n = 1;
-            while (n < accepted_cap) {
-                if (!s->qwen35_mtp_draft_valid) break;
-                const int t = ds4_session_argmax(s);
-                if (t < 0 || t == eos_token) break;
-                if (s->qwen35_mtp_draft != t) break;
-                accepted[n++] = t;
-                if (ds4_session_eval(s, t, err, errlen) != 0) return -1;
+            s->qwen35_mtp_draft_valid && getenv("DS4_QWEN35_MTP_SPEC") != NULL &&
+            max_tokens > 1 && accepted_cap > 1) {
+            /* Batched speculative verify: run the target forward over
+             * [t1, draft] in ONE batched pass (the weight rows are read once
+             * for both tokens). The per-position logits decide the accept. */
+            ds4_engine *e2 = s->engine;
+            const int V = (int)DS4_N_VOCAB;
+            const int t1 = ds4_session_argmax(s);
+            const int d = s->qwen35_mtp_draft;
+            if (t1 >= 0 && t1 != eos_token && d >= 0 && t1 == d) {
+                /* The MTP draft and the target argmax agree on the next token.
+                 * Run the verified token through the batched forward: it
+                 * advances the state, produces the logits and refreshes the
+                 * MTP draft for the following position. */
+                int toks[1] = { t1 };
+                float *lg = xmalloc((size_t)V * sizeof(float));
+                qwen35_cpu_forward_batch(lg, &e2->model, &e2->weights, s,
+                                         toks, 1, (uint32_t)s->checkpoint.len);
+                token_vec_push(&s->checkpoint, t1);
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                int a1 = 0;
+                for (int i = 1; i < V; i++)
+                    if (lg[i] > lg[a1]) a1 = i;
+                accepted[0] = t1;
+                if (accepted_cap > 1) accepted[1] = a1;
+                memcpy(s->logits, lg, (size_t)V * sizeof(float));
+                free(lg);
+                /* only t1 is emitted: the sampled token must consume the
+                 * logits that predict the token AFTER t1. */
+                return 1;
             }
-            return n;
         }
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;

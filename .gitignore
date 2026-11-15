@@ -5,5 +5,7 @@ build_win/
 *.log
 .probe_*
 
-
 .cache/
+.rel_gate_*.txt
+.smoke_auto*.txt
+bin/

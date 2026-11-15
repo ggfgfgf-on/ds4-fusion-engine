@@ -73845,6 +73845,105 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
     ds4_parallel_for(rows, qwen35_cpu_matvec_worker, &ctx);
 }
 
+/* qwen35 MTP draft: one nextn layer over the main model's final hidden state
+ * (pre-output-norm), mirroring llama.cpp's graph_mtp:
+ *   hnorm(h) ++ enorm(embd) -> eh_proj -> attn_norm -> gated GQA(pos+1, shared
+ *   KV) -> +residual -> post_norm -> dense FFN -> +residual -> head_norm ->
+ *   shared head. The draft's K/V lands at pos+1 in the MTP layer's cache; the
+ *   verify's main forward overwrites it before anything reads it back. */
+static void qwen35_cpu_mtp_forward(
+        const ds4_model *m, const ds4_weights *w, ds4_session *s,
+        const float *h_hidden, int token, uint32_t pos, float *draft_logits) {
+    const uint32_t E = DS4_N_EMBD, KV = DS4_N_HEAD_KV, HD = DS4_N_HEAD_DIM;
+    const uint32_t H = DS4_N_HEAD, FF = DS4_N_FF_DENSE;
+    const float eps = DS4_RMS_EPS;
+    const ds4_layer_weights *l = &w->layer[DS4_N_LAYER - 1u];
+    float *qkv = s->qwen35_cpu_buf[0];
+    float *z   = s->qwen35_cpu_buf[1];
+    float *ff_a = s->qwen35_cpu_buf[4];
+    float *ff_b = s->qwen35_cpu_buf[5];
+    float *blk = s->qwen35_cpu_buf[6];
+    float *xn  = s->qwen35_cpu_buf[7];
+    float *q2  = s->qwen35_cpu_buf[8];
+    float *k2  = s->qwen35_cpu_buf[9];
+    float *v2  = s->qwen35_cpu_buf[10];
+    float *score = s->qwen35_cpu_buf[11];
+    float *gate = z;
+    float *inpSA = ff_a; /* the eh_proj output survives the attention */
+    const uint32_t dpos = pos + 1u;
+
+    qwen4_ref_rms(xn, h_hidden, qwen4_ref_f32(m, l->nextn_hnorm), E, eps);
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, qkv);
+    qwen4_ref_rms(qkv, qkv, qwen4_ref_f32(m, l->nextn_enorm), E, eps);
+    memcpy(qkv + E, xn, E * sizeof(float)); /* [e_norm; h_norm] */
+    qwen35_cpu_matvec(m, l->nextn_eh_proj, qkv, blk, s->qwen35_cpu_q8, false);
+    memcpy(inpSA, blk, E * sizeof(float));
+
+    qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, l->attn_norm), E, eps);
+    qwen35_cpu_matvec(m, l->attn_q, xn, qkv, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->attn_k, xn, k2, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->attn_v, xn, v2, s->qwen35_cpu_q8, false);
+    for (uint32_t h = 0; h < H; h++) {
+        qwen4_ref_rms(q2 + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD,
+                      qwen4_ref_f32(m, l->attn_q_norm), HD, eps);
+        memcpy(gate + (uint64_t)h * HD, qkv + (uint64_t)h * 2u * HD + HD,
+               HD * sizeof(float));
+    }
+    for (uint32_t h = 0; h < KV; h++) {
+        qwen4_ref_rms(k2 + (uint64_t)h * HD, k2 + (uint64_t)h * HD,
+                      qwen4_ref_f32(m, l->attn_k_norm), HD, eps);
+    }
+    for (uint32_t h = 0; h < H; h++) qwen35_cpu_rope(q2 + (uint64_t)h * HD, (int32_t)dpos);
+    for (uint32_t h = 0; h < KV; h++) qwen35_cpu_rope(k2 + (uint64_t)h * HD, (int32_t)dpos);
+    float *kv = s->qwen35_cpu_kv[DS4_N_LAYER - 1u];
+    const uint32_t kv_cap = (uint32_t)s->ctx_size;
+    const uint32_t kv_pos = dpos % kv_cap;
+    memcpy(kv + (uint64_t)kv_pos * KV * HD, k2, (size_t)KV * HD * sizeof(float));
+    memcpy(kv + (uint64_t)(kv_cap * KV * HD) + (uint64_t)kv_pos * KV * HD,
+           v2, (size_t)KV * HD * sizeof(float));
+    const uint32_t visible = dpos + 1u;
+    const float scale = 1.0f / sqrtf((float)HD);
+    for (uint32_t h = 0; h < H; h++) {
+        const uint32_t kh = h / (H / KV);
+        for (uint32_t t = 0; t < visible; t++) {
+            const uint32_t p = t % kv_cap;
+            float dd = 0.0f;
+            for (uint32_t i = 0; i < HD; i++)
+                dd += q2[(uint64_t)h * HD + i] *
+                      kv[(uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+            score[t] = dd * scale;
+        }
+        float mx = score[0];
+        for (uint32_t t = 1; t < visible; t++) mx = fmaxf(mx, score[t]);
+        double ss = 0.0;
+        for (uint32_t t = 0; t < visible; t++) { score[t] = expf(score[t] - mx); ss += score[t]; }
+        for (uint32_t i = 0; i < HD; i++) {
+            float o = 0.0f;
+            for (uint32_t t = 0; t < visible; t++) {
+                const uint32_t p = t % kv_cap;
+                o += score[t] * kv[(uint64_t)(kv_cap * KV * HD) +
+                                    (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
+            }
+            ff_b[(uint64_t)h * HD + i] = o / (float)ss *
+                    (1.0f / (1.0f + expf(-gate[h * HD + i])));
+        }
+    }
+    qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, false);
+    for (uint32_t i = 0; i < E; i++) blk[i] += inpSA[i];
+
+    qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+    qwen35_cpu_matvec(m, l->ffn_gate, xn, ff_a, s->qwen35_cpu_q8, false);
+    qwen35_cpu_matvec(m, l->ffn_up, xn, ff_b, s->qwen35_cpu_q8, false);
+    for (uint32_t i = 0; i < FF; i++)
+        ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
+    qwen35_cpu_matvec(m, l->ffn_down, ff_b, xn, s->qwen35_cpu_q8, false);
+    for (uint32_t i = 0; i < E; i++) blk[i] += xn[i];
+
+    const ds4_tensor *head_norm_t = l->nextn_shared_head_norm ? l->nextn_shared_head_norm : w->output_norm;
+    qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, head_norm_t), E, eps);
+    qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, false);
+}
+
 /* qwen35 CPU decode (hybrid): one token through the 64 trunk layers,
  * mirroring the GPU graph's single-stream flow bit-for-bit:
  *   attn_norm -> layer(GDN or gated GQA) -> residual
@@ -74071,6 +74170,21 @@ static void qwen35_cpu_forward_token(
     PROF_TICK();
     qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
+    if (getenv("DS4_QWEN35_MTP_TEST")) {
+        static int prev_draft = -1;
+        float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        qwen35_cpu_mtp_forward(m, w, s, cur, token, pos, draft);
+        int dmx = 0, lmx = 0;
+        for (int i = 1; i < DS4_N_VOCAB; i++) {
+            if (draft[i] > draft[dmx]) dmx = i;
+            if (logits[i] > logits[lmx]) lmx = i;
+        }
+        fprintf(stderr, "[mtp] pos=%u prev_hit=%d draft=%d main=%d\n",
+                pos, prev_draft >= 0 && prev_draft == lmx, dmx, lmx);
+        fflush(stderr);
+        prev_draft = dmx;
+        free(draft);
+    }
     PROF_TOCK(t_mv);
     if (prof) {
         fprintf(stderr, "[prof] pos=%u mv=%.3f conv=%.3f ps=%.3f att=%.3f norm=%.3f total=%.3f\n",

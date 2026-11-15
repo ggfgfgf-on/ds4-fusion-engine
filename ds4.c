@@ -74156,21 +74156,19 @@ static void qwen35_cpu_forward_batch(
         s->qwen35_mtp_draft = dmx;
         s->qwen35_mtp_draft_valid = true;
         int prev = dmx;
-        /* the chained drafts run off the MAIN model's hidden state at the last
-         * position (post-output-norm - exactly what h_nextn means). Feeding the
-         * nextn layer's own output back degenerates within one step. */
-        const float *hsrc = blk + (uint64_t)(n_tok - 1) * E;
+        float *hsrc = hb;
         s->qwen35_mtp_chain_n = 0;
         for (int k = 0; k < 2; k++) {
-            /* d covers last_pos+1 (the position the NEXT cycle's t1 fills), so
-             * the first batch element after t1 must target last_pos+2. */
-            qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 2u + (uint32_t)k,
-                                     draft, NULL);
+            /* the chain: the previous step's h_nextn (post-output-norm) is the
+             * next step's input hidden, exactly like llama's draft loop. */
+            qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
+                                     draft, hb);
             int cmx = 0;
             for (int i = 1; i < (int)DS4_N_VOCAB; i++)
                 if (draft[i] > draft[cmx]) cmx = i;
             s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
             prev = cmx;
+            hsrc = hb;
         }
         free(hb);
         free(draft);
@@ -74284,8 +74282,10 @@ static void qwen35_cpu_mtp_forward_h(
     for (uint32_t i = 0; i < E; i++) blk[i] += xn[i];
 
     const ds4_tensor *head_norm_t = l->nextn_shared_head_norm ? l->nextn_shared_head_norm : w->output_norm;
-    if (out_hidden) memcpy(out_hidden, blk, (size_t)E * sizeof(float));
     qwen4_ref_rms(xn, blk, qwen4_ref_f32(m, head_norm_t), E, eps);
+    /* h_nextn is the POST-output-norm hidden (llama's t_h_nextn); the chain
+     * feeds this back as the next step's input. */
+    if (out_hidden) memcpy(out_hidden, xn, (size_t)E * sizeof(float));
     qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
 }
 

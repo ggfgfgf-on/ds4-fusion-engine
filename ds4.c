@@ -74173,9 +74173,17 @@ static void qwen35_cpu_forward_token(
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
     if (getenv("DS4_QWEN35_MTP_TEST")) {
         static int prev_draft = -1;
+        static float prev_h[8192];
+        static bool have_prev_h = false;
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         /* The llama's h_nextn = the POST-output-norm hidden (the blk here). */
-        qwen35_cpu_mtp_forward(m, w, s, blk, token, pos, draft);
+        if (getenv("DS4_QWEN35_MTP_CATCHUP") && have_prev_h) {
+            /* llama's catch-up: rewrite the slot pos with the (x_p, h_{p-1})
+             * pairing so the history matches the llama's draft KV. */
+            qwen35_cpu_mtp_forward(m, w, s, prev_h, token, pos - 1u, draft);
+        }
+        const float *h_in = getenv("DS4_QWEN35_MTP_SHIFT") && have_prev_h ? prev_h : blk;
+        qwen35_cpu_mtp_forward(m, w, s, h_in, token, pos, draft);
         int dmx = 0, lmx = 0;
         int top5[5] = {0, 0, 0, 0, 0};
         for (int i = 1; i < DS4_N_VOCAB; i++) {
@@ -74191,10 +74199,17 @@ static void qwen35_cpu_forward_token(
         }
         int in5 = 0;
         for (int t = 0; t < 5; t++) if (top5[t] == lmx) in5 = 1;
-        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d\n",
-                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx);
+        float mx = draft[0];
+        for (int i = 1; i < DS4_N_VOCAB; i++) mx = fmaxf(mx, draft[i]);
+        double ss = 0.0;
+        for (int i = 0; i < DS4_N_VOCAB; i++) ss += (double)expf(draft[i] - mx);
+        const float p1 = expf(draft[dmx] - mx) / (float)ss;
+        fprintf(stderr, "[mtp] pos=%u prev_hit=%d in5=%d draft=%d main=%d p1=%.3f\n",
+                pos, prev_draft >= 0 && prev_draft == lmx, in5, dmx, lmx, (double)p1);
         fflush(stderr);
         prev_draft = dmx;
+        memcpy(prev_h, blk, E * sizeof(float));
+        have_prev_h = true;
         free(draft);
     }
     PROF_TOCK(t_mv);

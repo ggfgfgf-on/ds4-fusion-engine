@@ -74012,6 +74012,84 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
 #endif
 }
 
+/* One token of the GDN block, shared by the per-token reference forward and the
+ * batched forward so the two cannot drift apart again. Covers everything from
+ * the causal conv through the gated out-projection input.
+ *
+ *   qk      in/out  C-wide conv slice of this token's lin_qkv row
+ *   blk     in      this token's attn_norm row (E wide)
+ *   zz      in      this token's lin_gate row (C wide)
+ *   tmp_row out     C-wide lin_out input (gated, pass-through lanes zeroed)
+ *   lin_o   scratch OW-wide scan output
+ *   ga/gb   scratch Hv-wide alpha/beta
+ */
+static void qwen35_gdn_token(
+        const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
+        float *qk, const float *blk, const float *zz,
+        float *tmp_row, float *lin_o, float *ga, float *gb) {
+    const uint32_t C = DS4_N_LIN_CONV_DIM;
+    const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
+    const uint32_t OW = Hv * D;
+    const float eps = DS4_RMS_EPS;
+    const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
+    float *hist = s->qwen35_cpu_conv_hist[il];
+    float *state = s->qwen35_cpu_ssm_state[il];
+
+    for (uint32_t c = 0; c < C; c++) {
+        float v = conv_w[c * 4u + 3u] * qk[c];
+        for (uint32_t i = 0; i < 3; i++)
+            v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
+        hist[(uint64_t)0 * C + c] = hist[(uint64_t)1 * C + c];
+        hist[(uint64_t)1 * C + c] = hist[(uint64_t)2 * C + c];
+        hist[(uint64_t)2 * C + c] = qk[c];
+        qk[c] = v / (1.0f + expf(-v));
+    }
+    qwen4_ref_matvec(m, l->lin_alpha, blk, ga);
+    qwen4_ref_matvec(m, l->lin_beta, blk, gb);
+    const float *A = qwen4_ref_f32(m, l->lin_a);
+    const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
+    for (uint32_t h = 0; h < Hv; h++) {
+        const float sp = qwen35_cpu_softplus(ga[h] + bias[h]);
+        ga[h] = expf(A[h] * sp);
+        gb[h] = 1.0f / (1.0f + expf(-gb[h]));
+    }
+    for (uint32_t h = 0; h < Hk; h++) {
+        double ss = 0.0;
+        float *q = qk + (uint64_t)h * D, *k = qk + (uint64_t)(Hk + h) * D;
+        for (uint32_t i = 0; i < D; i++) ss += (double)q[i] * q[i];
+        const float qs = 1.0f / sqrtf((float)ss + 1e-6f) * (1.0f / sqrtf((float)D));
+        ss = 0.0;
+        for (uint32_t i = 0; i < D; i++) ss += (double)k[i] * k[i];
+        const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
+        for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
+    }
+    for (uint32_t h = 0; h < Hv; h++) {
+        const uint32_t kh = h % Hk;
+        const float decay = ga[h], beta = gb[h];
+        const float *k = qk + (uint64_t)(Hk + kh) * D;
+        const float *q = qk + (uint64_t)kh * D;
+        float *sv = state + (uint64_t)h * D * D;
+        for (uint32_t dv = 0; dv < D; dv++) {
+            float *srow = sv + (uint64_t)dv * D;
+            const float v = qk[(uint64_t)(2u * Hk + h) * D + dv];
+            float u = 0.0f;
+            for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
+            const float delta = (v - u) * beta;
+            float o = 0.0f;
+            for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
+            lin_o[(uint64_t)h * D + dv] = o;
+        }
+    }
+    const float *nw = qwen4_ref_f32(m, l->lin_norm);
+    for (uint32_t sh = 0; sh < Hv; sh++)
+        qwen4_ref_rms(tmp_row + (uint64_t)sh * D, lin_o + (uint64_t)sh * D, nw, D, eps);
+    for (uint32_t i = 0; i < OW; i++)
+        tmp_row[i] *= zz[i] / (1.0f + expf(-zz[i]));
+    /* the lanes past OW are never gated; zero them so the forward stays
+     * deterministic (they used to carry uninitialised heap memory). */
+    memset(tmp_row + OW, 0, (size_t)(C - OW) * sizeof(float));
+}
+
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
@@ -74140,103 +74218,20 @@ static void qwen35_cpu_forward_batch(
             }
         }
         if (ds4_qwen4_layer_is_linear(il)) {
-            /* GDN: the batched qkv/gate projections. */
+            /* GDN: the batched qkv/gate projections, then the shared
+             * per-token block so this path cannot drift from the reference. */
             qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, true);
             qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, true);
-            const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
-            const float *A = qwen4_ref_f32(m, l->lin_a);
-            const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
-            const float *nw = qwen4_ref_f32(m, l->lin_norm);
-            /* the lin_qkv output row is NOT QW wide - use the tensor's real
-             * output dim, otherwise every t>0 row starts at the wrong offset. */
             const uint32_t QKV_STRIDE = (uint32_t)l->lin_qkv->dim[1];
-            float *hist = s->qwen35_cpu_conv_hist[il];
-            float *state = s->qwen35_cpu_ssm_state[il];
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
-                float *zz = z + (uint64_t)t * C;
-                float *gv = gate + (uint64_t)t * C;
-                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1) {
-                    fprintf(stderr, "[gdnb] t=%u pre-conv qkv=%.6f z=%.6f "
-                            "q0=%.6f q1=%.6f q2=%.6f blk0=%.6f blk1=%.6f "
-                            "blkfull=%.6f\n",
-                            t, qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
-                            (double)qk[0], (double)qk[1], (double)qk[2],
-                            (double)blk[(uint64_t)t * E + 0],
-                            (double)blk[(uint64_t)t * E + 1],
-                            qwen35_dbg_l2(blk + (uint64_t)t * E, E));
-                    FILE *fb = fopen("D:/DSHwork/blk_batch.bin", "wb");
-                    if (fb) {
-                        fwrite(blk + (uint64_t)t * E, sizeof(float), E, fb);
-                        fclose(fb);
-                    }
-                }
-                for (uint32_t c = 0; c < C; c++) {
-                    float v = conv_w[c * 4u + 3u] * qk[c];
-                    for (uint32_t i = 0; i < 3; i++)
-                        v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
-                    hist[(uint64_t)0 * C + c] = hist[(uint64_t)1 * C + c];
-                    hist[(uint64_t)1 * C + c] = hist[(uint64_t)2 * C + c];
-                    hist[(uint64_t)2 * C + c] = qk[c];
-                    qk[c] = v / (1.0f + expf(-v));
-                }
-                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1)
-                    fprintf(stderr, "[gdnb] t=%u post-conv qkv=%.6f\n",
-                            t, qwen35_dbg_l2(qk, C));
-                qwen4_ref_matvec(m, l->lin_alpha, blk + (uint64_t)t * E, ga + (uint64_t)t * Hv);
-                qwen4_ref_matvec(m, l->lin_beta, blk + (uint64_t)t * E, gb + (uint64_t)t * Hv);
-                for (uint32_t h = 0; h < Hv; h++) {
-                    const float sp = qwen35_cpu_softplus(ga[(uint64_t)t * Hv + h] + bias[h]);
-                    ga[(uint64_t)t * Hv + h] = expf(A[h] * sp);
-                    gb[(uint64_t)t * Hv + h] = 1.0f / (1.0f + expf(-gb[(uint64_t)t * Hv + h]));
-                }
-                for (uint32_t h = 0; h < Hk; h++) {
-                    double ss = 0.0;
-                    float *q = qk + (uint64_t)h * D, *k = qk + (uint64_t)(Hk + h) * D;
-                    for (uint32_t i = 0; i < D; i++) ss += (double)q[i] * q[i];
-                    float qs = 1.0f / sqrtf((float)ss + 1e-6f) * (1.0f / sqrtf((float)D));
-                    ss = 0.0;
-                    for (uint32_t i = 0; i < D; i++) ss += (double)k[i] * k[i];
-                    const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
-                    for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
-                }
-                for (uint32_t h = 0; h < Hv; h++) {
-                    const uint32_t kh = h % Hk;
-                    const float decay = ga[(uint64_t)t * Hv + h], beta = gb[(uint64_t)t * Hv + h];
-                    const float *kptr = qk + (uint64_t)(Hk + kh) * D;
-                    const float *qptr = qk + (uint64_t)kh * D;
-                    float *sv = state + (uint64_t)h * D * D;
-                    for (uint32_t dv = 0; dv < D; dv++) {
-                        float *srow = sv + (uint64_t)dv * D;
-                        const float v = qk[(uint64_t)(2u * Hk + h) * D + dv];
-                        float u = 0.0f;
-                        for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * kptr[i]; }
-                        const float delta = (v - u) * beta;
-                        float o = 0.0f;
-                        for (uint32_t i = 0; i < D; i++) { srow[i] += kptr[i] * delta; o += srow[i] * qptr[i]; }
-                        lin_o[(uint64_t)t * OW + (uint64_t)h * D + dv] = o;
-                    }
-                }
-                for (uint32_t sh = 0; sh < Hv; sh++)
-                    qwen4_ref_rms(tmp + (uint64_t)t * C + (uint64_t)sh * D,
-                                  lin_o + (uint64_t)t * OW + (uint64_t)sh * D, nw, D, eps);
-                /* The reference gates only the first Hv*D (=4096) lanes; the
-                 * remaining C-Hv*D lanes are passed through untouched. That
-                 * pass-through reads uninitialised session memory, which makes
-                 * the whole forward non-deterministic (values of 1e18 were
-                 * observed). Zero them instead - deterministic and neutral,
-                 * since the lin_out projection's contribution from those lanes
-                 * was never meaningful. */
-                for (uint32_t i = 0; i < OW; i++) {
-                    const float zv = zz[i];
-                    tmp[(uint64_t)t * C + i] *= zv / (1.0f + expf(-zv));
-                }
-                memset(tmp + (uint64_t)t * C + OW, 0,
-                       (size_t)(C - OW) * sizeof(float));
-                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1)
-                    fprintf(stderr, "[gdnb] t=%u post-norm tmp=%.6f lin_o=%.6f\n",
-                            t, qwen35_dbg_l2(tmp + (uint64_t)t * C, C),
-                            qwen35_dbg_l2(lin_o + (uint64_t)t * OW, OW));
+                qwen35_gdn_token(m, l, s, il, qk,
+                                 blk + (uint64_t)t * E,
+                                 z + (uint64_t)t * C,
+                                 tmp + (uint64_t)t * C,
+                                 lin_o + (uint64_t)t * OW,
+                                 ga + (uint64_t)t * Hv,
+                                 gb + (uint64_t)t * Hv);
             }
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, true);
@@ -74584,82 +74579,8 @@ static void qwen35_cpu_forward_token(
             }
             PROF_TOCK(t_mv);
             PROF_TICK();
-            const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
-            float *hist = s->qwen35_cpu_conv_hist[il];
-            for (uint32_t c = 0; c < C; c++) {
-                float v = conv_w[c * 4u + 3u] * qkv[c];
-                for (uint32_t i = 0; i < DS4_N_LIN_CONV - 1u; i++)
-                    v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
-                for (uint32_t i = 0; i + 1u < DS4_N_LIN_CONV - 1u; i++)
-                    hist[(uint64_t)i * C + c] = hist[(uint64_t)(i + 1u) * C + c];
-                hist[(uint64_t)(DS4_N_LIN_CONV - 2u) * C + c] = qkv[c];
-                qkv[c] = v / (1.0f + expf(-v)); /* silu */
-            }
-            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
-                fprintf(stderr, "[gdnr] post-conv qkv=%.6f\n", qwen35_dbg_l2(qkv, C));
-            PROF_TOCK(t_conv);
-            PROF_TICK();
-            qwen4_ref_matvec(m, l->lin_alpha, blk, ga);
-            qwen4_ref_matvec(m, l->lin_beta, blk, gb);
-            const float *A = qwen4_ref_f32(m, l->lin_a);
-            const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
-            /* prep: per-head q/k norms + a/b parameters. */
-            for (uint32_t h = 0; h < Hk; h++) {
-                double ss = 0.0;
-                float *q = qkv + (uint64_t)h * D, *k = qkv + (uint64_t)(Hk + h) * D;
-                for (uint32_t i = 0; i < D; i++) { ss += (double)q[i] * q[i]; }
-                float qs = 1.0f / sqrtf((float)ss + 1e-6f) * (1.0f / sqrtf((float)D));
-                ss = 0.0;
-                for (uint32_t i = 0; i < D; i++) ss += (double)k[i] * k[i];
-                const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
-                for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
-            }
-            for (uint32_t h = 0; h < Hv; h++) {
-                const float sp = qwen35_cpu_softplus(ga[h] + bias[h]);
-                ga[h] = expf(A[h] * sp);
-                gb[h] = 1.0f / (1.0f + expf(-gb[h])); /* sigmoid */
-            }
-            /* scan: per (v-head, dim) recurrence. */
-            float *state = s->qwen35_cpu_ssm_state[il];
-            for (uint32_t h = 0; h < Hv; h++) {
-                const uint32_t kh = h % Hk;
-                const float decay = ga[h], beta = gb[h];
-                const float *k = qkv + (uint64_t)(Hk + kh) * D;
-                const float *q = qkv + (uint64_t)kh * D;
-                float *sv = state + (uint64_t)h * D * D;
-                for (uint32_t dv = 0; dv < D; dv++) {
-                    float *srow = sv + (uint64_t)dv * D;
-                    const float v = qkv[(uint64_t)(2u * Hk + h) * D + dv];
-                    float u = 0.0f;
-                    for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
-                    const float delta = (v - u) * beta;
-                    float o = 0.0f;
-                    for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
-                    lin_o[(uint64_t)h * D + dv] = o;
-                }
-            }
-            PROF_TOCK(t_ps);
-            /* out: per-head RMS with the SHARED 128-wide norm weight (the
-             * Mamba-style norm reuses one weight vector across the v heads,
-             * mirroring the GPU's gdn_out w[k0+i]) + silu(z) gate. */
-            PROF_TICK();
-            const float *nw = qwen4_ref_f32(m, l->lin_norm);
-            for (uint32_t s = 0; s < Hv; s++) {
-                qwen4_ref_rms(tmp + (uint64_t)s * D, lin_o + (uint64_t)s * D, nw, D, eps);
-            }
-            for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
-                tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
-            }
-            /* the lanes past Hv*D were never gated; left as-is they carry
-             * uninitialised memory into lin_out and make the forward
-             * non-deterministic. Zero them. */
-            memset(tmp + (uint32_t)Hv * D, 0,
-                   (size_t)(C - (uint32_t)Hv * D) * sizeof(float));
-            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
-                fprintf(stderr, "[gdnr] post-norm tmp=%.6f lin_o=%.6f\n",
-                        qwen35_dbg_l2(tmp, C), qwen35_dbg_l2(lin_o, (uint64_t)Hv * D));
-            PROF_TOCK(t_norm);
-            PROF_TICK();
+            /* the same shared per-token block the batched path uses */
+            qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp, lin_o, ga, gb);
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {

@@ -74303,6 +74303,12 @@ static void qwen35_cpu_forward_batch(
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
         qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, false);
         for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+        if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
+            for (uint32_t t = 0; t < n_tok; t++)
+                fprintf(stderr, "[gdnb] t=%u POST-FFN xb_l2=%.6f ffn_l2=%.6f\n",
+                        t, qwen35_dbg_l2(xb + (uint64_t)t * E, E),
+                        qwen35_dbg_l2(blk + (uint64_t)t * E, E));
+        }
     }
     /* the output head per position. */
     for (uint32_t t = 0; t < n_tok; t++) {

@@ -74221,14 +74221,17 @@ static void qwen35_cpu_forward_batch(
                     qwen4_ref_rms(tmp + (uint64_t)t * C + (uint64_t)sh * D,
                                   lin_o + (uint64_t)t * OW + (uint64_t)sh * D, nw, D, eps);
                 /* The reference gates only the first Hv*D (=4096) lanes; the
-                 * remaining C-Hv*D lanes are passed through untouched, i.e.
-                 * they carry whatever the session's tmp buffer held. Reproduce
-                 * that exactly: copy the carry lanes from the session buffer. */
+                 * remaining C-Hv*D lanes are passed through untouched. That
+                 * pass-through reads uninitialised session memory, which makes
+                 * the whole forward non-deterministic (values of 1e18 were
+                 * observed). Zero them instead - deterministic and neutral,
+                 * since the lin_out projection's contribution from those lanes
+                 * was never meaningful. */
                 for (uint32_t i = 0; i < OW; i++) {
                     const float zv = zz[i];
                     tmp[(uint64_t)t * C + i] *= zv / (1.0f + expf(-zv));
                 }
-                memcpy(tmp + (uint64_t)t * C + OW, s->qwen35_cpu_buf[2] + OW,
+                memset(tmp + (uint64_t)t * C + OW, 0,
                        (size_t)(C - OW) * sizeof(float));
                 if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1)
                     fprintf(stderr, "[gdnb] t=%u post-norm tmp=%.6f lin_o=%.6f\n",
@@ -74237,11 +74240,8 @@ static void qwen35_cpu_forward_batch(
             }
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, true);
-            /* carry the pass-through lanes forward exactly like the reference
-             * does (it leaves them as whatever the session buffer held). */
-            memcpy(s->qwen35_cpu_buf[2] + OW,
-                   tmp + (uint64_t)(n_tok - 1) * C + OW,
-                   (size_t)(C - OW) * sizeof(float));
+            /* the pass-through lanes are zeroed per token above (see the gate
+             * comment) - nothing to carry forward. */
             /* (no residual: the GDN path adds it below) */
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
                 for (uint32_t t = 0; t < n_tok; t++)
@@ -74322,11 +74322,24 @@ static void qwen35_cpu_forward_batch(
         for (uint32_t t = 0; t < n_tok; t++)
             qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
                           qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+        const int ffn_dbg = getenv("DS4_QWEN35_GDN_DBG") != NULL && il == 0;
+#define FFN_CHK(tag) do { if (ffn_dbg) { \
+            fprintf(stderr, "[ffn] " tag " xb_l2=%.6f blk_l2=%.6f fa=%.6f fb=%.6f\n", \
+                    qwen35_dbg_l2(xb + (uint64_t)(n_tok - 1) * E, E), \
+                    qwen35_dbg_l2(blk + (uint64_t)(n_tok - 1) * E, E), \
+                    qwen35_dbg_l2(ff_a, NT * FF), qwen35_dbg_l2(ff_b, NT * FF)); \
+        } } while (0)
+        FFN_CHK("post-norm");
         qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, false);
+        FFN_CHK("gate");
         qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, false);
+        FFN_CHK("up");
         for (uint64_t i = 0; i < NT * FF; i++)
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
+        FFN_CHK("silu");
         qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, false);
+        FFN_CHK("down");
+#undef FFN_CHK
         for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
             for (uint32_t t = 0; t < n_tok; t++)
@@ -74637,6 +74650,11 @@ static void qwen35_cpu_forward_token(
             for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
                 tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
             }
+            /* the lanes past Hv*D were never gated; left as-is they carry
+             * uninitialised memory into lin_out and make the forward
+             * non-deterministic. Zero them. */
+            memset(tmp + (uint32_t)Hv * D, 0,
+                   (size_t)(C - (uint32_t)Hv * D) * sizeof(float));
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
                 fprintf(stderr, "[gdnr] post-norm tmp=%.6f lin_o=%.6f\n",
                         qwen35_dbg_l2(tmp, C), qwen35_dbg_l2(lin_o, (uint64_t)Hv * D));

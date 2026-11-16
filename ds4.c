@@ -74041,12 +74041,14 @@ static void qwen35_cpu_matvec_batch(
         .exact = exact,
     };
     ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
-    if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0) {
+    if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0 &&
+        (exact || getenv("DS4_QWEN35_CORE_DBG_Q8"))) {
         /* compare the batched kernel against the per-token kernel on the very
          * same activation rows */
         float *ref_out = xmalloc((size_t)rows * sizeof(float));
+        block_q8_K *q8_ref = xmalloc((size_t)blocks * sizeof(block_q8_K));
         for (uint64_t t = 0; t < n_tok && t < 3; t++) {
-            qwen35_cpu_matvec(m, w, x + t * ctx.in_dim, ref_out, NULL, exact);
+            qwen35_cpu_matvec(m, w, x + t * ctx.in_dim, ref_out, q8_ref, exact);
             double md = 0.0;
             uint64_t mdi = 0;
             const float *bo = out + t * ctx.out_dim;
@@ -74067,6 +74069,7 @@ static void qwen35_cpu_matvec_batch(
             }
         }
         free(ref_out);
+        free(q8_ref);
     }
     free(xq);
 }

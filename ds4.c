@@ -73822,7 +73822,8 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
         return;
     }
     uint64_t row = row0;
-    if (ctx->type == DS4_TENSOR_Q4_K && getenv("DS4_QWEN35_NO_X4") == NULL) {
+    if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
+        getenv("DS4_QWEN35_NO_X4") == NULL) {
         /* Use the same 4-row kernel the batched path uses, so both paths
          * compute bit-identical results (and this one gets the ILP win too). */
         for (; row + 3u < row1; row += 4u) {
@@ -74100,9 +74101,11 @@ static void qwen35_gdn_token(
         }
     }
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
-        fprintf(stderr, "[gdn]   postconv_qk=%.6f zz=%.6f lin_o=%.6f\n",
+        fprintf(stderr, "[gdn]   qk=%.6f zz=%.6f (z0=%.6f z1=%.6f z2=%.6f "
+                "zlast=%.6f) lin_o=%.6f\n",
                 qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
-                qwen35_dbg_l2(lin_o, OW));
+                (double)zz[0], (double)zz[1], (double)zz[2],
+                (double)zz[C - 1], qwen35_dbg_l2(lin_o, OW));
     const float *nw = qwen4_ref_f32(m, l->lin_norm);
     for (uint32_t sh = 0; sh < Hv; sh++)
         qwen4_ref_rms(tmp_row + (uint64_t)sh * D, lin_o + (uint64_t)sh * D, nw, D, eps);

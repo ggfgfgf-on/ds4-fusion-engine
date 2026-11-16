@@ -73924,6 +73924,21 @@ static double qwen35_dbg_l2(const float *v, uint64_t n) {
     return s;
 }
 
+/* NaN/Inf census: a bare L2 checksum hides them (NaN poisons the sum but a
+ * NaN-vs-NaN difference also reads as 0, which is how a broken kernel looked
+ * 'identical'). Always print this next to a checksum. */
+static void qwen35_dbg_nan(const char *tag, const float *v, uint64_t n) {
+    uint64_t bad = 0, first = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (!isfinite(v[i])) {
+            if (bad == 0) first = i;
+            bad++;
+        }
+    }
+    if (bad) fprintf(stderr, "[nan] %s nonfinite=%llu first=%llu\n", tag,
+                     (unsigned long long)bad, (unsigned long long)first);
+}
+
 typedef struct {
     const uint8_t *data;
     block_q8_K *xq;          /* the n_tok * blocks, token-major */
@@ -74037,12 +74052,19 @@ static void qwen35_cpu_matvec_batch(
             const float *bo = out + t * ctx.out_dim;
             for (uint64_t i = 0; i < rows; i++) {
                 const double d = fabs((double)bo[i] - (double)ref_out[i]);
-                if (d > md) { md = d; mdi = i; }
+                if (!isfinite(d) || d > md) { md = d; mdi = i; }
             }
             fprintf(stderr, "[core] t=%llu rows=%llu md=%.6g at %llu "
                     "batch[0]=%.6f ref[0]=%.6f\n",
                     (unsigned long long)t, (unsigned long long)rows, md,
                     (unsigned long long)mdi, (double)bo[0], (double)ref_out[0]);
+            {
+                char tag[64];
+                snprintf(tag, sizeof tag, "core-batch t=%llu", (unsigned long long)t);
+                qwen35_dbg_nan(tag, bo, rows);
+                snprintf(tag, sizeof tag, "core-ref   t=%llu", (unsigned long long)t);
+                qwen35_dbg_nan(tag, ref_out, rows);
+            }
         }
         free(ref_out);
     }

@@ -84803,7 +84803,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint64_t stride = ssm_f + conv_f;
             const int nv = prompt->len;
             float *save = xmalloc((size_t)DS4_MAX_LAYER * (size_t)stride * sizeof(float));
-            float *lg_batch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            /* one logits row per position: the batched forward writes all nv */
+            float *lg_batch = xmalloc((size_t)nv * (size_t)DS4_N_VOCAB * sizeof(float));
             float *lg_ref = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
             int *toks = xmalloc((size_t)nv * sizeof(int));
             for (int i = 0; i < nv; i++) toks[i] = prompt->v[i];
@@ -84828,10 +84829,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                          toks[i], (uint32_t)i);
             double maxd = 0.0;
             int argb = 0, argr = 0;
+            const float *last = lg_batch + (size_t)(nv - 1) * DS4_N_VOCAB;
             for (int i = 0; i < (int)DS4_N_VOCAB; i++) {
-                const double d = fabs((double)lg_batch[i] - (double)lg_ref[i]);
+                const double d = fabs((double)last[i] - (double)lg_ref[i]);
                 if (d > maxd) maxd = d;
-                if (lg_batch[i] > lg_batch[argb]) argb = i;
+                if (last[i] > last[argb]) argb = i;
                 if (lg_ref[i] > lg_ref[argr]) argr = i;
             }
             fprintf(stderr, "[batchverify] n=%d max|diff|=%.6g argmax batch=%d ref=%d %s\n",
@@ -84942,10 +84944,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * to run one single-token forward per prompt token, which reads the
              * whole model per token; the batched kernel reads the weight rows
              * once for the whole chunk. */
-            /* 16 is the largest chunk that still produces correct output in
-             * every run measured; 24/32 are faster but intermittently
-             * corrupted, and the cause is not yet isolated. */
-            uint32_t pbatch = 16;
+            /* The batched forward is NOT bit-identical to the per-token path
+             * (DS4_QWEN35_BATCH_VERIFY reports max|diff|~21 and a different
+             * argmax), so the prefill stays on the reference path until the
+             * batch kernel is actually correct. The batched path itself is
+             * kept for the speculation work and for future debugging. */
+            uint32_t pbatch = 1;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);

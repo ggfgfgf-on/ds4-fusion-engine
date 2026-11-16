@@ -73508,6 +73508,61 @@ static float qwen35_dot_q4_K_q8_K_maddubs(const block_q4_K *x, const block_q8_K 
     return d * (float)qwen35_hsum_i32(acc) + dm * (float)summs;
 }
 
+/* Four weight rows in one pass: the q8 block loads are shared across the rows
+ * and the four independent accumulator chains let the madd pipelines overlap.
+ * Same math as the single-row maddubs dot, so the results are bit-identical. */
+static void qwen35_dot_q4_K_q8_K_x4(
+        const block_q4_K *x0, const block_q4_K *x1,
+        const block_q4_K *x2, const block_q4_K *x3,
+        const block_q8_K *y, uint64_t blocks, float out[4]) {
+    const __m256i m0F = _mm256_set1_epi8(0x0F);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const block_q8_K *yb = y + b;
+        const float yd = yb->d;
+        const int8_t *q8 = yb->qs;
+        __m256i a0 = _mm256_setzero_si256();
+        __m256i a1 = _mm256_setzero_si256();
+        __m256i a2 = _mm256_setzero_si256();
+        __m256i a3 = _mm256_setzero_si256();
+        int64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
+            const __m256i q8b = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
+            const int32_t bs = (int32_t)yb->bsums[2 * j] + (int32_t)yb->bsums[2 * j + 1];
+            uint8_t sc, mv;
+#define Q4K_X4_ROW(acc, sum, xp)                                                   \
+            do {                                                                    \
+                q4_k_get_scale_min(j, (xp)[b].scales, &sc, &mv);                     \
+                sum += (int64_t)mv * bs;                                            \
+                __m256i q4n = _mm256_and_si256(_mm256_srli_epi16(                    \
+                        _mm256_loadu_si256((const __m256i *)((xp)[b].qs + byte_off)), \
+                        shift), m0F);                                                \
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(                       \
+                        _mm256_maddubs_epi16(q4n, q8b),                              \
+                        _mm256_set1_epi16((short)sc)));                              \
+            } while (0)
+            Q4K_X4_ROW(a0, s0, x0);
+            Q4K_X4_ROW(a1, s1, x1);
+            Q4K_X4_ROW(a2, s2, x2);
+            Q4K_X4_ROW(a3, s3, x3);
+#undef Q4K_X4_ROW
+        }
+        const float d0 = yd * f16_to_f32(x0[b].d), m0 = -yd * f16_to_f32(x0[b].dmin);
+        const float d1 = yd * f16_to_f32(x1[b].d), m1 = -yd * f16_to_f32(x1[b].dmin);
+        const float d2 = yd * f16_to_f32(x2[b].d), m2 = -yd * f16_to_f32(x2[b].dmin);
+        const float d3 = yd * f16_to_f32(x3[b].d), m3 = -yd * f16_to_f32(x3[b].dmin);
+        acc0 += d0 * (float)qwen35_hsum_i32(a0) + m0 * (float)s0;
+        acc1 += d1 * (float)qwen35_hsum_i32(a1) + m1 * (float)s1;
+        acc2 += d2 * (float)qwen35_hsum_i32(a2) + m2 * (float)s2;
+        acc3 += d3 * (float)qwen35_hsum_i32(a3) + m3 * (float)s3;
+    }
+    out[0] = acc0;
+    out[1] = acc1;
+    out[2] = acc2;
+    out[3] = acc3;
+}
+
 /* AVX2 Q6_K x Q8_K per block (the maddubs route with the +32 unsigned offset
  * and the -32*sum(q8) correction per the pair). */
 static float qwen35_dot_q6_K_q8_K_maddubs(const block_q6_K *x, const block_q8_K *y) {
@@ -73877,7 +73932,28 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
     qwen35_cpu_matvec_batch_ctx *ctx = vctx;
     const uint64_t blocks = ctx->in_dim / QK_K;
 #if defined(__AVX2__)
-    for (uint64_t row = row0; row < row1; row++) {
+    uint64_t row = row0;
+    if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact) {
+        /* four rows at a time: the activation loads are shared and the four
+         * accumulator chains overlap in the madd pipelines. */
+        for (; row + 3u < row1; row += 4u) {
+            const block_q4_K *r0 = (const block_q4_K *)(ctx->data + row * ctx->row_bytes);
+            const block_q4_K *r1 = (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
+            const block_q4_K *r2 = (const block_q4_K *)(ctx->data + (row + 2u) * ctx->row_bytes);
+            const block_q4_K *r3 = (const block_q4_K *)(ctx->data + (row + 3u) * ctx->row_bytes);
+            _mm_prefetch((const char *)(ctx->data + (row + 12u) * ctx->row_bytes), _MM_HINT_T0);
+            for (uint64_t t = 0; t < ctx->n_tok; t++) {
+                float o4[4];
+                qwen35_dot_q4_K_q8_K_x4(r0, r1, r2, r3, ctx->xq + t * blocks, blocks, o4);
+                float *dst = ctx->out + t * ctx->out_dim + row;
+                dst[0] = o4[0];
+                dst[1] = o4[1];
+                dst[2] = o4[2];
+                dst[3] = o4[3];
+            }
+        }
+    }
+    for (; row < row1; row++) {
         const uint8_t *rdata = ctx->data + row * ctx->row_bytes;
         _mm_prefetch((const char *)(ctx->data + (row + 8u) * ctx->row_bytes), _MM_HINT_T0);
         for (uint64_t t = 0; t < ctx->n_tok; t++) {
@@ -84757,9 +84833,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * to run one single-token forward per prompt token, which reads the
              * whole model per token; the batched kernel reads the weight rows
              * once for the whole chunk. */
-            /* 16 is the sweet spot: 2.7x over the per-token loop, and larger
-             * chunks only add memory without measurable gain. */
-            uint32_t pbatch = 16;
+            /* 32 is the measured sweet spot with the 4-row kernel; beyond that
+             * the gain flattens and the score buffers grow. */
+            uint32_t pbatch = 32;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);

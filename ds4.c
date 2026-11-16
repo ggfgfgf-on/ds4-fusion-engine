@@ -74026,6 +74026,26 @@ static void qwen35_cpu_matvec_batch(
         .exact = exact,
     };
     ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
+    if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0) {
+        /* compare the batched kernel against the per-token kernel on the very
+         * same activation rows */
+        float *ref_out = xmalloc((size_t)rows * sizeof(float));
+        for (uint64_t t = 0; t < n_tok && t < 3; t++) {
+            qwen35_cpu_matvec(m, w, x + t * ctx.in_dim, ref_out, NULL, exact);
+            double md = 0.0;
+            uint64_t mdi = 0;
+            const float *bo = out + t * ctx.out_dim;
+            for (uint64_t i = 0; i < rows; i++) {
+                const double d = fabs((double)bo[i] - (double)ref_out[i]);
+                if (d > md) { md = d; mdi = i; }
+            }
+            fprintf(stderr, "[core] t=%llu rows=%llu md=%.6g at %llu "
+                    "batch[0]=%.6f ref[0]=%.6f\n",
+                    (unsigned long long)t, (unsigned long long)rows, md,
+                    (unsigned long long)mdi, (double)bo[0], (double)ref_out[0]);
+        }
+        free(ref_out);
+    }
     free(xq);
 }
 
@@ -74102,10 +74122,13 @@ static void qwen35_cpu_forward_batch(
             const float *A = qwen4_ref_f32(m, l->lin_a);
             const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
             const float *nw = qwen4_ref_f32(m, l->lin_norm);
+            /* the lin_qkv output row is NOT QW wide - use the tensor's real
+             * output dim, otherwise every t>0 row starts at the wrong offset. */
+            const uint32_t QKV_STRIDE = (uint32_t)l->lin_qkv->dim[1];
             float *hist = s->qwen35_cpu_conv_hist[il];
             float *state = s->qwen35_cpu_ssm_state[il];
             for (uint32_t t = 0; t < n_tok; t++) {
-                float *qk = qkv + (uint64_t)t * QW;
+                float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 float *zz = z + (uint64_t)t * C;
                 float *gv = gate + (uint64_t)t * C;
                 if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1) {

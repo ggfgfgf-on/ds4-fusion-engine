@@ -74109,8 +74109,14 @@ static void qwen35_cpu_forward_batch(
                 float *zz = z + (uint64_t)t * C;
                 float *gv = gate + (uint64_t)t * C;
                 if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1) {
-                    fprintf(stderr, "[gdnb] t=%u pre-conv qkv=%.6f z=%.6f\n",
-                            t, qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C));
+                    fprintf(stderr, "[gdnb] t=%u pre-conv qkv=%.6f z=%.6f "
+                            "q0=%.6f q1=%.6f q2=%.6f blk0=%.6f blk1=%.6f "
+                            "blkfull=%.6f\n",
+                            t, qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
+                            (double)qk[0], (double)qk[1], (double)qk[2],
+                            (double)blk[(uint64_t)t * E + 0],
+                            (double)blk[(uint64_t)t * E + 1],
+                            qwen35_dbg_l2(blk + (uint64_t)t * E, E));
                 }
                 for (uint32_t c = 0; c < C; c++) {
                     float v = conv_w[c * 4u + 3u] * qk[c];
@@ -74479,8 +74485,11 @@ static void qwen35_cpu_forward_token(
             qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
             qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
-                fprintf(stderr, "[gdnr] pre-conv qkv=%.6f z=%.6f\n",
-                        qwen35_dbg_l2(qkv, C), qwen35_dbg_l2(z, C));
+                fprintf(stderr, "[gdnr] pre-conv qkv=%.6f z=%.6f "
+                        "q0=%.6f q1=%.6f q2=%.6f blk0=%.6f blkfull=%.6f\n",
+                        qwen35_dbg_l2(qkv, C), qwen35_dbg_l2(z, C),
+                        (double)qkv[0], (double)qkv[1], (double)qkv[2],
+                        (double)blk[0], qwen35_dbg_l2(blk, E));
             PROF_TOCK(t_mv);
             PROF_TICK();
             const float *conv_w = qwen4_ref_f32(m, l->lin_conv);

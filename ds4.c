@@ -74263,7 +74263,7 @@ static void qwen35_cpu_forward_batch(
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: the batched qkv/gate projections, then the shared
              * per-token block so this path cannot drift from the reference. */
-            const bool gdn_exact = getenv("DS4_QWEN35_GDN_Q8") == NULL;
+            const bool gdn_exact = false;  /* maddubs on both paths; keep them equal */
             qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
             qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
@@ -74622,8 +74622,8 @@ static void qwen35_cpu_forward_token(
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: qkv + gate projections, causal conv (silu), scan. */
             PROF_TICK();
-            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
-            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
+            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, false);
+            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, false);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
                 fprintf(stderr, "[gater] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
                         (unsigned long long)l->lin_gate->dim[0],
@@ -74646,7 +74646,7 @@ static void qwen35_cpu_forward_token(
             /* the same shared per-token block the batched path uses */
             qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
                              (uint32_t)l->lin_out->dim[0], lin_o, ga, gb);
-            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);
+            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, false);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
                 const float *nw2 = qwen4_ref_f32(m, l->lin_norm);
@@ -85094,7 +85094,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* the batched forward is now bit-identical to the per-token path
              * (verified max|diff|=0 for n=1..59), so batch the prompt by
              * default: 2.9 -> 7.2 t/s prefill on the dense 27B. */
-            uint32_t pbatch = 16;
+            uint32_t pbatch = 48;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);

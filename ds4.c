@@ -74259,6 +74259,11 @@ static void qwen35_cpu_forward_batch(
             const bool gdn_exact = getenv("DS4_QWEN35_GDN_Q8") == NULL;
             qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
             qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+                fprintf(stderr, "[gateb] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
+                        (unsigned long long)l->lin_gate->dim[0],
+                        (unsigned long long)l->lin_gate->dim[1],
+                        (double)z[6142], (double)z[6143]);
             const uint32_t QKV_STRIDE = (uint32_t)l->lin_qkv->dim[1];
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
@@ -74606,6 +74611,11 @@ static void qwen35_cpu_forward_token(
             PROF_TICK();
             qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
             qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+                fprintf(stderr, "[gater] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
+                        (unsigned long long)l->lin_gate->dim[0],
+                        (unsigned long long)l->lin_gate->dim[1],
+                        (double)z[6142], (double)z[6143]);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
                 fprintf(stderr, "[gdnr] pre-conv qkv=%.6f z=%.6f "
                         "q0=%.6f q1=%.6f q2=%.6f blk0=%.6f blkfull=%.6f\n",

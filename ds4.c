@@ -74046,7 +74046,7 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
 static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
         float *qk, const float *blk, const float *zz,
-        float *tmp_row, float *lin_o, float *ga, float *gb) {
+        float *tmp_row, uint32_t tmp_dim, float *lin_o, float *ga, float *gb) {
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t OW = Hv * D;
@@ -74116,7 +74116,8 @@ static void qwen35_gdn_token(
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
         fprintf(stderr, "[memset] OW=%u C=%u before4096=%.6f before4097=%.6f\n",
                 OW, C, (double)tmp_row[OW], (double)tmp_row[OW+1]);
-    memset(tmp_row + OW, 0, (size_t)(C - OW) * sizeof(float));
+    if (tmp_dim > OW)
+        memset(tmp_row + OW, 0, (size_t)(tmp_dim - OW) * sizeof(float));
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
         double hs = 0.0, ss = 0.0;
         for (uint32_t i = 0; i < 3u * C; i++) { const double v = hist[i]; hs += v * v; }
@@ -74275,12 +74276,14 @@ static void qwen35_cpu_forward_batch(
              * here shifted every token past the first onto the previous
              * token's row and read the wrong gate vector. */
             const uint32_t ZW = (uint32_t)l->lin_gate->dim[1];
+            /* tmp rows are lin_out's input width, NOT C (they differ). */
+            const uint32_t TW = (uint32_t)l->lin_out->dim[0];
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
                                  blk + (uint64_t)t * E,
                                  z + (uint64_t)t * ZW,
-                                 tmp + (uint64_t)t * C,
+                                 tmp + (uint64_t)t * TW, TW,
                                  lin_o + (uint64_t)t * OW,
                                  ga + (uint64_t)t * Hv,
                                  gb + (uint64_t)t * Hv);
@@ -74641,7 +74644,8 @@ static void qwen35_cpu_forward_token(
             PROF_TOCK(t_mv);
             PROF_TICK();
             /* the same shared per-token block the batched path uses */
-            qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp, lin_o, ga, gb);
+            qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
+                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb);
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {

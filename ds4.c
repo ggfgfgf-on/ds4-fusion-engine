@@ -74265,11 +74265,15 @@ static void qwen35_cpu_forward_batch(
                         (unsigned long long)l->lin_gate->dim[1],
                         (double)z[6142], (double)z[6143]);
             const uint32_t QKV_STRIDE = (uint32_t)l->lin_qkv->dim[1];
+            /* z rows are lin_gate-width (6144), NOT C (10240): using C
+             * here shifted every token past the first onto the previous
+             * token's row and read the wrong gate vector. */
+            const uint32_t ZW = (uint32_t)l->lin_gate->dim[1];
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
                                  blk + (uint64_t)t * E,
-                                 z + (uint64_t)t * C,
+                                 z + (uint64_t)t * ZW,
                                  tmp + (uint64_t)t * C,
                                  lin_o + (uint64_t)t * OW,
                                  ga + (uint64_t)t * Hv,

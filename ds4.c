@@ -74099,6 +74099,10 @@ static void qwen35_gdn_token(
             lin_o[(uint64_t)h * D + dv] = o;
         }
     }
+    if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+        fprintf(stderr, "[gdn]   postconv_qk=%.6f zz=%.6f lin_o=%.6f\n",
+                qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
+                qwen35_dbg_l2(lin_o, OW));
     const float *nw = qwen4_ref_f32(m, l->lin_norm);
     for (uint32_t sh = 0; sh < Hv; sh++)
         qwen4_ref_rms(tmp_row + (uint64_t)sh * D, lin_o + (uint64_t)sh * D, nw, D, eps);
@@ -74107,6 +74111,13 @@ static void qwen35_gdn_token(
     /* the lanes past OW are never gated; zero them so the forward stays
      * deterministic (they used to carry uninitialised heap memory). */
     memset(tmp_row + OW, 0, (size_t)(C - OW) * sizeof(float));
+    if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
+        double hs = 0.0, ss = 0.0;
+        for (uint32_t i = 0; i < 3u * C; i++) { const double v = hist[i]; hs += v * v; }
+        for (uint32_t i = 0; i < Hv * D * D; i++) { const double v = state[i]; ss += v * v; }
+        fprintf(stderr, "[gdn] tmp=%.6f hist=%.6f state=%.6f\n",
+                qwen35_dbg_l2(tmp_row, C), hs, ss);
+    }
 }
 
 static void qwen35_cpu_matvec_batch(
@@ -74709,6 +74720,9 @@ static void qwen35_cpu_forward_token(
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
         qwen35_cpu_matvec(m, l->ffn_down, ff_b, blk, s->qwen35_cpu_q8, false);
         PROF_TOCK(t_mv);
+        if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+            fprintf(stderr, "[gdnr] POST-FFN pre-resid xb_l2=%.6f ffn_l2=%.6f\n",
+                    qwen35_dbg_l2(cur, E), qwen35_dbg_l2(blk, E));
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
     }
     PROF_TICK();
@@ -82080,8 +82094,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
             const uint64_t buf_sizes[12] = {
                 (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * 2u, /* qkv: GDN qkv + attn q|gate (2*H*HD) */
-                (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* z/lin_o */
-                (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* tmp */
+                (uint64_t)DS4_N_LIN_CONV_DIM,        /* z: lin_gate is C-wide */
+                (uint64_t)DS4_N_LIN_CONV_DIM,        /* tmp: lin_out input is C-wide */
                 (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM, /* lin_o */
                 DS4_N_FF_DENSE,                      /* ff_a (gate) */
                 DS4_N_FF_DENSE,                      /* ff_b (up/down in) */

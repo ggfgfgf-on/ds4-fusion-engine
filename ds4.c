@@ -74113,13 +74113,19 @@ static void qwen35_gdn_token(
         tmp_row[i] *= zz[i] / (1.0f + expf(-zz[i]));
     /* the lanes past OW are never gated; zero them so the forward stays
      * deterministic (they used to carry uninitialised heap memory). */
+    if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+        fprintf(stderr, "[memset] OW=%u C=%u before4096=%.6f before4097=%.6f\n",
+                OW, C, (double)tmp_row[OW], (double)tmp_row[OW+1]);
     memset(tmp_row + OW, 0, (size_t)(C - OW) * sizeof(float));
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
         double hs = 0.0, ss = 0.0;
         for (uint32_t i = 0; i < 3u * C; i++) { const double v = hist[i]; hs += v * v; }
         for (uint32_t i = 0; i < Hv * D * D; i++) { const double v = state[i]; ss += v * v; }
-        fprintf(stderr, "[gdn] tmp=%.6f hist=%.6f state=%.6f\n",
-                qwen35_dbg_l2(tmp_row, C), hs, ss);
+        fprintf(stderr, "[gdn] tmp=%.6f t0=%.6f t1=%.6f t2=%.6f t4095=%.6f "
+                "t4096=%.6f t10239=%.6f hist=%.6f state=%.6f\n",
+                qwen35_dbg_l2(tmp_row, C), (double)tmp_row[0], (double)tmp_row[1],
+                (double)tmp_row[2], (double)tmp_row[4095], (double)tmp_row[4096],
+                (double)tmp_row[C-1], hs, ss);
     }
 }
 
@@ -74723,6 +74729,9 @@ static void qwen35_cpu_forward_token(
             }
         }
         /* residual */
+        if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+            fprintf(stderr, "[residr] cur=%.6f blk=%.6f\n",
+                    qwen35_dbg_l2(cur, E), qwen35_dbg_l2(blk, E));
         for (uint32_t i = 0; i < E; i++) cur[i] += blk[i];
         /* dense FFN: post_attn_norm -> gate/up -> silu -> down -> residual */
         PROF_TICK();

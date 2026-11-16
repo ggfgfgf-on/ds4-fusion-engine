@@ -73915,6 +73915,15 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
  * weight row once and accumulate the dots for all tokens. The weight read is
  * the dominant cost (15.66GB/token on the dense 27B), so N tokens cost about
  * the same bandwidth as one - this is the speculative-verify amortization. */
+static double qwen35_dbg_l2(const float *v, uint64_t n) {
+    double s = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        const double x = v[i];
+        s += x * x;
+    }
+    return s;
+}
+
 typedef struct {
     const uint8_t *data;
     block_q8_K *xq;          /* the n_tok * blocks, token-major */
@@ -74099,6 +74108,10 @@ static void qwen35_cpu_forward_batch(
                 float *qk = qkv + (uint64_t)t * QW;
                 float *zz = z + (uint64_t)t * C;
                 float *gv = gate + (uint64_t)t * C;
+                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1) {
+                    fprintf(stderr, "[gdnb] t=%u pre-conv qkv=%.6f z=%.6f\n",
+                            t, qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C));
+                }
                 for (uint32_t c = 0; c < C; c++) {
                     float v = conv_w[c * 4u + 3u] * qk[c];
                     for (uint32_t i = 0; i < 3; i++)
@@ -74108,6 +74121,9 @@ static void qwen35_cpu_forward_batch(
                     hist[(uint64_t)2 * C + c] = qk[c];
                     qk[c] = v / (1.0f + expf(-v));
                 }
+                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1)
+                    fprintf(stderr, "[gdnb] t=%u post-conv qkv=%.6f\n",
+                            t, qwen35_dbg_l2(qk, C));
                 qwen4_ref_matvec(m, l->lin_alpha, blk + (uint64_t)t * E, ga + (uint64_t)t * Hv);
                 qwen4_ref_matvec(m, l->lin_beta, blk + (uint64_t)t * E, gb + (uint64_t)t * Hv);
                 for (uint32_t h = 0; h < Hv; h++) {
@@ -74145,13 +74161,28 @@ static void qwen35_cpu_forward_batch(
                 for (uint32_t sh = 0; sh < Hv; sh++)
                     qwen4_ref_rms(tmp + (uint64_t)t * C + (uint64_t)sh * D,
                                   lin_o + (uint64_t)t * OW + (uint64_t)sh * D, nw, D, eps);
-                for (uint32_t i = 0; i < C; i++) {
+                /* The reference gates only the first Hv*D (=4096) lanes; the
+                 * remaining C-Hv*D lanes are passed through untouched, i.e.
+                 * they carry whatever the session's tmp buffer held. Reproduce
+                 * that exactly: copy the carry lanes from the session buffer. */
+                for (uint32_t i = 0; i < OW; i++) {
                     const float zv = zz[i];
                     tmp[(uint64_t)t * C + i] *= zv / (1.0f + expf(-zv));
                 }
+                memcpy(tmp + (uint64_t)t * C + OW, s->qwen35_cpu_buf[2] + OW,
+                       (size_t)(C - OW) * sizeof(float));
+                if (getenv("DS4_QWEN35_GDN_DBG") && il == 0 && t == n_tok - 1)
+                    fprintf(stderr, "[gdnb] t=%u post-norm tmp=%.6f lin_o=%.6f\n",
+                            t, qwen35_dbg_l2(tmp + (uint64_t)t * C, C),
+                            qwen35_dbg_l2(lin_o + (uint64_t)t * OW, OW));
             }
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, true);
+            /* carry the pass-through lanes forward exactly like the reference
+             * does (it leaves them as whatever the session buffer held). */
+            memcpy(s->qwen35_cpu_buf[2] + OW,
+                   tmp + (uint64_t)(n_tok - 1) * C + OW,
+                   (size_t)(C - OW) * sizeof(float));
             /* (no residual: the GDN path adds it below) */
             for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         } else {

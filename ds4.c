@@ -73526,27 +73526,42 @@ static void qwen35_dot_q4_K_q8_K_x4(
         __m256i a2 = _mm256_setzero_si256();
         __m256i a3 = _mm256_setzero_si256();
         int64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-        for (int j = 0; j < 8; j++) {
-            const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
-            const __m256i q8b = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
-            const int32_t bs = (int32_t)yb->bsums[2 * j] + (int32_t)yb->bsums[2 * j + 1];
-            uint8_t sc, mv;
-#define Q4K_X4_ROW(acc, sum, xp)                                                   \
-            do {                                                                    \
-                q4_k_get_scale_min(j, (xp)[b].scales, &sc, &mv);                     \
-                sum += (int64_t)mv * bs;                                            \
-                __m256i q4n = _mm256_and_si256(_mm256_srli_epi16(                    \
-                        _mm256_loadu_si256((const __m256i *)((xp)[b].qs + byte_off)), \
-                        shift), m0F);                                                \
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(                       \
-                        _mm256_maddubs_epi16(q4n, q8b),                              \
-                        _mm256_set1_epi16((short)sc)));                              \
-            } while (0)
-            Q4K_X4_ROW(a0, s0, x0);
-            Q4K_X4_ROW(a1, s1, x1);
-            Q4K_X4_ROW(a2, s2, x2);
-            Q4K_X4_ROW(a3, s3, x3);
+        for (int j = 0; j < 8; j += 2) {
+            /* j and j+1 share one 32-byte load (shift 0 / 4), so hoist it and
+             * halve the weight-side load traffic. */
+            const int byte_off = (j >> 1) * 32;
+            const __m256i raw0 = _mm256_loadu_si256((const __m256i *)(x0[b].qs + byte_off));
+            const __m256i raw1 = _mm256_loadu_si256((const __m256i *)(x1[b].qs + byte_off));
+            const __m256i raw2 = _mm256_loadu_si256((const __m256i *)(x2[b].qs + byte_off));
+            const __m256i raw3 = _mm256_loadu_si256((const __m256i *)(x3[b].qs + byte_off));
+            for (int half = 0; half < 2; half++) {
+                const int jj = j + half;
+                const int shift = half * 4;
+                const __m256i q8b = _mm256_loadu_si256((const __m256i *)(q8 + jj * 32));
+                const int32_t bs = (int32_t)yb->bsums[2 * jj] + (int32_t)yb->bsums[2 * jj + 1];
+                uint8_t sc, mv;
+#define Q4K_X4_ROW(acc, sum, raw)                                              \
+                do {                                                           \
+                    __m256i q4n = _mm256_and_si256(                            \
+                            half ? _mm256_srli_epi16(raw, 4) : raw, m0F);      \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(             \
+                            _mm256_maddubs_epi16(q4n, q8b),                    \
+                            _mm256_set1_epi16((short)sc)));                    \
+                } while (0)
+                q4_k_get_scale_min(jj, x0[b].scales, &sc, &mv);
+                s0 += (int64_t)mv * bs;
+                Q4K_X4_ROW(a0, s0, raw0);
+                q4_k_get_scale_min(jj, x1[b].scales, &sc, &mv);
+                s1 += (int64_t)mv * bs;
+                Q4K_X4_ROW(a1, s1, raw1);
+                q4_k_get_scale_min(jj, x2[b].scales, &sc, &mv);
+                s2 += (int64_t)mv * bs;
+                Q4K_X4_ROW(a2, s2, raw2);
+                q4_k_get_scale_min(jj, x3[b].scales, &sc, &mv);
+                s3 += (int64_t)mv * bs;
+                Q4K_X4_ROW(a3, s3, raw3);
 #undef Q4K_X4_ROW
+            }
         }
         const float d0 = yd * f16_to_f32(x0[b].d), m0 = -yd * f16_to_f32(x0[b].dmin);
         const float d1 = yd * f16_to_f32(x1[b].d), m1 = -yd * f16_to_f32(x1[b].dmin);

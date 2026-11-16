@@ -74478,6 +74478,9 @@ static void qwen35_cpu_forward_token(
             PROF_TICK();
             qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, true);
             qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, true);
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+                fprintf(stderr, "[gdnr] pre-conv qkv=%.6f z=%.6f\n",
+                        qwen35_dbg_l2(qkv, C), qwen35_dbg_l2(z, C));
             PROF_TOCK(t_mv);
             PROF_TICK();
             const float *conv_w = qwen4_ref_f32(m, l->lin_conv);
@@ -74491,6 +74494,8 @@ static void qwen35_cpu_forward_token(
                 hist[(uint64_t)(DS4_N_LIN_CONV - 2u) * C + c] = qkv[c];
                 qkv[c] = v / (1.0f + expf(-v)); /* silu */
             }
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+                fprintf(stderr, "[gdnr] post-conv qkv=%.6f\n", qwen35_dbg_l2(qkv, C));
             PROF_TOCK(t_conv);
             PROF_TICK();
             qwen4_ref_matvec(m, l->lin_alpha, blk, ga);
@@ -74544,6 +74549,9 @@ static void qwen35_cpu_forward_token(
             for (uint32_t i = 0; i < (uint32_t)Hv * D; i++) {
                 tmp[i] *= z[i] / (1.0f + expf(-z[i])); /* silu gate (qwen35 form) */
             }
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
+                fprintf(stderr, "[gdnr] post-norm tmp=%.6f lin_o=%.6f\n",
+                        qwen35_dbg_l2(tmp, C), qwen35_dbg_l2(lin_o, (uint64_t)Hv * D));
             PROF_TOCK(t_norm);
             PROF_TICK();
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, true);

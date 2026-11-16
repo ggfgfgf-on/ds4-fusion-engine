@@ -84801,7 +84801,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                    DS4_N_LIN_HEAD_DIM;
             const uint64_t conv_f = 3ull * DS4_N_LIN_CONV_DIM;
             const uint64_t stride = ssm_f + conv_f;
-            const int nv = prompt->len;
+            const int nv_full = prompt->len;
+            int nv = nv_full;
+            /* the env value > 1 doubles as a token-count override so the exact
+             * first-diverging prefix can be bisected. */
+            const char *bvenv = getenv("DS4_QWEN35_BATCH_VERIFY");
+            if (bvenv && atoi(bvenv) > 1 && atoi(bvenv) < nv) nv = atoi(bvenv);
             float *save = xmalloc((size_t)DS4_MAX_LAYER * (size_t)stride * sizeof(float));
             /* one logits row per position: the batched forward writes all nv */
             float *lg_batch = xmalloc((size_t)nv * (size_t)DS4_N_VOCAB * sizeof(float));

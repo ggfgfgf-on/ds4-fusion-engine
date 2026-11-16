@@ -73974,8 +73974,15 @@ static void qwen35_cpu_forward_batch(
     float *lin_o = xmalloc((size_t)(NT * OW) * sizeof(float));
     float *ff_a  = xmalloc((size_t)(NT * FF) * sizeof(float));
     float *ff_b  = xmalloc((size_t)(NT * FF) * sizeof(float));
-    float *tmp   = xmalloc((size_t)(NT * OW) * sizeof(float));
+    /* the GDN out-projection consumes the C-wide (6144) normalized rows, not
+     * the OW-wide (4096) raw ones - allocate C and zero the tail the scan does
+     * not fill, so the multiply below never sees uninitialized memory. */
+    float *tmp   = xmalloc((size_t)(NT * C) * sizeof(float));
+    memset(tmp, 0, (size_t)(NT * C) * sizeof(float));
     float *q2    = xmalloc((size_t)(NT * H * HD) * sizeof(float));
+    /* the attention output rows must be CONTIGUOUS for the batched matvec
+     * (stride H*HD), not carved out of the wider FFN buffer. */
+    float *attn_o = xmalloc((size_t)(NT * H * HD) * sizeof(float));
     float *k2    = xmalloc((size_t)(NT * KV * HD) * sizeof(float));
     float *v2    = xmalloc((size_t)(NT * KV * HD) * sizeof(float));
     float *ga    = xmalloc((size_t)(NT * Hv) * sizeof(float));
@@ -74052,9 +74059,9 @@ static void qwen35_cpu_forward_batch(
                 for (uint32_t sh = 0; sh < Hv; sh++)
                     qwen4_ref_rms(tmp + (uint64_t)t * OW + (uint64_t)sh * D,
                                   lin_o + (uint64_t)t * OW + (uint64_t)sh * D, nw, D, eps);
-                for (uint32_t i = 0; i < OW; i++) {
+                for (uint32_t i = 0; i < C; i++) {
                     const float zv = zz[i];
-                    tmp[(uint64_t)t * OW + i] *= zv / (1.0f + expf(-zv));
+                    tmp[(uint64_t)t * C + i] *= zv / (1.0f + expf(-zv));
                 }
             }
             /* the batched out projection + the residual. */
@@ -74114,12 +74121,11 @@ static void qwen35_cpu_forward_batch(
                             o += sc_t[u] * kv[(uint64_t)(kv_cap * KV * HD) +
                                               (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
                         }
-                        ff_b[(uint64_t)t * FF + (uint64_t)h * HD + i] = o / (float)ss *
-                                (1.0f / (1.0f + expf(-gt[h * HD + i])));
-                    }
+                        attn_o[(uint64_t)t * (uint64_t)(H * HD) + (uint64_t)h * HD + i] =
+                                o / (float)ss * (1.0f / (1.0f + expf(-gt[h * HD + i])));                    }
                 }
             }
-            qwen35_cpu_matvec_batch(m, l->attn_output, ff_b, blk, NT, false);
+            qwen35_cpu_matvec_batch(m, l->attn_output, attn_o, blk, NT, false);
             for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         }
         /* the dense FFN: the batched post norm, gate/up/down. */
@@ -74173,7 +74179,7 @@ static void qwen35_cpu_forward_batch(
         free(hb);
         free(draft);
     }
-    free(score); free(gb); free(ga); free(v2); free(k2); free(q2);
+    free(score); free(gb); free(ga); free(v2); free(k2); free(q2); free(attn_o);
     free(tmp); free(ff_b); free(ff_a); free(lin_o); free(z); free(qkv);
     free(blk); free(xb);
 }
@@ -84729,18 +84735,53 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
 
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-            /* Fresh CPU sync for the qwen35: the same per-token forward as
-             * the incremental path, from an empty checkpoint. */
-            for (int i = 0; i < prompt->len; i++) {
+            /* Fresh CPU sync for the qwen35: batched forward. The prefill used
+             * to run one single-token forward per prompt token, which reads the
+             * whole model per token; the batched kernel reads the weight rows
+             * once for the whole chunk. */
+            /* N>1 is still incorrect (the second and later positions diverge),
+             * so the safe default stays 1 until that is fixed. */
+            uint32_t pbatch = 1;
+            const char *pbenv = getenv("DS4_PREFILL_BATCH");
+            if (pbenv && *pbenv) {
+                int pv = atoi(pbenv);
+                if (pv > 0 && pv <= 64) pbatch = (uint32_t)pv;
+            }
+            float *lb = xmalloc((size_t)pbatch * (size_t)DS4_N_VOCAB * sizeof(float));
+            int *buf = xmalloc((size_t)pbatch * sizeof(int));
+            for (int base = 0; base < prompt->len; base += (int)pbatch) {
                 if (ds4_session_cancelled(s)) {
                     snprintf(err, errlen, "interrupted");
+                    free(buf);
+                    free(lb);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                qwen35_cpu_forward_token(s->logits, &e->model, &e->weights,
-                                         s, prompt->v[i], (uint32_t)i);
-                token_vec_push(&s->checkpoint, prompt->v[i]);
-                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+                int n = (int)pbatch;
+                if (base + n > prompt->len) n = prompt->len - base;
+                for (int k = 0; k < n; k++) buf[k] = prompt->v[base + k];
+                qwen35_cpu_forward_batch(lb, &e->model, &e->weights, s,
+                                         buf, (uint32_t)n, (uint32_t)base);
+                if (getenv("DS4_QWEN35_BATCH_DBG")) {
+                    for (int k = 0; k < n; k++) {
+                        const float *row = lb + (size_t)k * DS4_N_VOCAB;
+                        int am = 0;
+                        for (int i = 1; i < (int)DS4_N_VOCAB; i++)
+                            if (row[i] > row[am]) am = i;
+                        fprintf(stderr, "[pbatch] base=%d n=%d k=%d tok=%d argmax=%d "
+                                "l0=%.4f l1=%.4f l2=%.4f\n",
+                                base, n, k, buf[k], am, (double)row[0], (double)row[1],
+                                (double)row[2]);
+                    }
+                }
+                for (int k = 0; k < n; k++)
+                    token_vec_push(&s->checkpoint, buf[k]);
+                memcpy(s->logits, lb + (size_t)(n - 1) * DS4_N_VOCAB,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+                if (s->progress)
+                    s->progress(s->progress_ud, "prefill_chunk", base + n, prompt->len);
             }
+            free(buf);
+            free(lb);
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             return 0;

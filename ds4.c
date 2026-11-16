@@ -73521,6 +73521,9 @@ static void qwen35_dot_q4_K_q8_K_x4(
         const block_q8_K *yb = y + b;
         const float yd = yb->d;
         const int8_t *q8 = yb->qs;
+        uint8_t scv[8], mvv[8];
+        for (int q = 0; q < 8; q++)
+            q4_k_get_scale_min(q, x0[b].scales, &scv[q], &mvv[q]);
         __m256i a0 = _mm256_setzero_si256();
         __m256i a1 = _mm256_setzero_si256();
         __m256i a2 = _mm256_setzero_si256();
@@ -73530,17 +73533,16 @@ static void qwen35_dot_q4_K_q8_K_x4(
             const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
             const __m256i q8b = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
             const int32_t bs = (int32_t)yb->bsums[2 * j] + (int32_t)yb->bsums[2 * j + 1];
-            uint8_t sc, mv;
 #define Q4K_X4_ROW(acc, sum, xp)                                                   \
             do {                                                                    \
-                q4_k_get_scale_min(j, (xp)[b].scales, &sc, &mv);                     \
-                sum += (int64_t)mv * bs;                                            \
+                const int scl = scv[j], mnv = mvv[j];                               \
+                sum += (int64_t)mnv * bs;                                           \
                 __m256i q4n = _mm256_and_si256(_mm256_srli_epi16(                    \
                         _mm256_loadu_si256((const __m256i *)((xp)[b].qs + byte_off)), \
                         shift), m0F);                                                \
                 acc = _mm256_add_epi32(acc, _mm256_madd_epi16(                       \
                         _mm256_maddubs_epi16(q4n, q8b),                              \
-                        _mm256_set1_epi16((short)sc)));                              \
+                        _mm256_set1_epi16((short)scl)));                            \
             } while (0)
             Q4K_X4_ROW(a0, s0, x0);
             Q4K_X4_ROW(a1, s1, x1);
@@ -73561,6 +73563,145 @@ static void qwen35_dot_q4_K_q8_K_x4(
     out[1] = acc1;
     out[2] = acc2;
     out[3] = acc3;
+}
+
+/* 8-row variant of qwen35_dot_q4_K_q8_K_x4: the weight block is decoded once
+ * and reused across eight rows, keeping eight independent madd chains in
+ * flight at ~13 live ymm registers. BOTH the batched and the single-token
+ * worker call this, so the two paths stay bit-identical. */
+static void qwen35_dot_q4_K_q8_K_x8(
+        const block_q4_K *x0, const block_q4_K *x1, const block_q4_K *x2,
+        const block_q4_K *x3, const block_q4_K *x4, const block_q4_K *x5,
+        const block_q4_K *x6, const block_q4_K *x7,
+        const block_q8_K *y, uint64_t blocks, float out[8]) {
+    const __m256i m0F = _mm256_set1_epi8(0x0F);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const block_q8_K *yb = y + b;
+        const float yd = yb->d;
+        const int8_t *q8 = yb->qs;
+        __m256i a0 = _mm256_setzero_si256();
+        __m256i a1 = _mm256_setzero_si256();
+        __m256i a2 = _mm256_setzero_si256();
+        __m256i a3 = _mm256_setzero_si256();
+        __m256i a4 = _mm256_setzero_si256();
+        __m256i a5 = _mm256_setzero_si256();
+        __m256i a6 = _mm256_setzero_si256();
+        __m256i a7 = _mm256_setzero_si256();
+        int64_t s0 = 0;
+        int64_t s1 = 0;
+        int64_t s2 = 0;
+        int64_t s3 = 0;
+        int64_t s4 = 0;
+        int64_t s5 = 0;
+        int64_t s6 = 0;
+        int64_t s7 = 0;
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
+            const __m256i q8b = _mm256_loadu_si256((const __m256i *)(q8 + j * 32));
+            const int32_t bs = (int32_t)yb->bsums[2 * j] + (int32_t)yb->bsums[2 * j + 1];
+            uint8_t sc, mv;
+#define Q4K_X8_ROW(acc, sum, xp)                                                   \
+            do {                                                                    \
+                q4_k_get_scale_min(j, (xp)[b].scales, &sc, &mv);                     \
+                sum += (int64_t)mv * bs;                                            \
+                __m256i q4n = _mm256_and_si256(_mm256_srli_epi16(                    \
+                        _mm256_loadu_si256((const __m256i *)((xp)[b].qs + byte_off)), \
+                        shift), m0F);                                                \
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(                       \
+                        _mm256_maddubs_epi16(q4n, q8b),                              \
+                        _mm256_set1_epi16((short)sc)));                              \
+            } while (0)
+            Q4K_X8_ROW(a0, s0, x0);
+            Q4K_X8_ROW(a1, s1, x1);
+            Q4K_X8_ROW(a2, s2, x2);
+            Q4K_X8_ROW(a3, s3, x3);
+            Q4K_X8_ROW(a4, s4, x4);
+            Q4K_X8_ROW(a5, s5, x5);
+            Q4K_X8_ROW(a6, s6, x6);
+            Q4K_X8_ROW(a7, s7, x7);
+#undef Q4K_X8_ROW
+        }
+        const float d0 = yd * f16_to_f32(x0[b].d), m0 = -yd * f16_to_f32(x0[b].dmin);
+        acc0 += d0 * (float)qwen35_hsum_i32(a0) + m0 * (float)s0;
+        const float d1 = yd * f16_to_f32(x1[b].d), m1 = -yd * f16_to_f32(x1[b].dmin);
+        acc1 += d1 * (float)qwen35_hsum_i32(a1) + m1 * (float)s1;
+        const float d2 = yd * f16_to_f32(x2[b].d), m2 = -yd * f16_to_f32(x2[b].dmin);
+        acc2 += d2 * (float)qwen35_hsum_i32(a2) + m2 * (float)s2;
+        const float d3 = yd * f16_to_f32(x3[b].d), m3 = -yd * f16_to_f32(x3[b].dmin);
+        acc3 += d3 * (float)qwen35_hsum_i32(a3) + m3 * (float)s3;
+        const float d4 = yd * f16_to_f32(x4[b].d), m4 = -yd * f16_to_f32(x4[b].dmin);
+        acc4 += d4 * (float)qwen35_hsum_i32(a4) + m4 * (float)s4;
+        const float d5 = yd * f16_to_f32(x5[b].d), m5 = -yd * f16_to_f32(x5[b].dmin);
+        acc5 += d5 * (float)qwen35_hsum_i32(a5) + m5 * (float)s5;
+        const float d6 = yd * f16_to_f32(x6[b].d), m6 = -yd * f16_to_f32(x6[b].dmin);
+        acc6 += d6 * (float)qwen35_hsum_i32(a6) + m6 * (float)s6;
+        const float d7 = yd * f16_to_f32(x7[b].d), m7 = -yd * f16_to_f32(x7[b].dmin);
+        acc7 += d7 * (float)qwen35_hsum_i32(a7) + m7 * (float)s7;
+    }
+    out[0] = acc0;
+    out[1] = acc1;
+    out[2] = acc2;
+    out[3] = acc3;
+    out[4] = acc4;
+    out[5] = acc5;
+    out[6] = acc6;
+    out[7] = acc7;
+}
+
+/* 2-row x 4-token Q4_K x Q8_K tile. The point is not register ILP but
+ * WEIGHT REUSE: the two weight rows are decoded once per block and used
+ * for four tokens, so the coefficient stream is walked n_tok/4 times
+ * instead of n_tok times. The batched path was DRAM-bound on exactly
+ * that re-read (15.66GB x n_tok per batch). */
+static void qwen35_gemm_q4_K_q8_K_2x4(
+        const block_q4_K *x0, const block_q4_K *x1,
+        const block_q8_K *y, uint64_t blocks, uint64_t ystride,
+        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
+    const __m256i m0F = _mm256_set1_epi8(0x0F);
+    float acc[2][4] = {{0}};
+    for (uint64_t b = 0; b < blocks; b++) {
+        __m256i a[2][4];
+        int64_t s[2][4];
+        for (int r = 0; r < 2; r++) for (int t = 0; t < 4; t++) {
+            a[r][t] = _mm256_setzero_si256(); s[r][t] = 0; }
+        for (int j = 0; j < 8; j++) {
+            const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
+            __m256i q4n[2];
+            uint8_t scl[2], mnv[2];
+            const block_q4_K *xp[2] = { x0, x1 };
+            for (int r = 0; r < 2; r++) {
+                q4_k_get_scale_min(j, xp[r][b].scales, &scl[r], &mnv[r]);
+                q4n[r] = _mm256_and_si256(_mm256_srli_epi16(
+                        _mm256_loadu_si256((const __m256i *)(xp[r][b].qs + byte_off)),
+                        shift), m0F);
+            }
+            for (uint64_t tt = 0; tt < nt; tt++) {
+                const block_q8_K *yb = y + tt * ystride + b;
+                const __m256i q8b = _mm256_loadu_si256((const __m256i *)(yb->qs + j * 32));
+                const int32_t bs = (int32_t)yb->bsums[2*j] + (int32_t)yb->bsums[2*j+1];
+                for (int r = 0; r < 2; r++) {
+                    s[r][tt] += (int64_t)mnv[r] * bs;
+                    a[r][tt] = _mm256_add_epi32(a[r][tt], _mm256_madd_epi16(
+                            _mm256_maddubs_epi16(q4n[r], q8b),
+                            _mm256_set1_epi16((short)scl[r])));
+                }
+            }
+        }
+        for (uint64_t tt = 0; tt < nt; tt++) {
+            const float yd = (y + tt * ystride + b)->d;
+            for (int r = 0; r < 2; r++) {
+                const block_q4_K *xr = (r == 0) ? x0 : x1;
+                const float d = yd * f16_to_f32(xr[b].d);
+                const float m = -yd * f16_to_f32(xr[b].dmin);
+                acc[r][tt] += d * (float)qwen35_hsum_i32(a[r][tt]) + m * (float)s[r][tt];
+            }
+        }
+    }
+    for (uint64_t tt = 0; tt < nt; tt++)
+        for (int r = 0; r < 2; r++)
+            out[tt * out_stride + row + (uint64_t)r] = acc[r][tt];
 }
 
 /* AVX2 Q6_K x Q8_K per block (the maddubs route with the +32 unsigned offset
@@ -73826,6 +73967,27 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
         getenv("DS4_QWEN35_NO_X4") == NULL) {
         /* Use the same 4-row kernel the batched path uses, so both paths
          * compute bit-identical results (and this one gets the ILP win too). */
+        /* same 2-row x 4-token kernel the batched path uses (nt=1 here) so the
+         * two paths cannot drift. */
+        for (; row + 1u < row1; row += 2u)
+            qwen35_gemm_q4_K_q8_K_2x4(
+                    (const block_q4_K *)(ctx->data + (row + 0u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes),
+                    ctx->xq, blocks, blocks, 1, ctx->out, 0, row);
+        for (; row + 7u < row1; row += 8u) {
+            float o8[8];
+            qwen35_dot_q4_K_q8_K_x8(
+                    (const block_q4_K *)(ctx->data + (row + 0u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 2u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 3u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 4u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 5u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 6u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 7u) * ctx->row_bytes),
+                    ctx->xq, blocks, o8);
+            for (int q = 0; q < 8; q++) ctx->out[row + (uint64_t)q] = o8[q];
+        }
         for (; row + 3u < row1; row += 4u) {
             float o4[4];
             qwen35_dot_q4_K_q8_K_x4(
@@ -73980,6 +74142,38 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
         getenv("DS4_QWEN35_NO_X4") == NULL) {
         /* four rows at a time: the activation loads are shared and the four
          * accumulator chains overlap in the madd pipelines. */
+        /* 2 rows x 4 tokens: the weight stream is walked n_tok/4 times.
+         * Only taken when the token count is a multiple of 4, so no tail
+         * kernel is needed; everything else falls through to x8/x4. */
+        if (ctx->n_tok >= 4u && (ctx->n_tok % 4u) == 0u) {
+            for (; row + 1u < row1; row += 2u) {
+                const block_q4_K *t0 = (const block_q4_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
+                const block_q4_K *t1 = (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
+                _mm_prefetch((const char *)(ctx->data + (row + 16u) * ctx->row_bytes), _MM_HINT_T0);
+                for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u)
+                    qwen35_gemm_q4_K_q8_K_2x4(t0, t1, ctx->xq + tt * blocks, blocks,
+                                              blocks, 4, ctx->out + tt * ctx->out_dim,
+                                              ctx->out_dim, row);
+            }
+        }
+        for (; row + 7u < row1; row += 8u) {
+            const block_q4_K *s0 = (const block_q4_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
+            const block_q4_K *s1 = (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
+            const block_q4_K *s2 = (const block_q4_K *)(ctx->data + (row + 2u) * ctx->row_bytes);
+            const block_q4_K *s3 = (const block_q4_K *)(ctx->data + (row + 3u) * ctx->row_bytes);
+            const block_q4_K *s4 = (const block_q4_K *)(ctx->data + (row + 4u) * ctx->row_bytes);
+            const block_q4_K *s5 = (const block_q4_K *)(ctx->data + (row + 5u) * ctx->row_bytes);
+            const block_q4_K *s6 = (const block_q4_K *)(ctx->data + (row + 6u) * ctx->row_bytes);
+            const block_q4_K *s7 = (const block_q4_K *)(ctx->data + (row + 7u) * ctx->row_bytes);
+            _mm_prefetch((const char *)(ctx->data + (row + 16u) * ctx->row_bytes), _MM_HINT_T0);
+            for (uint64_t t = 0; t < ctx->n_tok; t++) {
+                float o8[8];
+                qwen35_dot_q4_K_q8_K_x8(s0, s1, s2, s3, s4, s5, s6, s7,
+                                        ctx->xq + t * blocks, blocks, o8);
+                float *dst = ctx->out + t * ctx->out_dim + row;
+                for (int q = 0; q < 8; q++) dst[q] = o8[q];
+            }
+        }
         for (; row + 3u < row1; row += 4u) {
             const block_q4_K *r0 = (const block_q4_K *)(ctx->data + row * ctx->row_bytes);
             const block_q4_K *r1 = (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
@@ -74263,7 +74457,7 @@ static void qwen35_cpu_forward_batch(
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: the batched qkv/gate projections, then the shared
              * per-token block so this path cannot drift from the reference. */
-            const bool gdn_exact = false;  /* maddubs on both paths; keep them equal */
+            const bool gdn_exact = getenv("DS4_QWEN35_GDN_F32") != NULL;
             qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
             qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
@@ -74622,8 +74816,9 @@ static void qwen35_cpu_forward_token(
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: qkv + gate projections, causal conv (silu), scan. */
             PROF_TICK();
-            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, false);
-            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, false);
+            const bool gdn_f32 = getenv("DS4_QWEN35_GDN_F32") != NULL;
+            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, gdn_f32);
+            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, gdn_f32);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
                 fprintf(stderr, "[gater] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
                         (unsigned long long)l->lin_gate->dim[0],
@@ -74646,7 +74841,7 @@ static void qwen35_cpu_forward_token(
             /* the same shared per-token block the batched path uses */
             qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
                              (uint32_t)l->lin_out->dim[0], lin_o, ga, gb);
-            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, false);
+            qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, gdn_f32);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {
                 const float *nw2 = qwen4_ref_f32(m, l->lin_norm);
@@ -85094,7 +85289,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* the batched forward is now bit-identical to the per-token path
              * (verified max|diff|=0 for n=1..59), so batch the prompt by
              * default: 2.9 -> 7.2 t/s prefill on the dense 27B. */
-            uint32_t pbatch = 48;
+            uint32_t pbatch = 64;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);

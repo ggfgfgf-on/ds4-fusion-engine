@@ -74209,12 +74209,15 @@ static void qwen35_cpu_forward_batch(
                           qwen4_ref_f32(m, l->attn_norm), E, eps);
         if (getenv("DS4_QWEN35_BDBG") && il < 3) {
             for (uint32_t t = 0; t < n_tok; t++) {
-                double s = 0.0;
+                double s = 0.0, sx = 0.0;
                 for (uint32_t i = 0; i < E; i++) {
                     const double v = blk[(uint64_t)t * E + i];
                     s += v * v;
+                    const double w = xb[(uint64_t)t * E + i];
+                    sx += w * w;
                 }
-                fprintf(stderr, "[bdbg] il=%u t=%u blk_l2=%.6f\n", il, t, s);
+                fprintf(stderr, "[bdbg] il=%u t=%u blk_l2=%.6f xb_l2=%.6f\n",
+                        il, t, s, sx);
             }
         }
         if (ds4_qwen4_layer_is_linear(il)) {
@@ -74325,14 +74328,15 @@ static void qwen35_cpu_forward_batch(
                     qwen35_dbg_l2(ff_a, NT * FF), qwen35_dbg_l2(ff_b, NT * FF)); \
         } } while (0)
         FFN_CHK("post-norm");
-        qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, false);
+        const bool ffn_exact = getenv("DS4_QWEN35_FFN_EXACT") != NULL;
+        qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, ffn_exact);
         FFN_CHK("gate");
-        qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, false);
+        qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, ffn_exact);
         FFN_CHK("up");
         for (uint64_t i = 0; i < NT * FF; i++)
             ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
         FFN_CHK("silu");
-        qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, false);
+        qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, ffn_exact);
         FFN_CHK("down");
 #undef FFN_CHK
         for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
@@ -74552,12 +74556,15 @@ static void qwen35_cpu_forward_token(
         PROF_TICK();
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->attn_norm), E, eps);
         if (getenv("DS4_QWEN35_BDBG") && il < 3) {
-            double s2 = 0.0;
+            double s2 = 0.0, sx2 = 0.0;
             for (uint32_t i = 0; i < E; i++) {
                 const double v = blk[i];
                 s2 += v * v;
+                const double w = cur[i];
+                sx2 += w * w;
             }
-            fprintf(stderr, "[bdbg] il=%u t=0 blk_l2=%.6f\n", il, s2);
+            fprintf(stderr, "[bdbg] il=%u t=0 blk_l2=%.6f xb_l2=%.6f\n",
+                    il, s2, sx2);
         }
         PROF_TOCK(t_norm);
         if (ds4_qwen4_layer_is_linear(il)) {

@@ -73655,6 +73655,68 @@ static void qwen35_dot_q4_K_q8_K_x8(
  * for four tokens, so the coefficient stream is walked n_tok/4 times
  * instead of n_tok times. The batched path was DRAM-bound on exactly
  * that re-read (15.66GB x n_tok per batch). */
+/* --- Q4_K block-interleaved repack (the layout llama.cpp's GEMM wants) ------
+ *
+ * Row-major:  row r, block b lives at  data + r*row_bytes + b*144, so the same
+ *             block of eight consecutive rows sits 8 * row_bytes apart.
+ * Interleaved: eight consecutive rows of one block form one contiguous 1152
+ *             byte record, so a GEMM pass over eight rows is a sequential
+ *             stream instead of eight scattered reads.
+ *
+ * The two layouts have the identical size (1152 == 8 * 144), so the repack is
+ * done in place with one group-sized scratch buffer.
+ */
+#define Q4K_ROW_BYTES   144u   /* d 2 | dmin 2 | scales 12 | qs 128 */
+#define Q4K_X8_BYTES   1152u   /* d 16 | dmin 16 | scales 96 | qs 1024 */
+
+static void qwen35_repack_q4_K_x8_group(uint8_t *grp, uint8_t *scratch,
+                                        uint64_t row_bytes, uint64_t blocks) {
+    memcpy(scratch, grp, (size_t)(8u * row_bytes));
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint8_t *dst = grp + b * Q4K_X8_BYTES;
+        for (uint64_t r = 0; r < 8; r++) {
+            const uint8_t *src = scratch + r * row_bytes + b * Q4K_ROW_BYTES;
+            memcpy(dst + r * 2u,        src + 0u,   2u);   /* d      */
+            memcpy(dst + 16u + r * 2u,  src + 2u,   2u);   /* dmin   */
+            memcpy(dst + 32u + r * 12u, src + 4u,  12u);   /* scales */
+            memcpy(dst + 128u + r * 128u, src + 16u, 128u); /* qs    */
+        }
+    }
+}
+
+static void qwen35_unrepack_q4_K_x8_group(uint8_t *grp, uint8_t *scratch,
+                                          uint64_t row_bytes, uint64_t blocks) {
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint8_t *src = grp + b * Q4K_X8_BYTES;
+        for (uint64_t r = 0; r < 8; r++) {
+            uint8_t *dst = scratch + r * row_bytes + b * Q4K_ROW_BYTES;
+            memcpy(dst + 0u,  src + r * 2u,        2u);
+            memcpy(dst + 2u,  src + 16u + r * 2u,  2u);
+            memcpy(dst + 4u,  src + 32u + r * 12u, 12u);
+            memcpy(dst + 16u, src + 128u + r * 128u, 128u);
+        }
+    }
+    memmove(grp, scratch, (size_t)(8u * row_bytes));
+}
+
+/* Round-trip self test on synthetic data: repack, unrepack, compare. */
+static int qwen35_repack_selftest(void) {
+    enum { BLOCKS = 5, ROWS = 8 };
+    const uint64_t row_bytes = BLOCKS * Q4K_ROW_BYTES;
+    uint8_t *buf = xmalloc((size_t)(ROWS * row_bytes));
+    uint8_t *scratch = xmalloc((size_t)(ROWS * row_bytes));
+    uint8_t *orig = xmalloc((size_t)(ROWS * row_bytes));
+    for (uint64_t i = 0; i < ROWS * row_bytes; i++) buf[i] = (uint8_t)(i * 37u + 11u);
+    memcpy(orig, buf, (size_t)(ROWS * row_bytes));
+    qwen35_repack_q4_K_x8_group(buf, scratch, row_bytes, BLOCKS);
+    int changed = memcmp(buf, orig, (size_t)(ROWS * row_bytes)) != 0;
+    qwen35_unrepack_q4_K_x8_group(buf, scratch, row_bytes, BLOCKS);
+    int roundtrip = memcmp(buf, orig, (size_t)(ROWS * row_bytes)) == 0;
+    free(buf); free(scratch); free(orig);
+    fprintf(stderr, "[repack] layout changed=%d roundtrip_ok=%d\n", changed, roundtrip);
+    return roundtrip && changed;
+}
+
 static void qwen35_gemm_q4_K_q8_K_2x4(
         const block_q4_K *x0, const block_q4_K *x1,
         const block_q8_K *y, uint64_t blocks, uint64_t ystride,
@@ -85289,6 +85351,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* the batched forward is now bit-identical to the per-token path
              * (verified max|diff|=0 for n=1..59), so batch the prompt by
              * default: 2.9 -> 7.2 t/s prefill on the dense 27B. */
+            if (getenv("DS4_QWEN35_REPACK_TEST")) qwen35_repack_selftest();
             uint32_t pbatch = 64;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {

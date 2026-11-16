@@ -74218,6 +74218,14 @@ static void qwen35_cpu_forward_batch(
                    tmp + (uint64_t)(n_tok - 1) * C + OW,
                    (size_t)(C - OW) * sizeof(float));
             /* (no residual: the GDN path adds it below) */
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
+                for (uint32_t t = 0; t < n_tok; t++)
+                    fprintf(stderr, "[gdnb] t=%u pre-resid xb_l2=%.6f "
+                            "linout_l2=%.6f tmp0=%.6f\n", t,
+                            qwen35_dbg_l2(xb + (uint64_t)t * E, E),
+                            qwen35_dbg_l2(blk + (uint64_t)t * E, E),
+                            (double)tmp[(uint64_t)t * C]);
+            }
             for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         } else {
             /* full attention: the batched q|gate, k, v projections. */

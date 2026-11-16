@@ -73821,7 +73821,25 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
         }
         return;
     }
-    for (uint64_t row = row0; row < row1; row++) {
+    uint64_t row = row0;
+    if (ctx->type == DS4_TENSOR_Q4_K && getenv("DS4_QWEN35_NO_X4") == NULL) {
+        /* Use the same 4-row kernel the batched path uses, so both paths
+         * compute bit-identical results (and this one gets the ILP win too). */
+        for (; row + 3u < row1; row += 4u) {
+            float o4[4];
+            qwen35_dot_q4_K_q8_K_x4(
+                    (const block_q4_K *)(ctx->data + row * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 2u) * ctx->row_bytes),
+                    (const block_q4_K *)(ctx->data + (row + 3u) * ctx->row_bytes),
+                    ctx->xq, blocks, o4);
+            ctx->out[row + 0] = o4[0];
+            ctx->out[row + 1] = o4[1];
+            ctx->out[row + 2] = o4[2];
+            ctx->out[row + 3] = o4[3];
+        }
+    }
+    for (; row < row1; row++) {
         const uint8_t *rdata = ctx->data + row * ctx->row_bytes;
         _mm_prefetch((const char *)(ctx->data + (row + 8u) * ctx->row_bytes), _MM_HINT_T0);
         float acc = 0.0f;
@@ -73957,7 +73975,8 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
     const uint64_t blocks = ctx->in_dim / QK_K;
 #if defined(__AVX2__)
     uint64_t row = row0;
-    if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact) {
+    if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
+        getenv("DS4_QWEN35_NO_X4") == NULL) {
         /* four rows at a time: the activation loads are shared and the four
          * accumulator chains overlap in the madd pipelines. */
         for (; row + 3u < row1; row += 4u) {
@@ -74223,8 +74242,9 @@ static void qwen35_cpu_forward_batch(
         if (ds4_qwen4_layer_is_linear(il)) {
             /* GDN: the batched qkv/gate projections, then the shared
              * per-token block so this path cannot drift from the reference. */
-            qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, true);
-            qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, true);
+            const bool gdn_exact = getenv("DS4_QWEN35_GDN_Q8") == NULL;
+            qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
+            qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
             const uint32_t QKV_STRIDE = (uint32_t)l->lin_qkv->dim[1];
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
@@ -74237,7 +74257,7 @@ static void qwen35_cpu_forward_batch(
                                  gb + (uint64_t)t * Hv);
             }
             /* the batched out projection + the residual. */
-            qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, true);
+            qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, gdn_exact);
             /* the pass-through lanes are zeroed per token above (see the gate
              * comment) - nothing to carry forward. */
             /* (no residual: the GDN path adds it below) */
@@ -84879,7 +84899,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* the env value > 1 doubles as a token-count override so the exact
              * first-diverging prefix can be bisected. */
             const char *bvenv = getenv("DS4_QWEN35_BATCH_VERIFY");
-            if (bvenv && atoi(bvenv) > 1 && atoi(bvenv) < nv) nv = atoi(bvenv);
+            if (bvenv && atoi(bvenv) > 0 && atoi(bvenv) < nv) nv = atoi(bvenv);
             float *save = xmalloc((size_t)DS4_MAX_LAYER * (size_t)stride * sizeof(float));
             /* one logits row per position: the batched forward writes all nv */
             float *lg_batch = xmalloc((size_t)nv * (size_t)DS4_N_VOCAB * sizeof(float));

@@ -74227,6 +74227,12 @@ static void qwen35_cpu_forward_batch(
                             (double)tmp[(uint64_t)t * C]);
             }
             for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+            if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
+                for (uint32_t t = 0; t < n_tok; t++)
+                    fprintf(stderr, "[gdnb] t=%u POST-resid xb_l2=%.6f xb0=%.6f\n",
+                            t, qwen35_dbg_l2(xb + (uint64_t)t * E, E),
+                            (double)xb[(uint64_t)t * E]);
+            }
         } else {
             /* full attention: the batched q|gate, k, v projections. */
             qwen35_cpu_matvec_batch(m, l->attn_q, blk, qkv, NT, false);

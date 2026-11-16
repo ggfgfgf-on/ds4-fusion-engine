@@ -84791,6 +84791,60 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        /* Bit-exactness gate: run the batched forward and the reference
+         * per-token forward over the same prompt from a clean state and report
+         * the logits difference. Placed before the incremental check so a fresh
+         * session actually reaches it. */
+        if (getenv("DS4_QWEN35_BATCH_VERIFY") &&
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && !s->checkpoint_valid) {
+            const uint64_t ssm_f = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                   DS4_N_LIN_HEAD_DIM;
+            const uint64_t conv_f = 3ull * DS4_N_LIN_CONV_DIM;
+            const uint64_t stride = ssm_f + conv_f;
+            const int nv = prompt->len;
+            float *save = xmalloc((size_t)DS4_MAX_LAYER * (size_t)stride * sizeof(float));
+            float *lg_batch = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            float *lg_ref = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            int *toks = xmalloc((size_t)nv * sizeof(int));
+            for (int i = 0; i < nv; i++) toks[i] = prompt->v[i];
+            for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+                if (!s->qwen35_cpu_ssm_state[il]) continue;
+                memcpy(save + (uint64_t)il * stride, s->qwen35_cpu_ssm_state[il],
+                       (size_t)ssm_f * sizeof(float));
+                memcpy(save + (uint64_t)il * stride + ssm_f, s->qwen35_cpu_conv_hist[il],
+                       (size_t)conv_f * sizeof(float));
+            }
+            qwen35_cpu_forward_batch(lg_batch, &e->model, &e->weights, s, toks,
+                                     (uint32_t)nv, 0u);
+            for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+                if (!s->qwen35_cpu_ssm_state[il]) continue;
+                memcpy(s->qwen35_cpu_ssm_state[il], save + (uint64_t)il * stride,
+                       (size_t)ssm_f * sizeof(float));
+                memcpy(s->qwen35_cpu_conv_hist[il], save + (uint64_t)il * stride + ssm_f,
+                       (size_t)conv_f * sizeof(float));
+            }
+            for (int i = 0; i < nv; i++)
+                qwen35_cpu_forward_token(lg_ref, &e->model, &e->weights, s,
+                                         toks[i], (uint32_t)i);
+            double maxd = 0.0;
+            int argb = 0, argr = 0;
+            for (int i = 0; i < (int)DS4_N_VOCAB; i++) {
+                const double d = fabs((double)lg_batch[i] - (double)lg_ref[i]);
+                if (d > maxd) maxd = d;
+                if (lg_batch[i] > lg_batch[argb]) argb = i;
+                if (lg_ref[i] > lg_ref[argr]) argr = i;
+            }
+            fprintf(stderr, "[batchverify] n=%d max|diff|=%.6g argmax batch=%d ref=%d %s\n",
+                    nv, maxd, argb, argr, argb == argr ? "MATCH" : "MISMATCH");
+            free(toks);
+            free(lg_ref);
+            free(lg_batch);
+            free(save);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+            snprintf(err, errlen, "batch verify done");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))

@@ -73700,14 +73700,21 @@ static void qwen35_gemm_repacked_8x4(
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
         uint64_t row0) {
     const __m512i m0F = _mm512_set1_epi8(0x0F);
-    float dens[8][4] = {{0}}, mins[8][4] = {{0}};
+    /* Both accumulators stay in registers: the min term is a lane vector
+     * times a broadcast sum, so it costs one fmadd per (block, token) rather
+     * than eight scalar updates into a stack array. */
+    __m512 dens[4], mins[4];
+    for (uint64_t t = 0; t < nt; t++) {
+        dens[t] = _mm512_setzero_ps();
+        mins[t] = _mm512_setzero_ps();
+    }
     for (uint64_t b = 0; b < blocks; b++) {
         const uint8_t *xb = grp + b * Q4K_X8;
-        __m512 facc[4];
-        for (uint64_t t = 0; t < nt; t++) facc[t] = _mm512_setzero_ps();
-        int32_t msum[8][4];
-        for (int r = 0; r < 8; r++)
-            for (uint64_t t = 0; t < nt; t++) msum[r][t] = 0;
+        __m512 dacc[4], macc[4];
+        for (uint64_t t = 0; t < nt; t++) {
+            dacc[t] = _mm512_setzero_ps();
+            macc[t] = _mm512_setzero_ps();
+        }
         for (int j = 0; j < 8; j++) {
             __m512i pacc[4];
             for (uint64_t t = 0; t < nt; t++) pacc[t] = _mm512_setzero_si512();
@@ -73720,8 +73727,8 @@ static void qwen35_gemm_repacked_8x4(
                 for (uint64_t t = 0; t < nt; t++) {
                     int64_t eight;
                     memcpy(&eight, y[t * ystride + b].qs + j * 32 + k * 8, 8);
-                    const __m512i q8 = _mm512_set1_epi64(eight);
-                    pacc[t] = _mm512_dpbusd_epi32(pacc[t], q4, q8);
+                    pacc[t] = _mm512_dpbusd_epi32(pacc[t], q4,
+                                                  _mm512_set1_epi64(eight));
                 }
             }
             uint8_t s[8], m[8];
@@ -73731,32 +73738,47 @@ static void qwen35_gemm_repacked_8x4(
                     (float)s[5],(float)s[5],(float)s[4],(float)s[4],
                     (float)s[3],(float)s[3],(float)s[2],(float)s[2],
                     (float)s[1],(float)s[1],(float)s[0],(float)s[0]);
+            const __m512 mnv = _mm512_set_ps(
+                    (float)m[7],(float)m[7],(float)m[6],(float)m[6],
+                    (float)m[5],(float)m[5],(float)m[4],(float)m[4],
+                    (float)m[3],(float)m[3],(float)m[2],(float)m[2],
+                    (float)m[1],(float)m[1],(float)m[0],(float)m[0]);
             for (uint64_t t = 0; t < nt; t++) {
                 const __m512i folded = _mm512_add_epi32(pacc[t],
                         _mm512_shuffle_epi32(pacc[t], (_MM_PERM_ENUM)0xB1));
-                facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(folded), scv, facc[t]);
+                dacc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(folded), scv, dacc[t]);
                 const int32_t bs = (int32_t)y[t * ystride + b].bsums[2 * j] +
                                    (int32_t)y[t * ystride + b].bsums[2 * j + 1];
-                for (int r = 0; r < 8; r++) msum[r][t] += m[r] * bs;
+                macc[t] = _mm512_fmadd_ps(mnv, _mm512_set1_ps((float)bs), macc[t]);
             }
         }
-        /* d and dmin are per super-block, and the q8 scale is per token and
-         * super-block: apply this block's own factors, not block 0's. */
-        float lanes[4][16];
-        for (uint64_t t = 0; t < nt; t++) _mm512_storeu_ps(lanes[t], facc[t]);
+        /* this block's own d and dmin, broadcast into the lane layout */
+        float dv[8], mdv[8];
         for (int r = 0; r < 8; r++) {
-            const float d4 = f16_to_f32(*(const uint16_t *)(xb + r * 2));
-            const float dm4 = f16_to_f32(*(const uint16_t *)(xb + 16 + r * 2));
-            for (uint64_t t = 0; t < nt; t++) {
-                const float yd = y[t * ystride + b].d;
-                dens[r][t] += d4 * yd * lanes[t][2 * r];
-                mins[r][t] += dm4 * yd * (float)msum[r][t];
-            }
+            dv[r]  = f16_to_f32(*(const uint16_t *)(xb + r * 2));
+            mdv[r] = f16_to_f32(*(const uint16_t *)(xb + 16 + r * 2));
+        }
+        const __m512 d4v = _mm512_set_ps(
+                dv[7],dv[7],dv[6],dv[6],dv[5],dv[5],dv[4],dv[4],
+                dv[3],dv[3],dv[2],dv[2],dv[1],dv[1],dv[0],dv[0]);
+        const __m512 dm4v = _mm512_set_ps(
+                mdv[7],mdv[7],mdv[6],mdv[6],mdv[5],mdv[5],mdv[4],mdv[4],
+                mdv[3],mdv[3],mdv[2],mdv[2],mdv[1],mdv[1],mdv[0],mdv[0]);
+        for (uint64_t t = 0; t < nt; t++) {
+            const float yd = y[t * ystride + b].d;
+            dens[t] = _mm512_fmadd_ps(dacc[t], _mm512_mul_ps(d4v,
+                                      _mm512_set1_ps(yd)), dens[t]);
+            mins[t] = _mm512_fmadd_ps(macc[t], _mm512_mul_ps(dm4v,
+                                      _mm512_set1_ps(yd)), mins[t]);
         }
     }
-    for (int r = 0; r < 8; r++)
-        for (uint64_t t = 0; t < nt; t++)
-            out[t * out_stride + row0 + (uint64_t)r] = dens[r][t] - mins[r][t];
+    for (uint64_t t = 0; t < nt; t++) {
+        float dl[16], ml[16];
+        _mm512_storeu_ps(dl, dens[t]);
+        _mm512_storeu_ps(ml, mins[t]);
+        for (int r = 0; r < 8; r++)
+            out[t * out_stride + row0 + (uint64_t)r] = dl[2 * r] - ml[2 * r];
+    }
 }
 
 

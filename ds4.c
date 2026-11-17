@@ -74299,6 +74299,35 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
  *   lin_o   scratch OW-wide scan output
  *   ga/gb   scratch Hv-wide alpha/beta
  */
+typedef struct {
+    float *state;
+    const float *qk;
+    float *lin_o;
+    const float *ga, *gb;
+    uint32_t Hk, Hv, D;
+} qwen35_gdn_scan_arg;
+
+/* One (head, dim) row of the GDN state recurrence. Each row owns its slice of
+ * the state, so these are independent across the whole Hv*D grid. */
+static void qwen35_gdn_scan_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_gdn_scan_arg *c = vctx;
+    const uint32_t D = c->D;
+    for (uint64_t idx = t0; idx < t1; idx++) {
+        const uint32_t h = (uint32_t)(idx / D), dv = (uint32_t)(idx % D);
+        const uint32_t kh = h % c->Hk;
+        const float decay = c->ga[h], beta = c->gb[h];
+        const float *k = c->qk + (uint64_t)(c->Hk + kh) * D;
+        const float *q = c->qk + (uint64_t)kh * D;
+        float *srow = c->state + (uint64_t)h * D * D + (uint64_t)dv * D;
+        const float v = c->qk[(uint64_t)(2u * c->Hk + h) * D + dv];
+        float u = 0.0f;
+        for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
+        const float delta = (v - u) * beta;
+        float o = 0.0f;
+        for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
+        c->lin_o[(uint64_t)h * D + dv] = o;
+    }
+}
 static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
         float *qk, const float *blk, const float *zz,
@@ -74320,8 +74349,13 @@ static void qwen35_gdn_token(
         hist[(uint64_t)2 * C + c] = qk[c];
         qk[c] = v / (1.0f + expf(-v));
     }
-    qwen4_ref_matvec(m, l->lin_alpha, blk, ga);
-    qwen4_ref_matvec(m, l->lin_beta, blk, gb);
+    /* These are small (48 outputs) but were on the scalar double-precision
+     * reference path: it dequantizes each row into a float buffer and then
+     * runs a 5120-iteration scalar loop. Across 48 layers x every token that
+     * was ~296 ms of the GDN block, the largest serial cost left in the
+     * forward. The AVX2 kernel does the same math from the packed weights. */
+    qwen35_cpu_matvec(m, l->lin_alpha, blk, ga, s->qwen35_cpu_q8, true);
+    qwen35_cpu_matvec(m, l->lin_beta, blk, gb, s->qwen35_cpu_q8, true);
     const float *A = qwen4_ref_f32(m, l->lin_a);
     const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
     for (uint32_t h = 0; h < Hv; h++) {
@@ -74339,23 +74373,22 @@ static void qwen35_gdn_token(
         const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
         for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
     }
-    for (uint32_t h = 0; h < Hv; h++) {
-        const uint32_t kh = h % Hk;
-        const float decay = ga[h], beta = gb[h];
-        const float *k = qk + (uint64_t)(Hk + kh) * D;
-        const float *q = qk + (uint64_t)kh * D;
-        float *sv = state + (uint64_t)h * D * D;
-        for (uint32_t dv = 0; dv < D; dv++) {
-            float *srow = sv + (uint64_t)dv * D;
-            const float v = qk[(uint64_t)(2u * Hk + h) * D + dv];
-            float u = 0.0f;
-            for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
-            const float delta = (v - u) * beta;
-            float o = 0.0f;
-            for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
-            lin_o[(uint64_t)h * D + dv] = o;
-        }
-    }
+    /* The scan is recurrent ACROSS tokens, but each (head, dim) row is
+     * independent, so Hv*D of them can run in parallel. Serial it cost 505 ms
+     * of a 1010 ms prefill - the largest single cost in the whole forward. */
+    static double scan_ms = 0.0;
+    struct timespec st0, st1;
+    clock_gettime(CLOCK_MONOTONIC, &st0);
+    qwen35_gdn_scan_arg sc;
+    sc.state = state; sc.qk = qk; sc.lin_o = lin_o;
+    sc.ga = ga; sc.gb = gb;
+    sc.Hk = Hk; sc.Hv = Hv; sc.D = D;
+    ds4_parallel_for((uint64_t)Hv * D, qwen35_gdn_scan_worker, &sc);
+    clock_gettime(CLOCK_MONOTONIC, &st1);
+    scan_ms += (double)(st1.tv_sec - st0.tv_sec) * 1e3 +
+               (double)(st1.tv_nsec - st0.tv_nsec) / 1e6;
+    if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
+        fprintf(stderr, "[phase] scan_total=%.1f ms\n", scan_ms);
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
         fprintf(stderr, "[gdn]   qk=%.6f zz=%.6f (z0=%.6f z1=%.6f z2=%.6f "
                 "zlast=%.6f) lin_o=%.6f\n",
@@ -74534,6 +74567,9 @@ static void qwen35_cpu_forward_batch(
             const uint32_t ZW = (uint32_t)l->lin_gate->dim[1];
             /* tmp rows are lin_out's input width, NOT C (they differ). */
             const uint32_t TW = (uint32_t)l->lin_out->dim[0];
+            static double gdn2_ms = 0.0;
+            struct timespec g2a, g2b;
+            clock_gettime(CLOCK_MONOTONIC, &g2a);
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
@@ -74544,6 +74580,11 @@ static void qwen35_cpu_forward_batch(
                                  ga + (uint64_t)t * Hv,
                                  gb + (uint64_t)t * Hv);
             }
+            clock_gettime(CLOCK_MONOTONIC, &g2b);
+            gdn2_ms += (double)(g2b.tv_sec - g2a.tv_sec) * 1e3 +
+                       (double)(g2b.tv_nsec - g2a.tv_nsec) / 1e6;
+            if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
+                fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn2_ms);
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, gdn_exact);
             /* the pass-through lanes are zeroed per token above (see the gate

@@ -235,13 +235,31 @@ void *ds4_mmap(void *addr, size_t length, int prot, int flags,
         errno = EBADF;
         return MAP_FAILED;
     }
-    DWORD flProtect = (prot & PROT_WRITE) ? PAGE_READWRITE : PAGE_READONLY;
+    /* Three modes, matching the POSIX combinations we use:
+     *   PROT_READ                      -> PAGE_READONLY / FILE_MAP_READ
+     *   PROT_READ|WRITE + MAP_SHARED   -> PAGE_READWRITE / FILE_MAP_WRITE
+     *   PROT_READ|WRITE + MAP_PRIVATE  -> PAGE_WRITECOPY / FILE_MAP_COPY
+     * The last one is copy-on-write: it works on a read-only handle, never
+     * touches the file, and only charges RAM for pages that are written. It is
+     * what lets the loader repack weights in place safely. */
+    DWORD flProtect, access;
+    if (prot & PROT_WRITE) {
+        if (flags & MAP_SHARED) {
+            flProtect = PAGE_READWRITE;
+            access = FILE_MAP_WRITE;
+        } else {
+            flProtect = PAGE_WRITECOPY;
+            access = FILE_MAP_COPY;
+        }
+    } else {
+        flProtect = PAGE_READONLY;
+        access = FILE_MAP_READ;
+    }
     HANDLE mapping = CreateFileMappingA(fh, NULL, flProtect, 0, 0, NULL);
     if (!mapping) {
         errno = ENOMEM;
         return MAP_FAILED;
     }
-    DWORD access = (prot & PROT_WRITE) ? FILE_MAP_WRITE : FILE_MAP_READ;
     void *view = MapViewOfFile(mapping, access,
                                (DWORD)((unsigned __int64)offset >> 32),
                                (DWORD)((unsigned __int64)offset & 0xffffffff),

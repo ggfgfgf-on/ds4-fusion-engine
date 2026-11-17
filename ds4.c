@@ -73796,6 +73796,30 @@ static void qwen35_rp_set(const uint8_t *d, uint8_t v) {
 /* Repack one Q4_K tensor in place. Rows must be a multiple of 8; the caller
  * only asks for those. Writes go through the COW mapping, so the file is
  * untouched and no extra resident memory is used (measured: +0 MB for 4 GB). */
+/* Eviction: throw the repacked pages away and give the memory back to the
+ *
+ * NOT WIRED YET. Calling it while requests are live is unsafe: tensor_data()
+ * recomputes from m->map and survives the remap, but several worker contexts
+ * capture .data = tensor_data(...) at construction and then outlive the view.
+ * A safe trigger has to sit between requests, after those contexts are gone.
+ * Nothing calls this today, and nothing needs to: the repack itself is gated
+ * off (DS4_QWEN35_LANE_GEMM) because it measured slower in place.
+ * file. munmap + a fresh read-only map returns the ORIGINAL bytes, because
+ * the COW view is derived from the file - that is what makes the repack
+ * safe to discard on a machine that runs short. DiscardVirtualMemory is not
+ * usable here: it hands back zeros, not the file content (measured). */
+static bool qwen35_rp_evict(ds4_model *m) {
+    if (!m || !m->map) return false;
+    const uint64_t size = m->size;
+    void *ro = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, m->fd, 0);
+    if (ro == MAP_FAILED) return false;
+    void *old = (void *)m->map;
+    m->map = (const uint8_t *)ro;
+    munmap(old, (size_t)size);
+    memset(g_rp_key, 0, sizeof g_rp_key);
+    memset(g_rp_val, 0, sizeof g_rp_val);
+    return true;
+}
 static int qwen35_rp_tensor(uint8_t *data, uint64_t rows, uint64_t row_bytes) {
     if (rows < 8u || (rows % 8u) != 0u) return 0;
     if (row_bytes < Q4K_ROW || (row_bytes % Q4K_ROW) != 0u) return 0;

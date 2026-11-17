@@ -75034,6 +75034,7 @@ static void qwen35_cpu_forward_batch(
     const uint64_t NT = n_tok;
     const uint32_t QW = 2u * H * HD;      /* the q|gate width */
     struct timespec bf0, bf1;
+    double attn_ms = 0.0, gdn_batch_ms = 0.0;
     acc_ms = 0.0; acc_calls = 0; acc_bytes = 0; acc_q4 = 0; acc_q6 = 0;
     clock_gettime(CLOCK_MONOTONIC, &bf0);
     const uint32_t OW = Hv * D;           /* the GDN output width */
@@ -75174,6 +75175,8 @@ static void qwen35_cpu_forward_batch(
             const float *knorm = qwen4_ref_f32(m, l->attn_k_norm);
             float *kv = s->qwen35_cpu_kv[il];
             const uint32_t kv_cap = (uint32_t)s->ctx_size;
+            struct timespec at0, at1;
+            clock_gettime(CLOCK_MONOTONIC, &at0);
             for (uint32_t t = 0; t < n_tok; t++) {
                 const uint32_t pos = pos0 + t;
                 float *qk = qkv + (uint64_t)t * QW;
@@ -75222,6 +75225,9 @@ static void qwen35_cpu_forward_batch(
                                 o / (float)ss * (1.0f / (1.0f + expf(-gt[h * HD + i])));                    }
                 }
             }
+            clock_gettime(CLOCK_MONOTONIC, &at1);
+            attn_ms += (double)(at1.tv_sec - at0.tv_sec) * 1e3 +
+                       (double)(at1.tv_nsec - at0.tv_nsec) / 1e6;
             qwen35_cpu_matvec_batch(m, l->attn_output, attn_o, blk, NT, false);
             for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         }
@@ -75311,6 +75317,13 @@ static void qwen35_cpu_forward_batch(
                     n_tok, wall, (unsigned long long)acc_calls, acc_ms,
                     100.0 * acc_ms / (wall > 0.0 ? wall : 1.0),
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
+            (void)gdn_batch_ms;
+            if (getenv("DS4_QWEN35_BYTE_DBG"))
+                fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "
+                        "everything-else=%.0f ms (%.0f%%)\n",
+                        attn_ms, 100.0 * attn_ms / (wall > 0.0 ? wall : 1.0),
+                        wall - acc_ms - attn_ms,
+                        100.0 * (wall - acc_ms - attn_ms) / (wall > 0.0 ? wall : 1.0));
     }
 }
 

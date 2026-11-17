@@ -73712,7 +73712,6 @@ static void qwen35_gemm_repacked_8x4(
     }
     for (uint64_t b = 0; b < blocks; b++) {
         const uint8_t *xb = grp + b * Q4K_X8;
-        const uint64_t tg = b / 4u;
         __m512 dacc[4], macc[4];
         for (uint64_t t = 0; t < nt; t++) {
             dacc[t] = _mm512_setzero_ps();
@@ -73727,15 +73726,15 @@ static void qwen35_gemm_repacked_8x4(
                 const __m512i q4 = (j & 1)
                         ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
                         : _mm512_and_si512(raw, m0F);
-                const __m256i a4 = _mm256_loadu_si256((const __m256i *)
-                        (act + (((tg * 8u + (uint64_t)j) * 4u + (uint64_t)k) * 32u)));
-                const __m128i alo = _mm256_castsi256_si128(a4);
-                const __m128i ahi = _mm256_extracti128_si256(a4, 1);
-                const __m128i at[4] = { alo, _mm_srli_si128(alo, 8),
-                                        ahi, _mm_srli_si128(ahi, 8) };
-                for (uint64_t t = 0; t < nt; t++)
+                /* one 8-byte unit per token, nt of them contiguous */
+                const int8_t *ap = act + (((b * 8u + (uint64_t)j) * 4u +
+                                           (uint64_t)k) * 8u);
+                for (uint64_t t = 0; t < nt; t++) {
+                    int64_t e8;
+                    memcpy(&e8, ap + t * 8u, 8);
                     pacc[t] = _mm512_dpbusd_epi32(pacc[t], q4,
-                                                  _mm512_broadcast_i64x2(at[t]));
+                                                  _mm512_set1_epi64(e8));
+                }
             }
             uint8_t s[8], m[8];
             qwen35_unpack_scales(xb, j, s, m);
@@ -73785,6 +73784,23 @@ static void qwen35_gemm_repacked_8x4(
             out[t * out_stride + row0 + (uint64_t)r] = dl[2 * r] - ml[2 * r];
     }
 }
+
+typedef struct {
+    const uint8_t *data;
+    const int8_t *act;
+    block_q8_K *xq;
+    float *out;
+    uint64_t out_dim, blocks;
+} qwen35_rp1_ctx;
+
+static void qwen35_rp1_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    qwen35_rp1_ctx *c = vctx;
+    for (uint64_t g = g0; g < g1; g++)
+        qwen35_gemm_repacked_8x4(c->data + g * c->blocks * Q4K_X8, c->blocks,
+                                 c->act, c->xq, c->blocks, 1,
+                                 c->out, c->out_dim, g * 8u);
+}
+
 
 
 /* --- Repacked-tensor registry ----------------------------------------------
@@ -74426,22 +74442,32 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
         rows >= 8u && (rows % 8u) == 0u &&
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW &&
         qwen35_rp_get((const uint8_t *)tensor_data(m, w)) == 1) {
-        /* one token: interleave it into slot 0 of the four-token layout */
+        /* One token: interleave it into slot 0. The buffer is reused across
+         * calls - allocating and zeroing 278 KB per matvec call (256 of them
+         * per token) cost more than the kernel itself. */
+        static int8_t *act1 = NULL;
+        static size_t act1_cap = 0;
         const int8_t *x8 = (const int8_t *)q8_scratch[0].qs;
-        const uint64_t agrp = (blocks + 3u) / 4u;
-        int8_t *act1 = xcalloc((size_t)(agrp * 4u * 128u * 32u), 1);
-        for (uint64_t b = 0; b < blocks; b++) {
+        const size_t need = (size_t)(blocks * 8u * 4u * 8u);
+        if (act1_cap < need) {
+            free(act1);
+            act1 = xmalloc(need);
+            act1_cap = need;
+        }
+        for (uint64_t b = 0; b < blocks; b++)
             for (uint64_t j = 0; j < 8u; j++)
                 for (uint64_t k = 0; k < 4u; k++)
-                    memcpy((uint8_t *)act1 + (((b / 4u) * 8u + j) * 4u + k) * 32u,
+                    memcpy(act1 + ((b * 8u + j) * 4u + k) * 8u,
                            x8 + b * QK_K + j * 32u + k * 8u, 8u);
-        }
-        const uint8_t *td = (const uint8_t *)tensor_data(m, w);
-        for (uint64_t g = 0; g < rows / 8u; g++)
-            qwen35_gemm_repacked_8x4(td + g * blocks * Q4K_X8, blocks,
-                                     act1, q8_scratch, blocks, 1, out, rows,
-                                     g * 8u);
-        free(act1);
+        /* Parallelise over groups: this ran serially at first, which alone was
+         * a 5x regression on decode (one core instead of 28). */
+        typedef struct {
+            const uint8_t *data; const int8_t *act; block_q8_K *xq;
+            float *out; uint64_t out_dim, blocks;
+        } rp1_ctx;
+        rp1_ctx r1 = { (const uint8_t *)tensor_data(m, w), act1, q8_scratch,
+                       out, rows, blocks };
+        ds4_parallel_for(rows / 8u, qwen35_rp1_worker, &r1);
         return;
     }
     if (getenv("DS4_QWEN35_TRACE0") && rows > 5000u && !exact) {
@@ -74777,7 +74803,7 @@ typedef struct {
     const int8_t *act;
     block_q8_K *xq;
     float *out;
-    uint64_t n_tok, out_dim, blocks;
+    uint64_t n_tok, out_dim, blocks, act_tstride;
 } qwen35_rp_work;
 
 static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
@@ -74787,7 +74813,8 @@ static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
         for (uint64_t t0 = 0; t0 < c->n_tok; t0 += 4u) {
             uint64_t nt = c->n_tok - t0;
             if (nt > 4u) nt = 4u;
-            qwen35_gemm_repacked_8x4(grp, c->blocks, c->act,
+            qwen35_gemm_repacked_8x4(grp, c->blocks,
+                                     c->act + t0 * c->act_tstride,
                                      c->xq + t0 * c->blocks, c->blocks, nt,
                                      c->out + t0 * c->out_dim, c->out_dim,
                                      g * 8u);
@@ -74816,29 +74843,21 @@ static void qwen35_cpu_matvec_batch(
      * activation bytes once per token and the load-unit cost cancels the lane
      * packing gain - that is exactly the 2x that showed up on integration. */
     int8_t *act4 = NULL;
-    uint64_t act4_grp = (blocks + 3u) / 4u;
     bool use_lane = (w->type == DS4_TENSOR_Q4_K && !exact &&
                      getenv("DS4_QWEN35_LANE_GEMM") != NULL &&
                      getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
                      rows >= 8u && (rows % 8u) == 0u &&
                      (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW);
+    uint64_t act_tstride = blocks * 8u * 4u * 8u;   /* bytes per token */
     if (use_lane) {
-        act4 = xmalloc((size_t)(act4_grp * 4u * 128u * 32u));
-        for (uint64_t tg = 0; tg < act4_grp; tg++) {
-            for (uint64_t j = 0; j < 8u; j++) {
-                for (uint64_t k = 0; k < 4u; k++) {
-                    uint8_t *dstp = (uint8_t *)act4 +
-                            (((tg * 8u + j) * 4u + k) * 32u);
-                    for (uint64_t t = 0; t < 4u; t++) {
-                        const uint64_t b = tg * 4u + t;
-                        if (b < blocks && t < n_tok)
-                            memcpy(dstp + t * 8u, xq[t * blocks + b].qs + j * 32u + k * 8u, 8u);
-                        else
-                            memset(dstp + t * 8u, 0, 8u);
-                    }
-                }
-            }
-        }
+        act4 = xmalloc((size_t)(n_tok * act_tstride));
+        for (uint64_t t = 0; t < n_tok; t++)
+            for (uint64_t b = 0; b < blocks; b++)
+                for (uint64_t j = 0; j < 8u; j++)
+                    for (uint64_t k = 0; k < 4u; k++)
+                        memcpy((uint8_t *)act4 +
+                                   (t * act_tstride + ((b * 8u + j) * 4u + k) * 8u),
+                               xq[t * blocks + b].qs + j * 32u + k * 8u, 8u);
     }
     const uint8_t *tdata = (const uint8_t *)tensor_data(m, w);
     /* Repacked Q4_K tensors take the lane-packed 8x4 kernel. The repack is done
@@ -74856,7 +74875,7 @@ static void qwen35_cpu_matvec_batch(
             qwen35_rp_set(tdata, (uint8_t)st);
         }
         if (st == 1) {
-            qwen35_rp_work w2 = { tdata, act4, xq, out, n_tok, rows, blocks };
+            qwen35_rp_work w2 = { tdata, act4, xq, out, n_tok, rows, blocks, act_tstride };
             ds4_parallel_for(rows / 8u, qwen35_rp_worker, &w2);
             free(act4);
             free(xq);

@@ -74503,16 +74503,17 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
         static int8_t *act1 = NULL;
         static size_t act1_cap = 0;
         const int8_t *x8 = (const int8_t *)q8_scratch[0].qs;
-        const size_t need = (size_t)(blocks * 8u * 4u * 8u);
+        const size_t need = (size_t)(blocks * 8u * 4u * 32u);
         if (act1_cap < need) {
             free(act1);
             act1 = xmalloc(need);
             act1_cap = need;
         }
+        memset(act1, 0, need);
         for (uint64_t b = 0; b < blocks; b++)
             for (uint64_t j = 0; j < 8u; j++)
                 for (uint64_t k = 0; k < 4u; k++)
-                    memcpy(act1 + ((b * 8u + j) * 4u + k) * 8u,
+                    memcpy(act1 + ((b * 8u + j) * 4u + k) * 32u,
                            x8 + b * QK_K + j * 32u + k * 8u, 8u);
         /* Parallelise over groups: this ran serially at first, which alone was
          * a 5x regression on decode (one core instead of 28). */
@@ -74866,7 +74867,7 @@ typedef struct {
     const int8_t *act;
     block_q8_K *xq;
     float *out;
-    uint64_t n_tok, out_dim, blocks, act_tstride;
+    uint64_t n_tok, out_dim, blocks, act_slab;
 } qwen35_rp_work;
 
 static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
@@ -74877,7 +74878,7 @@ static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
             uint64_t nt = c->n_tok - t0;
             if (nt > 4u) nt = 4u;
             qwen35_gemm_repacked_8x4(grp, c->blocks,
-                                     c->act + t0 * c->act_tstride,
+                                     c->act + (t0 / 4u) * c->act_slab,
                                      c->xq + t0 * c->blocks, c->blocks, nt,
                                      c->out + t0 * c->out_dim, c->out_dim,
                                      g * 8u);
@@ -74915,15 +74916,19 @@ static void qwen35_cpu_matvec_batch(
                      getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
                      rows >= 8u && (rows % 8u) == 0u &&
                      (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW);
-    uint64_t act_tstride = blocks * 8u * 4u * 8u;   /* bytes per token */
+    /* One 32-byte unit per (block, j, k) with the four tokens' 8 bytes back to
+     * back, so the kernel fetches them with a single load instead of four.
+     * One such slab per group of four tokens. */
+    const uint64_t act_slab = blocks * 8u * 4u * 32u;
+    const uint64_t act_groups = (n_tok + 3u) / 4u;
     if (use_lane) {
-        act4 = xmalloc((size_t)(n_tok * act_tstride));
+        act4 = xcalloc((size_t)(act_groups * act_slab), 1);
         for (uint64_t t = 0; t < n_tok; t++)
             for (uint64_t b = 0; b < blocks; b++)
                 for (uint64_t j = 0; j < 8u; j++)
                     for (uint64_t k = 0; k < 4u; k++)
-                        memcpy((uint8_t *)act4 +
-                                   (t * act_tstride + ((b * 8u + j) * 4u + k) * 8u),
+                        memcpy((uint8_t *)act4 + (t / 4u) * act_slab +
+                                   (((b * 8u + j) * 4u + k) * 4u + (t % 4u)) * 8u,
                                xq[t * blocks + b].qs + j * 32u + k * 8u, 8u);
     }
     const uint8_t *tdata = (const uint8_t *)tensor_data(m, w);
@@ -74942,7 +74947,7 @@ static void qwen35_cpu_matvec_batch(
             qwen35_rp_set(tdata, (uint8_t)st);
         }
         if (st == 1) {
-            qwen35_rp_work w2 = { tdata, act4, xq, out, n_tok, rows, blocks, act_tstride };
+            qwen35_rp_work w2 = { tdata, act4, xq, out, n_tok, rows, blocks, act_slab };
             ds4_parallel_for(rows / 8u, qwen35_rp_worker, &w2);
             free(act4);
             free(xq);

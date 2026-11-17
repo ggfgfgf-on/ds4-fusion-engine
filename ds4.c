@@ -74478,6 +74478,20 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
     if (getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) ||
         w->dim[0] % QK_K != 0) {
+        /* Which tensors actually land on the scalar double-precision path?
+         * Anything big here is a whole matvec running without SIMD. */
+        static int fb_dbg = -1;
+        if (fb_dbg < 0) fb_dbg = getenv("DS4_QWEN35_BYTE_DBG") != NULL;
+        if (fb_dbg && w->bytes > (1u << 20)) {
+            static uint64_t fb_bytes = 0, fb_calls = 0;
+            fb_bytes += w->bytes; fb_calls++;
+            fprintf(stderr, "[fallback] type=%u dim0=%llu dim1=%llu bytes=%.1f MB"
+                    "  total=%.1f GB in %llu calls\n",
+                    (unsigned)w->type, (unsigned long long)w->dim[0],
+                    (unsigned long long)(w->ndim >= 2 ? w->dim[1] : 1u),
+                    (double)w->bytes / 1048576.0,
+                    (double)fb_bytes / 1e9, (unsigned long long)fb_calls);
+        }
         qwen4_ref_matvec(m, w, x, out);
         return;
     }

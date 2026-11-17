@@ -73655,66 +73655,155 @@ static void qwen35_dot_q4_K_q8_K_x8(
  * for four tokens, so the coefficient stream is walked n_tok/4 times
  * instead of n_tok times. The batched path was DRAM-bound on exactly
  * that re-read (15.66GB x n_tok per batch). */
-/* --- Q4_K block-interleaved repack (the layout llama.cpp's GEMM wants) ------
+/* --- Q4_K 8-row block repack ------------------------------------------------
  *
- * Row-major:  row r, block b lives at  data + r*row_bytes + b*144, so the same
- *             block of eight consecutive rows sits 8 * row_bytes apart.
- * Interleaved: eight consecutive rows of one block form one contiguous 1152
- *             byte record, so a GEMM pass over eight rows is a sequential
- *             stream instead of eight scattered reads.
+ * Ported from llama.cpp make_block_q4_Kx8 (ggml-cpu/repack.cpp:3177) plus the
+ * inverse. Both layouts are the same size (8 * 144 == 1152), so the transform
+ * is a pure permutation inside each 1152-byte window and can run in place.
  *
- * The two layouts have the identical size (1152 == 8 * 144), so the repack is
- * done in place with one group-sized scratch buffer.
+ *   block_q4_K   : d 2 | dmin 2 | scales 12 | qs 128          = 144 per row
+ *   group of 8   : d[8] 16 | dmin[8] 16 | scales 96 | qs 1024 = 1152
+ *
+ * qs is interleaved in 8-byte chunks so a 64-byte load holds all eight rows'
+ * bytes for one chunk. scales are regrouped so one 12-byte record carries the
+ * eight rows' 6-bit min/scale pair for one sub-block. The round trip is
+ * exercised by DS4_QWEN35_REPACK_TEST.
  */
-#define Q4K_ROW_BYTES   144u   /* d 2 | dmin 2 | scales 12 | qs 128 */
-#define Q4K_X8_BYTES   1152u   /* d 16 | dmin 16 | scales 96 | qs 1024 */
+#define Q4K_SCALES   12u
+#define Q4K_QS      128u
+#define Q4K_ROW     144u
+#define Q4K_X8     1152u
 
-static void qwen35_repack_q4_K_x8_group(uint8_t *grp, uint8_t *scratch,
-                                        uint64_t row_bytes, uint64_t blocks) {
-    memcpy(scratch, grp, (size_t)(8u * row_bytes));
+static void qwen35_repack_group(const uint8_t *src, uint8_t *dst,
+                                uint64_t row_bytes, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++) {
-        uint8_t *dst = grp + b * Q4K_X8_BYTES;
-        for (uint64_t r = 0; r < 8; r++) {
-            const uint8_t *src = scratch + r * row_bytes + b * Q4K_ROW_BYTES;
-            memcpy(dst + r * 2u,        src + 0u,   2u);   /* d      */
-            memcpy(dst + 16u + r * 2u,  src + 2u,   2u);   /* dmin   */
-            memcpy(dst + 32u + r * 12u, src + 4u,  12u);   /* scales */
-            memcpy(dst + 128u + r * 128u, src + 16u, 128u); /* qs    */
+        uint8_t *o = dst + b * Q4K_X8;
+        const uint8_t *in[8];
+        for (int r = 0; r < 8; r++)
+            in[r] = src + (uint64_t)r * row_bytes + b * Q4K_ROW;
+        for (int r = 0; r < 8; r++) {
+            memcpy(o + r * 2, in[r] + 0, 2);
+            memcpy(o + 16 + r * 2, in[r] + 2, 2);
+        }
+        for (int i = 0; i < 128; i++) {
+            const int sid = i % 8, soff = (i / 8) * 8, doff = i * 8;
+            memcpy(o + 128 + doff, in[sid] + 4 + Q4K_SCALES + soff, 8);
+        }
+        uint8_t s[8], m[8];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 8; j++) {
+                s[j] = in[j][4 + i] & 63;
+                m[j] = in[j][4 + i + 4] & 63;
+            }
+            uint8_t *sc = o + 32 + i * 12;
+            sc[0] = (uint8_t)((s[0] & 63) + ((s[4] & 48) << 2));
+            sc[1] = (uint8_t)((s[1] & 63) + ((s[5] & 48) << 2));
+            sc[2] = (uint8_t)((s[2] & 63) + ((s[6] & 48) << 2));
+            sc[3] = (uint8_t)((s[3] & 63) + ((s[7] & 48) << 2));
+            sc[4] = (uint8_t)((m[0] & 63) + ((m[4] & 48) << 2));
+            sc[5] = (uint8_t)((m[1] & 63) + ((m[5] & 48) << 2));
+            sc[6] = (uint8_t)((m[2] & 63) + ((m[6] & 48) << 2));
+            sc[7] = (uint8_t)((m[3] & 63) + ((m[7] & 48) << 2));
+            sc[8]  = (uint8_t)((s[4] & 15) + ((m[4] & 15) << 4));
+            sc[9]  = (uint8_t)((s[5] & 15) + ((m[5] & 15) << 4));
+            sc[10] = (uint8_t)((s[6] & 15) + ((m[6] & 15) << 4));
+            sc[11] = (uint8_t)((s[7] & 15) + ((m[7] & 15) << 4));
+        }
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 8; j++) {
+                s[j] = (uint8_t)(((in[j][4 + i] & 192) >> 2) | (in[j][4 + i + 8] & 15));
+                m[j] = (uint8_t)(((in[j][4 + i + 4] & 192) >> 2) |
+                                 ((in[j][4 + i + 8] & 240) >> 4));
+            }
+            uint8_t *sc = o + 32 + 48 + i * 12;
+            sc[0] = (uint8_t)((s[0] & 63) + ((s[4] & 48) << 2));
+            sc[1] = (uint8_t)((s[1] & 63) + ((s[5] & 48) << 2));
+            sc[2] = (uint8_t)((s[2] & 63) + ((s[6] & 48) << 2));
+            sc[3] = (uint8_t)((s[3] & 63) + ((s[7] & 48) << 2));
+            sc[4] = (uint8_t)((m[0] & 63) + ((m[4] & 48) << 2));
+            sc[5] = (uint8_t)((m[1] & 63) + ((m[5] & 48) << 2));
+            sc[6] = (uint8_t)((m[2] & 63) + ((m[6] & 48) << 2));
+            sc[7] = (uint8_t)((m[3] & 63) + ((m[7] & 48) << 2));
+            sc[8]  = (uint8_t)((s[4] & 15) + ((m[4] & 15) << 4));
+            sc[9]  = (uint8_t)((s[5] & 15) + ((m[5] & 15) << 4));
+            sc[10] = (uint8_t)((s[6] & 15) + ((m[6] & 15) << 4));
+            sc[11] = (uint8_t)((s[7] & 15) + ((m[7] & 15) << 4));
         }
     }
 }
 
-static void qwen35_unrepack_q4_K_x8_group(uint8_t *grp, uint8_t *scratch,
-                                          uint64_t row_bytes, uint64_t blocks) {
+static void qwen35_unrepack_group(const uint8_t *src, uint8_t *dst,
+                                  uint64_t row_bytes, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++) {
-        const uint8_t *src = grp + b * Q4K_X8_BYTES;
-        for (uint64_t r = 0; r < 8; r++) {
-            uint8_t *dst = scratch + r * row_bytes + b * Q4K_ROW_BYTES;
-            memcpy(dst + 0u,  src + r * 2u,        2u);
-            memcpy(dst + 2u,  src + 16u + r * 2u,  2u);
-            memcpy(dst + 4u,  src + 32u + r * 12u, 12u);
-            memcpy(dst + 16u, src + 128u + r * 128u, 128u);
+        const uint8_t *o = src + b * Q4K_X8;
+        uint8_t *out[8];
+        for (int r = 0; r < 8; r++)
+            out[r] = dst + (uint64_t)r * row_bytes + b * Q4K_ROW;
+        for (int r = 0; r < 8; r++) {
+            memcpy(out[r] + 0, o + r * 2, 2);
+            memcpy(out[r] + 2, o + 16 + r * 2, 2);
+        }
+        for (int i = 0; i < 128; i++) {
+            const int sid = i % 8, soff = (i / 8) * 8, doff = i * 8;
+            memcpy(out[sid] + 4 + Q4K_SCALES + soff, o + 128 + doff, 8);
+        }
+        uint8_t s[8], m[8];
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *sc = o + 32 + i * 12;
+            s[0] = sc[0] & 63; s[1] = sc[1] & 63; s[2] = sc[2] & 63; s[3] = sc[3] & 63;
+            m[0] = sc[4] & 63; m[1] = sc[5] & 63; m[2] = sc[6] & 63; m[3] = sc[7] & 63;
+            s[4] = (uint8_t)((sc[8] & 15)  | ((sc[0] >> 2) & 48));
+            s[5] = (uint8_t)((sc[9] & 15)  | ((sc[1] >> 2) & 48));
+            s[6] = (uint8_t)((sc[10] & 15) | ((sc[2] >> 2) & 48));
+            s[7] = (uint8_t)((sc[11] & 15) | ((sc[3] >> 2) & 48));
+            m[4] = (uint8_t)((sc[8] >> 4)  | ((sc[4] >> 2) & 48));
+            m[5] = (uint8_t)((sc[9] >> 4)  | ((sc[5] >> 2) & 48));
+            m[6] = (uint8_t)((sc[10] >> 4) | ((sc[6] >> 2) & 48));
+            m[7] = (uint8_t)((sc[11] >> 4) | ((sc[7] >> 2) & 48));
+            for (int j = 0; j < 8; j++) {
+                out[j][4 + i] = s[j];
+                out[j][4 + i + 4] = m[j];
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *sc = o + 32 + 48 + i * 12;
+            s[0] = sc[0] & 63; s[1] = sc[1] & 63; s[2] = sc[2] & 63; s[3] = sc[3] & 63;
+            m[0] = sc[4] & 63; m[1] = sc[5] & 63; m[2] = sc[6] & 63; m[3] = sc[7] & 63;
+            s[4] = (uint8_t)((sc[8] & 15)  | ((sc[0] >> 2) & 48));
+            s[5] = (uint8_t)((sc[9] & 15)  | ((sc[1] >> 2) & 48));
+            s[6] = (uint8_t)((sc[10] & 15) | ((sc[2] >> 2) & 48));
+            s[7] = (uint8_t)((sc[11] & 15) | ((sc[3] >> 2) & 48));
+            m[4] = (uint8_t)((sc[8] >> 4)  | ((sc[4] >> 2) & 48));
+            m[5] = (uint8_t)((sc[9] >> 4)  | ((sc[5] >> 2) & 48));
+            m[6] = (uint8_t)((sc[10] >> 4) | ((sc[6] >> 2) & 48));
+            m[7] = (uint8_t)((sc[11] >> 4) | ((sc[7] >> 2) & 48));
+            for (int j = 0; j < 8; j++) {
+                out[j][4 + i] = (uint8_t)((out[j][4 + i] & 63) | ((s[j] & 48) << 2));
+                out[j][4 + i + 4] = (uint8_t)((out[j][4 + i + 4] & 63) | ((m[j] & 48) << 2));
+                out[j][4 + i + 8] = (uint8_t)((s[j] & 15) | ((m[j] & 15) << 4));
+            }
         }
     }
-    memmove(grp, scratch, (size_t)(8u * row_bytes));
 }
 
-/* Round-trip self test on synthetic data: repack, unrepack, compare. */
+/* Round-trip self test on synthetic data. */
 static int qwen35_repack_selftest(void) {
-    enum { BLOCKS = 5, ROWS = 8 };
-    const uint64_t row_bytes = BLOCKS * Q4K_ROW_BYTES;
-    uint8_t *buf = xmalloc((size_t)(ROWS * row_bytes));
-    uint8_t *scratch = xmalloc((size_t)(ROWS * row_bytes));
-    uint8_t *orig = xmalloc((size_t)(ROWS * row_bytes));
-    for (uint64_t i = 0; i < ROWS * row_bytes; i++) buf[i] = (uint8_t)(i * 37u + 11u);
-    memcpy(orig, buf, (size_t)(ROWS * row_bytes));
-    qwen35_repack_q4_K_x8_group(buf, scratch, row_bytes, BLOCKS);
-    int changed = memcmp(buf, orig, (size_t)(ROWS * row_bytes)) != 0;
-    qwen35_unrepack_q4_K_x8_group(buf, scratch, row_bytes, BLOCKS);
-    int roundtrip = memcmp(buf, orig, (size_t)(ROWS * row_bytes)) == 0;
-    free(buf); free(scratch); free(orig);
-    fprintf(stderr, "[repack] layout changed=%d roundtrip_ok=%d\n", changed, roundtrip);
-    return roundtrip && changed;
+    int bad = 0;
+    for (uint64_t blocks = 1; blocks <= 5; blocks++) {
+        const uint64_t row_bytes = blocks * Q4K_ROW;
+        const size_t n = 8 * (size_t)row_bytes;
+        uint8_t *orig = xmalloc(n), *tmp = xmalloc(n), *back = xmalloc(n);
+        for (size_t i = 0; i < n; i++) orig[i] = (uint8_t)((i * 131u + 7u) & 0xFF);
+        qwen35_repack_group(orig, tmp, row_bytes, blocks);
+        int permuted = memcmp(tmp, orig, n) != 0;
+        qwen35_unrepack_group(tmp, back, row_bytes, blocks);
+        int ok = memcmp(back, orig, n) == 0;
+        if (!ok || !permuted) bad++;
+        fprintf(stderr, "[repack] blocks=%llu permuted=%d roundtrip=%s\n",
+                (unsigned long long)blocks, permuted, ok ? "OK" : "MISMATCH");
+        free(orig); free(tmp); free(back);
+    }
+    return bad == 0;
 }
 
 static void qwen35_gemm_q4_K_q8_K_2x4(
@@ -74570,6 +74659,9 @@ static void qwen35_cpu_forward_batch(
             static double gdn2_ms = 0.0;
             struct timespec g2a, g2b;
             clock_gettime(CLOCK_MONOTONIC, &g2a);
+            static double gdn_ms = 0.0;
+            struct timespec gt0, gt1;
+            clock_gettime(CLOCK_MONOTONIC, &gt0);
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
@@ -74585,6 +74677,11 @@ static void qwen35_cpu_forward_batch(
                        (double)(g2b.tv_nsec - g2a.tv_nsec) / 1e6;
             if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
                 fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn2_ms);
+            clock_gettime(CLOCK_MONOTONIC, &gt1);
+            gdn_ms += (double)(gt1.tv_sec - gt0.tv_sec) * 1e3 +
+                      (double)(gt1.tv_nsec - gt0.tv_nsec) / 1e6;
+            if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
+                fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn_ms);
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, gdn_exact);
             /* the pass-through lanes are zeroed per token above (see the gate

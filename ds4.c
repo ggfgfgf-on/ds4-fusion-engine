@@ -74892,7 +74892,7 @@ static void qwen35_cpu_matvec_batch(
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
-    static uint64_t acc_bytes = 0, acc_calls = 0;
+    static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
     static double acc_ms = 0.0;
     struct timespec mv0, mv1;
     clock_gettime(CLOCK_MONOTONIC, &mv0);
@@ -74968,11 +74968,11 @@ static void qwen35_cpu_matvec_batch(
               (double)(mv1.tv_nsec - mv0.tv_nsec) / 1e6;
     acc_calls++;
     acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
+    if (w->type == DS4_TENSOR_Q6_K) acc_q6 += w->bytes;
+    else acc_q4 += w->bytes;
     if (getenv("DS4_QWEN35_BYTE_DBG") && (acc_calls % 96u) == 0u)
-        fprintf(stderr, "[bytes] calls=%llu walked_gb=%.1f time_ms=%.0f "
-                "eff_gbs=%.1f\n",
-                (unsigned long long)acc_calls, (double)acc_bytes / 1e9, acc_ms,
-                (double)acc_bytes / 1e9 / (acc_ms / 1e3));
+        fprintf(stderr, "[bytes] q4_gb=%.2f q6_gb=%.2f time_ms=%.0f\n",
+                (double)acc_q4 / 1e9, (double)acc_q6 / 1e9, acc_ms);
     if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0 &&
         (exact || getenv("DS4_QWEN35_CORE_DBG_Q8"))) {
         /* compare the batched kernel against the per-token kernel on the very

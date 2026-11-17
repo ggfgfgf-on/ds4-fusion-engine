@@ -74573,6 +74573,49 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
 #endif
 }
 
+static void qwen35_gdn_post(const ds4_model *m, const ds4_layer_weights *l,
+                            uint32_t il, const float *lin_o, const float *zz,
+                            float *tmp_row, uint32_t tmp_dim);
+
+typedef struct {
+    float *state;
+    const float *qk;
+    float *lin_o;
+    const float *ga, *gb;
+    uint32_t Hk, Hv, D;
+    uint64_t n_tok, stride, o_stride;
+} qwen35_gdn_scanb_arg;
+
+/* Whole-token scan: the (head, dim) row is the parallel axis and the token
+ * loop runs inside it. Same operations per (row, token), same order, so the
+ * results are bit-identical to running one token at a time - but a 512-byte
+ * state row now stays in L1 across the whole token run instead of being
+ * streamed out and back once per token. */
+static void qwen35_gdn_scanb_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    qwen35_gdn_scanb_arg *a = vctx;
+    const uint32_t D = a->D;
+    const uint32_t sh = (uint32_t)__builtin_ctz(D), mask = D - 1u;
+    for (uint64_t idx = i0; idx < i1; idx++) {
+        const uint32_t h = (uint32_t)idx >> sh, dv = (uint32_t)idx & mask;
+        const uint32_t kh = h % a->Hk;
+        float *srow = a->state + (uint64_t)h * D * D + (uint64_t)dv * D;
+        for (uint64_t t = 0; t < a->n_tok; t++) {
+            const float *qk = a->qk + t * a->stride;
+            const float decay = a->ga[t * a->Hv + h];
+            const float beta = a->gb[t * a->Hv + h];
+            const float *k = qk + (uint64_t)(a->Hk + kh) * D;
+            const float *q = qk + (uint64_t)kh * D;
+            const float v = qk[(uint64_t)(2u * a->Hk + h) * D + dv];
+            float u = 0.0f;
+            for (uint32_t i = 0; i < D; i++) { srow[i] *= decay; u += srow[i] * k[i]; }
+            const float delta = (v - u) * beta;
+            float o = 0.0f;
+            for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
+            a->lin_o[t * a->o_stride + (uint64_t)h * D + dv] = o;
+        }
+    }
+}
+
 /* One token of the GDN block, shared by the per-token reference forward and the
  * batched forward so the two cannot drift apart again. Covers everything from
  * the causal conv through the gated out-projection input.
@@ -74616,7 +74659,8 @@ static void qwen35_gdn_scan_worker(void *vctx, uint64_t t0, uint64_t t1) {
 static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
         float *qk, const float *blk, const float *zz,
-        float *tmp_row, uint32_t tmp_dim, float *lin_o, float *ga, float *gb) {
+        float *tmp_row, uint32_t tmp_dim, float *lin_o, float *ga, float *gb,
+        int skip_scan) {
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t OW = Hv * D;
@@ -74658,28 +74702,31 @@ static void qwen35_gdn_token(
         const float ks = 1.0f / sqrtf((float)ss + 1e-6f);
         for (uint32_t i = 0; i < D; i++) { q[i] *= qs; k[i] *= ks; }
     }
-    /* The scan is recurrent ACROSS tokens, but each (head, dim) row is
-     * independent, so Hv*D of them can run in parallel. Serial it cost 505 ms
-     * of a 1010 ms prefill - the largest single cost in the whole forward. */
-    static double scan_ms = 0.0;
-    struct timespec st0, st1;
-    clock_gettime(CLOCK_MONOTONIC, &st0);
+    /* The scan is recurrent across tokens. The batched forward defers it and
+     * runs one whole-token pass (row outer, token inner); the per-token path
+     * runs it here. Same math either way. */
+    if (skip_scan) return;
     qwen35_gdn_scan_arg sc;
     sc.state = state; sc.qk = qk; sc.lin_o = lin_o;
     sc.ga = ga; sc.gb = gb;
     sc.Hk = Hk; sc.Hv = Hv; sc.D = D;
     ds4_parallel_for((uint64_t)Hv * D, qwen35_gdn_scan_worker, &sc);
-    clock_gettime(CLOCK_MONOTONIC, &st1);
-    scan_ms += (double)(st1.tv_sec - st0.tv_sec) * 1e3 +
-               (double)(st1.tv_nsec - st0.tv_nsec) / 1e6;
-    if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
-        fprintf(stderr, "[phase] scan_total=%.1f ms\n", scan_ms);
     if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
         fprintf(stderr, "[gdn]   qk=%.6f zz=%.6f (z0=%.6f z1=%.6f z2=%.6f "
                 "zlast=%.6f) lin_o=%.6f\n",
                 qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
                 (double)zz[0], (double)zz[1], (double)zz[2],
                 (double)zz[C - 1], qwen35_dbg_l2(lin_o, OW));
+    qwen35_gdn_post(m, l, il, lin_o, zz, tmp_row, tmp_dim);
+}
+/* rms + silu gate over the scan output, then zero the pass-through lanes. */
+static void qwen35_gdn_post(const ds4_model *m, const ds4_layer_weights *l,
+                            uint32_t il, const float *lin_o, const float *zz,
+                            float *tmp_row, uint32_t tmp_dim) {
+    const uint32_t Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
+    const uint32_t OW = Hv * D;
+    const float eps = DS4_RMS_EPS;
+    (void)il;
     const float *nw = qwen4_ref_f32(m, l->lin_norm);
     for (uint32_t sh = 0; sh < Hv; sh++)
         qwen4_ref_rms(tmp_row + (uint64_t)sh * D, lin_o + (uint64_t)sh * D, nw, D, eps);
@@ -74687,21 +74734,8 @@ static void qwen35_gdn_token(
         tmp_row[i] *= zz[i] / (1.0f + expf(-zz[i]));
     /* the lanes past OW are never gated; zero them so the forward stays
      * deterministic (they used to carry uninitialised heap memory). */
-    if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
-        fprintf(stderr, "[memset] OW=%u C=%u before4096=%.6f before4097=%.6f\n",
-                OW, C, (double)tmp_row[OW], (double)tmp_row[OW+1]);
     if (tmp_dim > OW)
         memset(tmp_row + OW, 0, (size_t)(tmp_dim - OW) * sizeof(float));
-    if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
-        double hs = 0.0, ss = 0.0;
-        for (uint32_t i = 0; i < 3u * C; i++) { const double v = hist[i]; hs += v * v; }
-        for (uint32_t i = 0; i < Hv * D * D; i++) { const double v = state[i]; ss += v * v; }
-        fprintf(stderr, "[gdn] tmp=%.6f t0=%.6f t1=%.6f t2=%.6f t4095=%.6f "
-                "t4096=%.6f t10239=%.6f hist=%.6f state=%.6f\n",
-                qwen35_dbg_l2(tmp_row, C), (double)tmp_row[0], (double)tmp_row[1],
-                (double)tmp_row[2], (double)tmp_row[4095], (double)tmp_row[4096],
-                (double)tmp_row[C-1], hs, ss);
-    }
 }
 
 typedef struct {
@@ -74910,7 +74944,8 @@ static void qwen35_cpu_forward_batch(
                                  tmp + (uint64_t)t * TW, TW,
                                  lin_o + (uint64_t)t * OW,
                                  ga + (uint64_t)t * Hv,
-                                 gb + (uint64_t)t * Hv);
+                                 gb + (uint64_t)t * Hv,
+                                 getenv("DS4_QWEN35_NO_WHOLE_SCAN") ? 0 : 1);
             }
             clock_gettime(CLOCK_MONOTONIC, &g2b);
             gdn2_ms += (double)(g2b.tv_sec - g2a.tv_sec) * 1e3 +
@@ -74922,6 +74957,23 @@ static void qwen35_cpu_forward_batch(
                       (double)(gt1.tv_nsec - gt0.tv_nsec) / 1e6;
             if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
                 fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn_ms);
+            if (!getenv("DS4_QWEN35_NO_WHOLE_SCAN")) {
+                /* one pass for every token, state rows kept in L1 */
+                qwen35_gdn_scanb_arg sb;
+                sb.state = s->qwen35_cpu_ssm_state[il];
+                sb.qk = qkv;
+                sb.lin_o = lin_o;
+                sb.ga = ga; sb.gb = gb;
+                sb.Hk = DS4_N_LIN_K_HEAD; sb.Hv = DS4_N_LIN_V_HEAD;
+                sb.D = DS4_N_LIN_HEAD_DIM;
+                sb.n_tok = n_tok; sb.stride = QKV_STRIDE; sb.o_stride = OW;
+                ds4_parallel_for((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM,
+                                 qwen35_gdn_scanb_worker, &sb);
+                for (uint32_t t = 0; t < n_tok; t++)
+                    qwen35_gdn_post(m, l, il, lin_o + (uint64_t)t * OW,
+                                    z + (uint64_t)t * ZW,
+                                    tmp + (uint64_t)t * TW, TW);
+            }
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, gdn_exact);
             /* the pass-through lanes are zeroed per token above (see the gate
@@ -75280,7 +75332,7 @@ static void qwen35_cpu_forward_token(
             PROF_TICK();
             /* the same shared per-token block the batched path uses */
             qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
-                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb);
+                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb, 0);
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, gdn_f32);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {

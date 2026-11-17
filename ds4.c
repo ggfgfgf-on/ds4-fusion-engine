@@ -74886,6 +74886,9 @@ static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
     }
 }
 
+static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
+static double acc_ms = 0.0;
+
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
@@ -74893,8 +74896,6 @@ static void qwen35_cpu_matvec_batch(
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
-    static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
-    static double acc_ms = 0.0;
     struct timespec mv0, mv1;
     clock_gettime(CLOCK_MONOTONIC, &mv0);
     const uint64_t in_dim = w->dim[0];
@@ -75032,6 +75033,9 @@ static void qwen35_cpu_forward_batch(
     const float eps = DS4_RMS_EPS;
     const uint64_t NT = n_tok;
     const uint32_t QW = 2u * H * HD;      /* the q|gate width */
+    struct timespec bf0, bf1;
+    acc_ms = 0.0; acc_calls = 0; acc_bytes = 0; acc_q4 = 0; acc_q6 = 0;
+    clock_gettime(CLOCK_MONOTONIC, &bf0);
     const uint32_t OW = Hv * D;           /* the GDN output width */
 
     float *xb    = xmalloc((size_t)(NT * E) * sizeof(float));
@@ -75295,6 +75299,19 @@ static void qwen35_cpu_forward_batch(
     free(score); free(gb); free(ga); free(v2); free(k2); free(q2); free(attn_o);
     free(tmp); free(ff_b); free(ff_a); free(lin_o); free(z); free(qkv);
     free(blk); free(xb);
+    {
+        struct timespec bf1;
+        clock_gettime(CLOCK_MONOTONIC, &bf1);
+        const double wall = (double)(bf1.tv_sec - bf0.tv_sec) * 1e3 +
+                            (double)(bf1.tv_nsec - bf0.tv_nsec) / 1e6;
+        if (getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr,
+                    "[prefill] n_tok=%u wall=%.0f ms  matvec_calls=%llu matvec=%.0f ms"
+                    "  share=%.0f%%  q4=%.1f GB q6=%.1f GB\n",
+                    n_tok, wall, (unsigned long long)acc_calls, acc_ms,
+                    100.0 * acc_ms / (wall > 0.0 ? wall : 1.0),
+                    (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
+    }
 }
 
 
@@ -85811,8 +85828,25 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 memcpy(save + (uint64_t)il * stride + ssm_f, s->qwen35_cpu_conv_hist[il],
                        (size_t)conv_f * sizeof(float));
             }
-            qwen35_cpu_forward_batch(lg_batch, &e->model, &e->weights, s, toks,
-                                     (uint32_t)nv, 0u);
+            {
+                struct timespec w0, w1;
+                clock_gettime(CLOCK_MONOTONIC, &w0);
+                const double ms0 = acc_ms;
+                const uint64_t c0 = acc_calls;
+                qwen35_cpu_forward_batch(lg_batch, &e->model, &e->weights, s, toks,
+                                         (uint32_t)nv, 0u);
+                clock_gettime(CLOCK_MONOTONIC, &w1);
+                const double wall = (double)(w1.tv_sec - w0.tv_sec) * 1e3 +
+                                    (double)(w1.tv_nsec - w0.tv_nsec) / 1e6;
+                if (getenv("DS4_QWEN35_BYTE_DBG"))
+                    fprintf(stderr,
+                            "[prefill] n_tok=%d wall=%.0f ms  matvec_calls=%llu "
+                            "matvec=%.0f ms  share=%.0f%%\n",
+                            nv, wall,
+                            (unsigned long long)(acc_calls - c0),
+                            acc_ms - ms0,
+                            100.0 * (acc_ms - ms0) / (wall > 0.0 ? wall : 1.0));
+            }
             for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
                 if (!s->qwen35_cpu_ssm_state[il]) continue;
                 memcpy(s->qwen35_cpu_ssm_state[il], save + (uint64_t)il * stride,

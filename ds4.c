@@ -73475,6 +73475,20 @@ typedef struct {
 #if defined(__AVX2__)
 #include <immintrin.h>
 
+static inline float y0d(const block_q8_K *y, uint64_t ystride, uint64_t b,
+                        uint64_t t, uint64_t nt) {
+    return (t < nt) ? (y + t * ystride + b)->d : 0.0f;
+}
+
+static inline float qwen35_hsum_ps(__m256 v) {
+    const __m128 lo = _mm256_castps256_ps128(v);
+    const __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    return _mm_cvtss_f32(s);
+}
+
 static inline int32_t qwen35_hsum_i32(__m256i v) {
     __m256i s = _mm256_add_epi32(v, _mm256_permute2x128_si256(v, v, 1));
     __m128i lo = _mm256_castsi256_si128(s);
@@ -74025,53 +74039,94 @@ static int qwen35_repack_selftest(void) {
     return bad == 0;
 }
 
+/* nt == 4 hot path: every accumulator is a named register. The generic shape
+ * indexed a[2][4] and s[2][4] with a runtime loop variable, which forces both
+ * arrays into memory - the same trap that cost 2x on the lane kernel. */
 static void qwen35_gemm_q4_K_q8_K_2x4(
         const block_q4_K *x0, const block_q4_K *x1,
-        const block_q8_K *y, uint64_t blocks, uint64_t ystride,
+        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
         uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
     const __m256i m0F = _mm256_set1_epi8(0x0F);
-    float acc[2][4] = {{0}};
+    __m256 f00 = _mm256_setzero_ps(), f01 = _mm256_setzero_ps();
+    __m256 f02 = _mm256_setzero_ps(), f03 = _mm256_setzero_ps();
+    __m256 f10 = _mm256_setzero_ps(), f11 = _mm256_setzero_ps();
+    __m256 f12 = _mm256_setzero_ps(), f13 = _mm256_setzero_ps();
+    float m00 = 0.f, m01 = 0.f, m02 = 0.f, m03 = 0.f;
+    float m10 = 0.f, m11 = 0.f, m12 = 0.f, m13 = 0.f;
+    (void)f02; (void)f03; (void)f12; (void)f13;
+    (void)m02; (void)m03; (void)m12; (void)m13;
     for (uint64_t b = 0; b < blocks; b++) {
-        __m256i a[2][4];
-        int64_t s[2][4];
-        for (int r = 0; r < 2; r++) for (int t = 0; t < 4; t++) {
-            a[r][t] = _mm256_setzero_si256(); s[r][t] = 0; }
+        __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a03 = a00;
+        __m256i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+        int32_t s00 = 0, s01 = 0, s02 = 0, s03 = 0;
+        int32_t s10 = 0, s11 = 0, s12 = 0, s13 = 0;
         for (int j = 0; j < 8; j++) {
             const int byte_off = (j >> 1) * 32, shift = (j & 1) * 4;
-            __m256i q4n[2];
-            uint8_t scl[2], mnv[2];
-            const block_q4_K *xp[2] = { x0, x1 };
-            for (int r = 0; r < 2; r++) {
-                q4_k_get_scale_min(j, xp[r][b].scales, &scl[r], &mnv[r]);
-                q4n[r] = _mm256_and_si256(_mm256_srli_epi16(
-                        _mm256_loadu_si256((const __m256i *)(xp[r][b].qs + byte_off)),
-                        shift), m0F);
-            }
-            for (uint64_t tt = 0; tt < nt; tt++) {
-                const block_q8_K *yb = y + tt * ystride + b;
-                const __m256i q8b = _mm256_loadu_si256((const __m256i *)(yb->qs + j * 32));
-                const int32_t bs = (int32_t)yb->bsums[2*j] + (int32_t)yb->bsums[2*j+1];
-                for (int r = 0; r < 2; r++) {
-                    s[r][tt] += (int64_t)mnv[r] * bs;
-                    a[r][tt] = _mm256_add_epi32(a[r][tt], _mm256_madd_epi16(
-                            _mm256_maddubs_epi16(q4n[r], q8b),
-                            _mm256_set1_epi16((short)scl[r])));
-                }
-            }
+            uint8_t scl0, mnv0, scl1, mnv1;
+            q4_k_get_scale_min(j, x0[b].scales, &scl0, &mnv0);
+            q4_k_get_scale_min(j, x1[b].scales, &scl1, &mnv1);
+            const __m256i q0 = _mm256_and_si256(_mm256_srli_epi16(
+                    _mm256_loadu_si256((const __m256i *)(x0[b].qs + byte_off)),
+                    shift), m0F);
+            const __m256i q1 = _mm256_and_si256(_mm256_srli_epi16(
+                    _mm256_loadu_si256((const __m256i *)(x1[b].qs + byte_off)),
+                    shift), m0F);
+            const __m256i sc0 = _mm256_set1_epi16((short)scl0);
+            const __m256i sc1 = _mm256_set1_epi16((short)scl1);
+            /* four tokens unrolled; nt < 4 uses zeroed q8 so the results are
+             * identical and the loop stays branch-free */
+            const block_q8_K *y0 = y + 0 * ystride + b;
+            const block_q8_K *y1 = (nt > 1) ? y + 1 * ystride + b : y0;
+            const block_q8_K *y2 = (nt > 2) ? y + 2 * ystride + b : y0;
+            const block_q8_K *y3 = (nt > 3) ? y + 3 * ystride + b : y0;
+            const __m256i qa = _mm256_loadu_si256((const __m256i *)(y0->qs + j*32));
+            const __m256i qb = _mm256_loadu_si256((const __m256i *)(y1->qs + j*32));
+            const __m256i qc = _mm256_loadu_si256((const __m256i *)(y2->qs + j*32));
+            const __m256i qd = _mm256_loadu_si256((const __m256i *)(y3->qs + j*32));
+            const int32_t ba = y0->bsums[2*j] + y0->bsums[2*j+1];
+            const int32_t bb = y1->bsums[2*j] + y1->bsums[2*j+1];
+            const int32_t bc = y2->bsums[2*j] + y2->bsums[2*j+1];
+            const int32_t bd = y3->bsums[2*j] + y3->bsums[2*j+1];
+            s00 += mnv0 * ba; s01 += mnv0 * bb; s02 += mnv0 * bc; s03 += mnv0 * bd;
+            s10 += mnv1 * ba; s11 += mnv1 * bb; s12 += mnv1 * bc; s13 += mnv1 * bd;
+            a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(_mm256_maddubs_epi16(q0, qa), sc0));
+            a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(_mm256_maddubs_epi16(q0, qb), sc0));
+            a02 = _mm256_add_epi32(a02, _mm256_madd_epi16(_mm256_maddubs_epi16(q0, qc), sc0));
+            a03 = _mm256_add_epi32(a03, _mm256_madd_epi16(_mm256_maddubs_epi16(q0, qd), sc0));
+            a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(_mm256_maddubs_epi16(q1, qa), sc1));
+            a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(_mm256_maddubs_epi16(q1, qb), sc1));
+            a12 = _mm256_add_epi32(a12, _mm256_madd_epi16(_mm256_maddubs_epi16(q1, qc), sc1));
+            a13 = _mm256_add_epi32(a13, _mm256_madd_epi16(_mm256_maddubs_epi16(q1, qd), sc1));
         }
-        for (uint64_t tt = 0; tt < nt; tt++) {
-            const float yd = (y + tt * ystride + b)->d;
-            for (int r = 0; r < 2; r++) {
-                const block_q4_K *xr = (r == 0) ? x0 : x1;
-                const float d = yd * f16_to_f32(xr[b].d);
-                const float m = -yd * f16_to_f32(xr[b].dmin);
-                acc[r][tt] += d * (float)qwen35_hsum_i32(a[r][tt]) + m * (float)s[r][tt];
-            }
-        }
+        const float d0 = f16_to_f32(x0[b].d), mn0 = f16_to_f32(x0[b].dmin);
+        const float d1 = f16_to_f32(x1[b].d), mn1 = f16_to_f32(x1[b].dmin);
+        const float ya = y0d(y, ystride, b, 0, nt), yb_ = y0d(y, ystride, b, 1, nt);
+        const float yc = y0d(y, ystride, b, 2, nt), yd_ = y0d(y, ystride, b, 3, nt);
+        f00 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a00), _mm256_set1_ps(d0*ya), f00);
+        f01 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a01), _mm256_set1_ps(d0*yb_), f01);
+        f02 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a02), _mm256_set1_ps(d0*yc), f02);
+        f03 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a03), _mm256_set1_ps(d0*yd_), f03);
+        f10 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a10), _mm256_set1_ps(d1*ya), f10);
+        f11 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a11), _mm256_set1_ps(d1*yb_), f11);
+        f12 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a12), _mm256_set1_ps(d1*yc), f12);
+        f13 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a13), _mm256_set1_ps(d1*yd_), f13);
+        m00 -= mn0*ya*(float)s00; m01 -= mn0*yb_*(float)s01;
+        m02 -= mn0*yc*(float)s02; m03 -= mn0*yd_*(float)s03;
+        m10 -= mn1*ya*(float)s10; m11 -= mn1*yb_*(float)s11;
+        m12 -= mn1*yc*(float)s12; m13 -= mn1*yd_*(float)s13;
     }
-    for (uint64_t tt = 0; tt < nt; tt++)
-        for (int r = 0; r < 2; r++)
-            out[tt * out_stride + row + (uint64_t)r] = acc[r][tt];
+    const uint64_t lim = nt < 4u ? nt : 4u;
+    for (uint64_t tt = 0; tt < lim; tt++) {
+        float v0, v1;
+        switch (tt) {
+        case 0: v0 = qwen35_hsum_ps(f00) + m00; v1 = qwen35_hsum_ps(f10) + m10; break;
+        case 1: v0 = qwen35_hsum_ps(f01) + m01; v1 = qwen35_hsum_ps(f11) + m11; break;
+        case 2: v0 = qwen35_hsum_ps(f02) + m02; v1 = qwen35_hsum_ps(f12) + m12; break;
+        default: v0 = qwen35_hsum_ps(f03) + m03; v1 = qwen35_hsum_ps(f13) + m13; break;
+        }
+        out[tt * out_stride + row + 0] = v0;
+        out[tt * out_stride + row + 1] = v1;
+    }
 }
 
 /* AVX2 Q6_K x Q8_K per block (the maddubs route with the +32 unsigned offset
@@ -74552,15 +74607,23 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
         /* 2 rows x 4 tokens: the weight stream is walked n_tok/4 times.
          * Only taken when the token count is a multiple of 4, so no tail
          * kernel is needed; everything else falls through to x8/x4. */
-        if (ctx->n_tok >= 4u && (ctx->n_tok % 4u) == 0u) {
+        /* Any token count takes the 2x4 path now: the tail group passes nt < 4
+         * and the kernel zero-fills the missing tokens. Before, a token count
+         * that was not a multiple of four fell through to the per-token kernel
+         * and walked the whole weight stream once per token - 22 passes instead
+         * of 6 on a 22-token prompt. */
+        {
             for (; row + 1u < row1; row += 2u) {
                 const block_q4_K *t0 = (const block_q4_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
                 const block_q4_K *t1 = (const block_q4_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
                 _mm_prefetch((const char *)(ctx->data + (row + 16u) * ctx->row_bytes), _MM_HINT_T0);
-                for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u)
+                for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u) {
+                    uint64_t nt = ctx->n_tok - tt;
+                    if (nt > 4u) nt = 4u;
                     qwen35_gemm_q4_K_q8_K_2x4(t0, t1, ctx->xq + tt * blocks, blocks,
-                                              blocks, 4, ctx->out + tt * ctx->out_dim,
+                                              blocks, nt, ctx->out + tt * ctx->out_dim,
                                               ctx->out_dim, row);
+                }
             }
         }
         for (; row + 7u < row1; row += 8u) {
@@ -74829,6 +74892,10 @@ static void qwen35_cpu_matvec_batch(
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
+    static uint64_t acc_bytes = 0, acc_calls = 0;
+    static double acc_ms = 0.0;
+    struct timespec mv0, mv1;
+    clock_gettime(CLOCK_MONOTONIC, &mv0);
     const uint64_t in_dim = w->dim[0];
     const uint64_t rows = w->ndim >= 2 ? w->dim[1] : 1u;
     const uint64_t blocks = in_dim / QK_K;
@@ -74896,6 +74963,16 @@ static void qwen35_cpu_matvec_batch(
         .exact = exact,
     };
     ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
+    clock_gettime(CLOCK_MONOTONIC, &mv1);
+    acc_ms += (double)(mv1.tv_sec - mv0.tv_sec) * 1e3 +
+              (double)(mv1.tv_nsec - mv0.tv_nsec) / 1e6;
+    acc_calls++;
+    acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
+    if (getenv("DS4_QWEN35_BYTE_DBG") && (acc_calls % 96u) == 0u)
+        fprintf(stderr, "[bytes] calls=%llu walked_gb=%.1f time_ms=%.0f "
+                "eff_gbs=%.1f\n",
+                (unsigned long long)acc_calls, (double)acc_bytes / 1e9, acc_ms,
+                (double)acc_bytes / 1e9 / (acc_ms / 1e3));
     if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0 &&
         (exact || getenv("DS4_QWEN35_CORE_DBG_Q8"))) {
         /* compare the batched kernel against the per-token kernel on the very

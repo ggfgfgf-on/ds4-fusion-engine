@@ -86026,6 +86026,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * 2.03848 on both runs - so no uninitialised memory and no race.
              * That is what this check now guards. */
             const double tol = 3.0;
+            /* A systematic offset would push every logit one way and shift the
+             * distribution; symmetric rounding leaves the mean at ~0 and only
+             * moves near-ties. Report both so the two cases are distinguishable. */
+            double ssum = 0.0, smax = 0.0, rms = 0.0;
+            int nlog = (int)DS4_N_VOCAB;
+            for (int i = 0; i < nlog; i++) {
+                const double d = (double)last[i] - (double)lg_ref[i];
+                ssum += d;
+                if (fabs(d) > smax) smax = fabs(d);
+                rms += d * d;
+            }
+            const double mean_d = ssum / (nlog ? nlog : 1);
+            const double rms_d = sqrt(rms / (nlog ? nlog : 1));
+            fprintf(stderr, "[batchverify] bias: mean=%+.4g rms=%.4g max=%.4g "
+                    "(bias≈0 means rounding noise, not a shift)\n",
+                    mean_d, rms_d, smax);
             fprintf(stderr, "[batchverify] n=%d max|diff|=%.6g argmax batch=%d ref=%d"
                     "  %s (tolerance %.1f)\n",
                     nv, maxd, argb, argr,

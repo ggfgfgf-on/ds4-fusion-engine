@@ -73842,84 +73842,90 @@ static void qwen35_gemm_q4_K_16x4(
                 dv[15],dv[14],dv[13],dv[12],dv[11],dv[10],dv[9],dv[8],
                 dv[7],dv[6],dv[5],dv[4],dv[3],dv[2],dv[1],dv[0]);
 
-        for (int j = 0; j < 8; j++) {
-            const int sh = (j & 1) ? 4 : 0;
-            __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+        /* Sub-block PAIRS. A q4_K byte holds the low nibble for sub-block 2m
+         * and the high nibble for 2m+1, so walking j and j+1 separately loaded
+         * every 32-byte block twice and threw half of it away. One load now
+         * feeds both sub-blocks, which halves the weight loads. The two
+         * sub-blocks carry different scales, so each token needs a low and a
+         * high accumulator: eight integer accumulators against the previous
+         * four. */
+        for (int jp = 0; jp < 4; jp++) {
+            const int jlo = 2 * jp;
             const block_q8_K *y0 = y + 0 * ystride + b;
             const block_q8_K *y1 = y + 1 * ystride + b;
             const block_q8_K *y2 = y + 2 * ystride + b;
             const block_q8_K *y3 = y + 3 * ystride + b;
+            __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0, lo3 = lo0;
+            __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
             if (lim == 4u) {
-                /* Unrolled deliberately. The generic loop below put a four-way
-                 * switch after every dpbusd - a branch per product in the
-                 * hottest loop of the kernel - and dpbusd already accumulates,
-                 * so the separate add was doubling the dependency chain. */
                 for (int c = 0; c < 8; c++) {
                     const __m512i raw = _mm512_loadu_si512(
-                            (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
-                    const __m512i q = sh
-                            ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
-                            : _mm512_and_si512(raw, m0F);
-                    int32_t f0, f1, f2, f3;
-                    memcpy(&f0, y0->qs + j * 32 + c * 4, 4);
-                    memcpy(&f1, y1->qs + j * 32 + c * 4, 4);
-                    memcpy(&f2, y2->qs + j * 32 + c * 4, 4);
-                    memcpy(&f3, y3->qs + j * 32 + c * 4, 4);
-                    a0 = _mm512_dpbusd_epi32(a0, q, _mm512_set1_epi32(f0));
-                    a1 = _mm512_dpbusd_epi32(a1, q, _mm512_set1_epi32(f1));
-                    a2 = _mm512_dpbusd_epi32(a2, q, _mm512_set1_epi32(f2));
-                    a3 = _mm512_dpbusd_epi32(a3, q, _mm512_set1_epi32(f3));
-                }
-            } else
-            if (lim == 1u) {
-                /* Decode is one token and accounts for the large majority of
-                 * the calls, so it needs its own loop: only a0 is live, and the
-                 * switch below would otherwise run on every product. */
-                for (int c = 0; c < 8; c++) {
-                    const __m512i raw = _mm512_loadu_si512(
-                            (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
-                    const __m512i q = sh
-                            ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
-                            : _mm512_and_si512(raw, m0F);
-                    int32_t f0;
-                    memcpy(&f0, y0->qs + j * 32 + c * 4, 4);
-                    a0 = _mm512_dpbusd_epi32(a0, q, _mm512_set1_epi32(f0));
-                }
-            } else
-            for (int c = 0; c < 8; c++) {
-                const __m512i raw = _mm512_loadu_si512(
-                        (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
-                const __m512i q = sh
-                        ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
-                        : _mm512_and_si512(raw, m0F);
-                for (uint64_t t = 0; t < lim; t++) {
-                    int32_t four;
-                    memcpy(&four, y[t * ystride + b].qs + j * 32 + c * 4, 4);
-                    const __m512i r = _mm512_dpbusd_epi32(
-                            _mm512_setzero_si512(), q, _mm512_set1_epi32(four));
-                    switch (t) {
-                    case 0: a0 = _mm512_add_epi32(a0, r); break;
-                    case 1: a1 = _mm512_add_epi32(a1, r); break;
-                    case 2: a2 = _mm512_add_epi32(a2, r); break;
-                    default: a3 = _mm512_add_epi32(a3, r); break;
+                            (const void *)(xp + 256 + ((jp * 8 + c) * 64)));
+                    const __m512i ql = _mm512_and_si512(raw, m0F);
+                    const __m512i qh = _mm512_and_si512(
+                            _mm512_srli_epi16(raw, 4), m0F);
+                    int32_t l0, l1, l2, l3, h0, h1, h2, h3;
+                    memcpy(&l0, y0->qs + jlo * 32 + c * 4, 4);
+                    memcpy(&h0, y0->qs + (jlo + 1) * 32 + c * 4, 4);
+                    lo0 = _mm512_dpbusd_epi32(lo0, ql, _mm512_set1_epi32(l0));
+                    hi0 = _mm512_dpbusd_epi32(hi0, qh, _mm512_set1_epi32(h0));
+                    if (lim > 1u) {
+                        memcpy(&l1, y1->qs + jlo * 32 + c * 4, 4);
+                        memcpy(&h1, y1->qs + (jlo + 1) * 32 + c * 4, 4);
+                        lo1 = _mm512_dpbusd_epi32(lo1, ql, _mm512_set1_epi32(l1));
+                        hi1 = _mm512_dpbusd_epi32(hi1, qh, _mm512_set1_epi32(h1));
+                    }
+                    if (lim > 2u) {
+                        memcpy(&l2, y2->qs + jlo * 32 + c * 4, 4);
+                        memcpy(&h2, y2->qs + (jlo + 1) * 32 + c * 4, 4);
+                        lo2 = _mm512_dpbusd_epi32(lo2, ql, _mm512_set1_epi32(l2));
+                        hi2 = _mm512_dpbusd_epi32(hi2, qh, _mm512_set1_epi32(h2));
+                    }
+                    if (lim > 3u) {
+                        memcpy(&l3, y3->qs + jlo * 32 + c * 4, 4);
+                        memcpy(&h3, y3->qs + (jlo + 1) * 32 + c * 4, 4);
+                        lo3 = _mm512_dpbusd_epi32(lo3, ql, _mm512_set1_epi32(l3));
+                        hi3 = _mm512_dpbusd_epi32(hi3, qh, _mm512_set1_epi32(h3));
                     }
                 }
+            } else {
+                for (int c = 0; c < 8; c++) {
+                    const __m512i raw = _mm512_loadu_si512(
+                            (const void *)(xp + 256 + ((jp * 8 + c) * 64)));
+                    const __m512i ql = _mm512_and_si512(raw, m0F);
+                    const __m512i qh = _mm512_and_si512(
+                            _mm512_srli_epi16(raw, 4), m0F);
+                    int32_t l0, h0;
+                    memcpy(&l0, y0->qs + jlo * 32 + c * 4, 4);
+                    memcpy(&h0, y0->qs + (jlo + 1) * 32 + c * 4, 4);
+                    lo0 = _mm512_dpbusd_epi32(lo0, ql, _mm512_set1_epi32(l0));
+                    hi0 = _mm512_dpbusd_epi32(hi0, qh, _mm512_set1_epi32(h0));
+                }
             }
-            uint8_t sv[Q4K_X16_ROWS];
-            qwen35_unpack6(xp + 64 + j * 24, sv);
-            /* Sixteen bytes to sixteen float lanes in one instruction. This was
-             * a _mm512_set_ps of sixteen scalars, which is the shape that has
-             * cost this session more than anything else - every runtime-indexed
-             * vector built from scalars lands in memory first. */
-            const __m512 scv = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                    _mm_loadu_si128((const __m128i *)sv)));
-            const __m512 base = _mm512_mul_ps(scv, dvec);
+            uint8_t svl[Q4K_X16_ROWS], svh[Q4K_X16_ROWS];
+            qwen35_unpack6(xp + 64 + jlo * 24, svl);
+            qwen35_unpack6(xp + 64 + (jlo + 1) * 24, svh);
+            const __m512 basel = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)svl))), dvec);
+            const __m512 baseh = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)svh))), dvec);
             for (uint64_t t = 0; t < lim; t++) {
-                const __m512i pv = (t == 0) ? a0 : (t == 1) ? a1
-                                 : (t == 2) ? a2 : a3;
-                const __m512 k = _mm512_mul_ps(base,
-                        _mm512_set1_ps(y[t * ystride + b].d));
-                const __m512 v = _mm512_mul_ps(_mm512_cvtepi32_ps(pv), k);
+                const __m512 pr_l = (t == 0) ? lo0 : (t == 1) ? lo1
+                                  : (t == 2) ? lo2 : lo3;
+                const __m512i pi_l = _mm512_castps_si512(pr_l);
+                (void)pi_l;
+                const __m512i il = (t == 0) ? lo0 : (t == 1) ? lo1
+                                 : (t == 2) ? lo2 : lo3;
+                const __m512i ih = (t == 0) ? hi0 : (t == 1) ? hi1
+                                 : (t == 2) ? hi2 : hi3;
+                const float yd = y[t * ystride + b].d;
+                const __m512 v = _mm512_add_ps(
+                        _mm512_mul_ps(_mm512_cvtepi32_ps(il),
+                                      _mm512_mul_ps(basel, _mm512_set1_ps(yd))),
+                        _mm512_mul_ps(_mm512_cvtepi32_ps(ih),
+                                      _mm512_mul_ps(baseh, _mm512_set1_ps(yd))));
                 switch (t) {
                 case 0: f0 = _mm512_add_ps(f0, v); break;
                 case 1: f1 = _mm512_add_ps(f1, v); break;

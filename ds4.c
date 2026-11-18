@@ -83470,6 +83470,9 @@ static bool ds4_session_tp_leader(const ds4_session *s) {
 
 static void qwen35_rp16_eager(const ds4_model *m, const ds4_weights *w);
 
+static void qwen35_rp8_eager(const ds4_model *m, const ds4_weights *w);
+static void qwen35_rp16_eager(const ds4_model *m, const ds4_weights *w);
+
 static int ds4_session_tp_register(ds4_session *s) {
     if (!ds4_session_tp_leader(s)) return 1;
     ds4_engine *e = s->engine;
@@ -83518,6 +83521,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (getenv("DS4_QWEN35_X16") != NULL &&
             getenv("DS4_REPACK_WRITABLE_MAP") != NULL) {
             qwen35_rp16_eager(&e->model, &e->weights);
+        }
+        if (getenv("DS4_QWEN35_LANE_GEMM") != NULL &&
+            getenv("DS4_REPACK_WRITABLE_MAP") != NULL) {
+            qwen35_rp8_eager(&e->model, &e->weights);
         }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
@@ -88665,6 +88672,53 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
  * is once per process either way - the registry guarantees that - but doing it
  * here means the FIRST request does not pay 3.6 seconds while every later one
  * pays nothing. */
+/* Eager repack for the eight-row lane layout, so its one-time cost leaves the
+ * request path the same way the sixteen-row one already does. */
+static uint64_t qwen35_rp8_one(const ds4_model *m, const ds4_tensor *w) {
+    if (!w || w->type != DS4_TENSOR_Q4_K) return 0;
+    if (w->ndim < 2 || w->dim[0] % QK_K != 0) return 0;
+    const uint64_t rows = w->dim[1];
+    const uint64_t blocks = w->dim[0] / QK_K;
+    const uint64_t row_bytes = blocks * Q4K_ROW;
+    if (rows < 8u || (rows % 8u) != 0u || row_bytes < Q4K_ROW) return 0;
+    uint8_t *data = (uint8_t *)(uintptr_t)tensor_data(m, w);
+    if (!data || qwen35_rp_get(data) != 0) return 0;
+    uint8_t *scratch = xmalloc((size_t)(8u * row_bytes));
+    for (uint64_t g = 0; g < rows / 8u; g++) {
+        uint8_t *grp = data + g * 8u * row_bytes;
+        qwen35_repack_group(grp, scratch, row_bytes, blocks);
+        memcpy(grp, scratch, (size_t)(8u * row_bytes));
+    }
+    free(scratch);
+    qwen35_rp_set(data, 1);
+    return w->bytes;
+}
+
+static void qwen35_rp8_eager(const ds4_model *m, const ds4_weights *w) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        total += qwen35_rp8_one(m, l->lin_qkv);
+        total += qwen35_rp8_one(m, l->lin_gate);
+        total += qwen35_rp8_one(m, l->lin_out);
+        total += qwen35_rp8_one(m, l->attn_q);
+        total += qwen35_rp8_one(m, l->attn_k);
+        total += qwen35_rp8_one(m, l->attn_v);
+        total += qwen35_rp8_one(m, l->attn_output);
+        total += qwen35_rp8_one(m, l->ffn_gate);
+        total += qwen35_rp8_one(m, l->ffn_up);
+        total += qwen35_rp8_one(m, l->ffn_down);
+    }
+    total += qwen35_rp8_one(m, w->output);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "[repack8] eager: %.1f GB in %.0f ms\n",
+            (double)total / 1e9,
+            (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+            (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+}
+
 static uint64_t qwen35_rp16_one(const ds4_model *m, const ds4_tensor *w) {
     if (!w || w->type != DS4_TENSOR_Q4_K) return 0;
     if (w->ndim < 2 || w->dim[0] % QK_K != 0) return 0;

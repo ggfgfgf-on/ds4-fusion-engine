@@ -73786,8 +73786,14 @@ static void qwen35_repack16_group(const uint8_t *src, uint8_t *dst,
     }
 }
 
-/* Sixteen rows, up to four tokens, main term in the lanes and the -dmin term
- * as a separate scalar pass so it never touches the hot loop's registers. */
+/* Sixteen rows, up to four tokens. Lane r of every accumulator IS row r, so
+ * four integer and four float accumulators hold all 64 outputs - eight zmm
+ * against the 2x4 kernel's sixteen. The -dmin term is a separate scalar pass
+ * that never touches the hot loop's registers.
+ *
+ * d is folded into the per-lane scale vector rather than applied as one scalar:
+ * d[16] is contiguous precisely so all sixteen rows' scales arrive in one load,
+ * and using d[0] for every row was the bug that made this read 10.06 off. */
 static void qwen35_gemm_q4_K_16x4(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -73795,11 +73801,18 @@ static void qwen35_gemm_q4_K_16x4(
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
     const uint64_t lim = nt < 4u ? nt : 4u;
-    float mainv[Q4K_X16_ROWS][4];
-    memset(mainv, 0, sizeof mainv);
+    __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
 
     for (uint64_t b = 0; b < blocks; b++) {
         const uint8_t *xp = grp + b * Q4K_X16_BYTES;
+        /* all sixteen rows' d for this super-block, contiguous */
+        float dv[Q4K_X16_ROWS];
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            dv[r] = f16_to_f32(*(const uint16_t *)(xp + r * 2));
+        const __m512 dvec = _mm512_set_ps(
+                dv[15],dv[14],dv[13],dv[12],dv[11],dv[10],dv[9],dv[8],
+                dv[7],dv[6],dv[5],dv[4],dv[3],dv[2],dv[1],dv[0]);
+
         for (int j = 0; j < 8; j++) {
             const int sh = (j & 1) ? 4 : 0;
             __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
@@ -73829,15 +73842,19 @@ static void qwen35_gemm_q4_K_16x4(
                     (float)sv[11],(float)sv[10],(float)sv[9],(float)sv[8],
                     (float)sv[7],(float)sv[6],(float)sv[5],(float)sv[4],
                     (float)sv[3],(float)sv[2],(float)sv[1],(float)sv[0]);
+            const __m512 base = _mm512_mul_ps(scv, dvec);
             for (uint64_t t = 0; t < lim; t++) {
                 const __m512i pv = (t == 0) ? a0 : (t == 1) ? a1
                                  : (t == 2) ? a2 : a3;
-                const float d = f16_to_f32(*(const uint16_t *)(xp + 0))
-                        * y[t * ystride + b].d;
-                float lane[16];
-                _mm512_storeu_ps(lane, _mm512_mul_ps(scv,
-                        _mm512_mul_ps(_mm512_cvtepi32_ps(pv), _mm512_set1_ps(d))));
-                for (unsigned r = 0; r < Q4K_X16_ROWS; r++) mainv[r][t] += lane[r];
+                const __m512 k = _mm512_mul_ps(base,
+                        _mm512_set1_ps(y[t * ystride + b].d));
+                const __m512 v = _mm512_mul_ps(_mm512_cvtepi32_ps(pv), k);
+                switch (t) {
+                case 0: f0 = _mm512_add_ps(f0, v); break;
+                case 1: f1 = _mm512_add_ps(f1, v); break;
+                case 2: f2 = _mm512_add_ps(f2, v); break;
+                default: f3 = _mm512_add_ps(f3, v); break;
+                }
             }
         }
     }
@@ -73847,27 +73864,32 @@ static void qwen35_gemm_q4_K_16x4(
     memset(minv, 0, sizeof minv);
     for (uint64_t b = 0; b < blocks; b++) {
         const uint8_t *xp = grp + b * Q4K_X16_BYTES;
+        float mn[8][Q4K_X16_ROWS];
+        for (int j = 0; j < 8; j++) {
+            uint8_t mvb[Q4K_X16_ROWS];
+            qwen35_unpack6(xp + 64 + j * 24 + 12, mvb);
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++) mn[j][r] = (float)mvb[r];
+        }
         for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
             const float dm = f16_to_f32(*(const uint16_t *)(xp + 32 + r * 2));
-            float mn[8];
-            for (int j = 0; j < 8; j++) {
-                uint8_t mvv[Q4K_X16_ROWS];
-                qwen35_unpack6(xp + 64 + j * 24 + 12, mvv);
-                mn[j] = (float)mvv[r];
-            }
             for (uint64_t t = 0; t < lim; t++) {
                 const block_q8_K *yt = y + t * ystride + b;
-                float s = 0.f;
+                float acc = 0.f;
                 for (int j = 0; j < 8; j++)
-                    s += mn[j] * (float)((int32_t)yt->bsums[2*j] + yt->bsums[2*j+1]);
-                minv[r][t] -= yt->d * dm * s;
+                    acc += (float)mn[j][r] *
+                           (float)((int32_t)yt->bsums[2*j] + yt->bsums[2*j+1]);
+                minv[r][t] -= yt->d * dm * acc;
             }
         }
     }
 
-    for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
-        for (uint64_t t = 0; t < lim; t++)
-            out[t * out_stride + row0 + r] = mainv[r][t] + minv[r][t];
+    for (uint64_t t = 0; t < lim; t++) {
+        __m512 fv = (t == 0) ? f0 : (t == 1) ? f1 : (t == 2) ? f2 : f3;
+        float lane[Q4K_X16_ROWS];
+        _mm512_storeu_ps(lane, fv);
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            out[t * out_stride + row0 + r] = lane[r] + minv[r][t];
+    }
 #else
     (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
     (void)out; (void)out_stride; (void)row0;

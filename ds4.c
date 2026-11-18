@@ -74697,6 +74697,19 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
                                               ? (uint64_t)sizeof(block_q4_K)
                                               : (uint64_t)sizeof(block_q6_K));
     if (!exact) ds4_quantize_row_q8_K(x, q8_scratch, (int64_t)in_dim);
+    /* Sixteen-row layout: decode has to read it through the matching kernel.
+     * Without this branch the code below treats the repacked bytes as
+     * row-major, which is why the per-token BATCH_VERIFY reference disagreed
+     * with the 16-row batch path by twenty to thirty while the kernel itself
+     * matches a scalar reference to 2.5e-06. */
+    if (w->type == DS4_TENSOR_Q4_K && !exact &&
+        qwen35_rp_get((const uint8_t *)tensor_data(m, w)) == 3) {
+        const uint8_t *tb16 = (const uint8_t *)tensor_data(m, w);
+        for (uint64_t g = 0; g < rows / 16u; g++)
+            qwen35_gemm_q4_K_16x4(tb16 + g * blocks * Q4K_X16_BYTES, blocks,
+                                  q8_scratch, blocks, 1u, out, rows, g * 16u);
+        return;
+    }
     /* Keep the repacked layout consistent across BOTH paths: decode reads the
      * same tensors the batched prefill repacked, so it must use the matching
      * kernel (nt=1 here). */
@@ -75307,10 +75320,19 @@ static void qwen35_cpu_matvec_batch(
                         (double)w->bytes / 1048576.0, rp_ms);
         }
         if (st == 3) {
-            for (uint64_t g = 0; g < rows / 16u; g++)
-                qwen35_gemm_q4_K_16x4(tdata + g * blocks * Q4K_X16_BYTES, blocks,
-                                      xq, blocks, n_tok,
-                                      out, rows, g * 16u);
+            /* Four tokens per call, so the token groups must be walked here.
+             * Passing n_tok straight in left every token past the fourth
+             * holding its previous value, which read as max|diff| 25 on an
+             * eight-token batch while a four-token one already agreed to
+             * 1.27. */
+            for (uint64_t tt = 0; tt < n_tok; tt += 4u) {
+                uint64_t nt4 = n_tok - tt;
+                if (nt4 > 4u) nt4 = 4u;
+                for (uint64_t g = 0; g < rows / 16u; g++)
+                    qwen35_gemm_q4_K_16x4(tdata + g * blocks * Q4K_X16_BYTES,
+                                          blocks, xq + tt * blocks, blocks, nt4,
+                                          out + tt * rows, rows, g * 16u);
+            }
             free(xq);
             return;
         }

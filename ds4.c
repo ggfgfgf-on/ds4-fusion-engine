@@ -73768,6 +73768,7 @@ typedef struct {
 /* Repack a tensor's sixteen-row groups on all threads - one scratch per chunk.
  * Serially this was 41 ms per 48 MB tensor after the pack6 rewrite, eight
  * seconds across the model. */
+
 static void qwen35_rp16_worker(void *vctx, uint64_t g0, uint64_t g1) {
     qwen35_rp16_work *c = vctx;
     const size_t sz = (size_t)(16u * c->row_bytes);
@@ -88531,6 +88532,51 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 }
 #endif
 
+/* Repack every Q4_K tensor up front instead of lazily on first use. The repack
+ * is once per process either way - the registry guarantees that - but doing it
+ * here means the FIRST request does not pay 3.6 seconds while every later one
+ * pays nothing. */
+static uint64_t qwen35_rp16_one(const ds4_model *m, const ds4_tensor *w) {
+    if (!w || w->type != DS4_TENSOR_Q4_K) return 0;
+    if (w->ndim < 2 || w->dim[0] % QK_K != 0) return 0;
+    const uint64_t rows = w->dim[1];
+    const uint64_t blocks = w->dim[0] / QK_K;
+    const uint64_t row_bytes = blocks * Q4K_ROW;
+    if (rows < 16u || (rows % 16u) != 0u || row_bytes < Q4K_ROW) return 0;
+    uint8_t *data = (uint8_t *)(uintptr_t)tensor_data(m, w);
+    if (!data || qwen35_rp_get(data) != 0) return 0;
+    qwen35_rp16_work rw = { data, row_bytes, blocks, rows / 16u };
+    ds4_parallel_for(rows / 16u, qwen35_rp16_worker, &rw);
+    qwen35_rp_set(data, 3);
+    return w->bytes;
+}
+
+static void qwen35_rp16_eager(const ds4_model *m, const ds4_weights *w) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        total += qwen35_rp16_one(m, l->lin_qkv);
+        total += qwen35_rp16_one(m, l->lin_gate);
+        total += qwen35_rp16_one(m, l->lin_out);
+        total += qwen35_rp16_one(m, l->attn_q);
+        total += qwen35_rp16_one(m, l->attn_k);
+        total += qwen35_rp16_one(m, l->attn_v);
+        total += qwen35_rp16_one(m, l->attn_output);
+        total += qwen35_rp16_one(m, l->ffn_gate);
+        total += qwen35_rp16_one(m, l->ffn_up);
+        total += qwen35_rp16_one(m, l->ffn_down);
+    }
+    total += qwen35_rp16_one(m, w->output);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "[repack16] eager: %.1f GB in %.0f ms\n",
+            (double)total / 1e9,
+            (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+            (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+}
+
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -88557,6 +88603,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             g_lp_setup_done = true;
             if (getenv("DS4_LARGE_PAGES") != NULL) {
                 ds4_large_pages_setup(&s->engine->model, &s->engine->weights);
+            }
+            if (getenv("DS4_QWEN35_X16") != NULL &&
+                getenv("DS4_REPACK_WRITABLE_MAP") != NULL) {
+                qwen35_rp16_eager(&s->engine->model, &s->engine->weights);
             }
         }
         ds4_engine *e = s->engine;

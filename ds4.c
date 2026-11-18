@@ -73731,27 +73731,55 @@ static void qwen35_unpack_scales(const uint8_t *o, int j, uint8_t s[8], uint8_t 
 #define Q4K_X16_BYTES 2304u
 #define Q4K_X16_ROWS    16u
 
+/* Four six-bit values occupy three bytes, so sixteen values are four groups of
+ * three bytes rather than ninety-six individual bit tests. The bit-at-a-time
+ * version ran at 116 ms per 48 MB tensor - 23 seconds over the whole model,
+ * which was the entire repack cost and the reason the 16-row kernel looked
+ * slow. */
 static void qwen35_pack6(const uint8_t *v, uint8_t *out) {
-    memset(out, 0, 12);
-    for (unsigned i = 0; i < Q4K_X16_ROWS; i++)
-        for (unsigned b = 0; b < 6; b++) {
-            const unsigned bit = i * 6u + b;
-            if (v[i] & (1u << b)) out[bit >> 3] |= (uint8_t)(1u << (bit & 7));
-        }
+    for (unsigned k = 0; k < 4; k++) {
+        const unsigned a = v[4*k + 0] & 63u, b = v[4*k + 1] & 63u;
+        const unsigned c = v[4*k + 2] & 63u, d = v[4*k + 3] & 63u;
+        out[3*k + 0] = (uint8_t)(a | (b << 6));
+        out[3*k + 1] = (uint8_t)((b >> 2) | (c << 4));
+        out[3*k + 2] = (uint8_t)((c >> 4) | (d << 2));
+    }
 }
 
 static void qwen35_unpack6(const uint8_t *in, uint8_t *v) {
-    for (unsigned i = 0; i < Q4K_X16_ROWS; i++) {
-        unsigned x = 0;
-        for (unsigned b = 0; b < 6; b++) {
-            const unsigned bit = i * 6u + b;
-            if (in[bit >> 3] & (1u << (bit & 7))) x |= 1u << b;
-        }
-        v[i] = (uint8_t)x;
+    for (unsigned k = 0; k < 4; k++) {
+        const unsigned b0 = in[3*k + 0], b1 = in[3*k + 1], b2 = in[3*k + 2];
+        v[4*k + 0] = (uint8_t)(b0 & 63u);
+        v[4*k + 1] = (uint8_t)(((b0 >> 6) & 3u) | ((b1 & 15u) << 2));
+        v[4*k + 2] = (uint8_t)(((b1 >> 4) & 15u) | ((b2 & 3u) << 4));
+        v[4*k + 3] = (uint8_t)((b2 >> 2) & 63u);
     }
 }
 
 /* src: sixteen consecutive rows, row-major. dst: blocks * 2304, interleaved. */
+static void qwen35_repack16_group(const uint8_t *src, uint8_t *dst,
+                                  uint64_t row_bytes, uint64_t blocks);
+
+typedef struct {
+    uint8_t *data;
+    uint64_t row_bytes, blocks, groups;
+} qwen35_rp16_work;
+
+/* Repack a tensor's sixteen-row groups on all threads - one scratch per chunk.
+ * Serially this was 41 ms per 48 MB tensor after the pack6 rewrite, eight
+ * seconds across the model. */
+static void qwen35_rp16_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    qwen35_rp16_work *c = vctx;
+    const size_t sz = (size_t)(16u * c->row_bytes);
+    uint8_t *scratch = xmalloc(sz);
+    for (uint64_t g = g0; g < g1; g++) {
+        uint8_t *grp = c->data + g * sz;
+        qwen35_repack16_group(grp, scratch, c->row_bytes, c->blocks);
+        memcpy(grp, scratch, sz);
+    }
+    free(scratch);
+}
+
 static void qwen35_repack16_group(const uint8_t *src, uint8_t *dst,
                                   uint64_t row_bytes, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++) {
@@ -75261,16 +75289,21 @@ static void qwen35_cpu_matvec_batch(
         rows >= 16u && (rows % 16u) == 0u &&
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
         int st = qwen35_rp_get(tdata);
+        static double rp_ms = 0.0;
         if (st == 0) {
-            uint8_t *scratch = xmalloc((size_t)(16u * row_bytes));
-            for (uint64_t g = 0; g < rows / 16u; g++) {
-                uint8_t *grp = (uint8_t *)tdata + g * 16u * row_bytes;
-                qwen35_repack16_group(grp, scratch, row_bytes, blocks);
-                memcpy(grp, scratch, (size_t)(16u * row_bytes));
-            }
-            free(scratch);
+            struct timespec rt0, rt1;
+            clock_gettime(CLOCK_MONOTONIC, &rt0);
+            qwen35_rp16_work rw = { (uint8_t *)tdata, row_bytes, blocks,
+                                    rows / 16u };
+            ds4_parallel_for(rows / 16u, qwen35_rp16_worker, &rw);
             qwen35_rp_set(tdata, 3);       /* 3 = 16-row layout */
             st = 3;
+            clock_gettime(CLOCK_MONOTONIC, &rt1);
+            rp_ms += (double)(rt1.tv_sec - rt0.tv_sec) * 1e3 +
+                     (double)(rt1.tv_nsec - rt0.tv_nsec) / 1e6;
+            if (getenv("DS4_QWEN35_BYTE_DBG"))
+                fprintf(stderr, "[repack16] %.1f MB in %.0f ms\n",
+                        (double)w->bytes / 1048576.0, rp_ms);
         }
         if (st == 3) {
             for (uint64_t g = 0; g < rows / 16u; g++)

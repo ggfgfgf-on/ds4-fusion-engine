@@ -75022,6 +75022,7 @@ static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
 }
 
 static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
+static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
 
 static void qwen35_cpu_matvec_batch(
@@ -75108,12 +75109,23 @@ static void qwen35_cpu_matvec_batch(
     acc_ms += (double)(mv1.tv_sec - mv0.tv_sec) * 1e3 +
               (double)(mv1.tv_nsec - mv0.tv_nsec) / 1e6;
     acc_calls++;
+    acc_tok_sum += n_tok;
+    if (n_tok > acc_tok_max) acc_tok_max = n_tok;
+    acc_tensors += w->bytes;      /* one pass over the tensor, no multiplier */
     acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
     if (w->type == DS4_TENSOR_Q6_K) acc_q6 += w->bytes;
     else acc_q4 += w->bytes;
     if (getenv("DS4_QWEN35_BYTE_DBG") && (acc_calls % 96u) == 0u)
         fprintf(stderr, "[bytes] q4_gb=%.2f q6_gb=%.2f time_ms=%.0f\n",
                 (double)acc_q4 / 1e9, (double)acc_q6 / 1e9, acc_ms);
+    if (getenv("DS4_QWEN35_BYTE_DBG") && (acc_calls % 96u) == 0u)
+        fprintf(stderr, "[bytes]   calls=%llu avg_n_tok=%.1f max_n_tok=%llu "
+                "one_pass_gb=%.2f  passes=%.1f\n",
+                (unsigned long long)acc_calls,
+                (double)acc_tok_sum / (double)(acc_calls ? acc_calls : 1u),
+                (unsigned long long)acc_tok_max,
+                (double)acc_tensors / 1e9,
+                (double)acc_bytes / (double)(acc_tensors ? acc_tensors : 1u));
     if (getenv("DS4_QWEN35_CORE_DBG") && n_tok > 0 &&
         (exact || getenv("DS4_QWEN35_CORE_DBG_Q8"))) {
         /* compare the batched kernel against the per-token kernel on the very
@@ -75171,6 +75183,7 @@ static void qwen35_cpu_forward_batch(
     struct timespec bf0, bf1;
     double attn_ms = 0.0, gdn_batch_ms = 0.0;
     acc_ms = 0.0; acc_calls = 0; acc_bytes = 0; acc_q4 = 0; acc_q6 = 0;
+    acc_tok_sum = 0; acc_tok_max = 0; acc_tensors = 0;
     clock_gettime(CLOCK_MONOTONIC, &bf0);
     const uint32_t OW = Hv * D;           /* the GDN output width */
 

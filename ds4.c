@@ -73866,11 +73866,12 @@ static void qwen35_gemm_q4_K_16x4(
             }
             uint8_t sv[Q4K_X16_ROWS];
             qwen35_unpack6(xp + 64 + j * 24, sv);
-            const __m512 scv = _mm512_set_ps(
-                    (float)sv[15],(float)sv[14],(float)sv[13],(float)sv[12],
-                    (float)sv[11],(float)sv[10],(float)sv[9],(float)sv[8],
-                    (float)sv[7],(float)sv[6],(float)sv[5],(float)sv[4],
-                    (float)sv[3],(float)sv[2],(float)sv[1],(float)sv[0]);
+            /* Sixteen bytes to sixteen float lanes in one instruction. This was
+             * a _mm512_set_ps of sixteen scalars, which is the shape that has
+             * cost this session more than anything else - every runtime-indexed
+             * vector built from scalars lands in memory first. */
+            const __m512 scv = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *)sv)));
             const __m512 base = _mm512_mul_ps(scv, dvec);
             for (uint64_t t = 0; t < lim; t++) {
                 const __m512i pv = (t == 0) ? a0 : (t == 1) ? a1
@@ -73893,22 +73894,42 @@ static void qwen35_gemm_q4_K_16x4(
     memset(minv, 0, sizeof minv);
     for (uint64_t b = 0; b < blocks; b++) {
         const uint8_t *xp = grp + b * Q4K_X16_BYTES;
-        float mn[8][Q4K_X16_ROWS];
-        for (int j = 0; j < 8; j++) {
-            uint8_t mvb[Q4K_X16_ROWS];
-            qwen35_unpack6(xp + 64 + j * 24 + 12, mvb);
-            for (unsigned r = 0; r < Q4K_X16_ROWS; r++) mn[j][r] = (float)mvb[r];
+        uint8_t mv[8][Q4K_X16_ROWS];
+        for (int j = 0; j < 8; j++)
+            qwen35_unpack6(xp + 64 + j * 24 + 12, mv[j]);
+        /* Built once per block and reused by every token. Elements are
+         * [r0j0, r0j1, r1j0, r1j1, ...] so madd's lane k is row k, which turns
+         * the eight-term per-row dot product into one instruction per j pair -
+         * 128 scalar multiply-adds became four madds. */
+        __m512i mn16[4];
+        for (int m = 0; m < 4; m++) {
+            const __m128i lo = _mm_loadu_si128((const __m128i *)mv[2*m]);
+            const __m128i hi = _mm_loadu_si128((const __m128i *)mv[2*m + 1]);
+            const __m128i il = _mm_unpacklo_epi8(lo, hi);
+            const __m128i ih = _mm_unpackhi_epi8(lo, hi);
+            mn16[m] = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_cvtepu8_epi16(il)),
+                    _mm256_cvtepu8_epi16(ih), 1);
         }
-        for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
-            const float dm = f16_to_f32(*(const uint16_t *)(xp + 32 + r * 2));
-            for (uint64_t t = 0; t < lim; t++) {
-                const block_q8_K *yt = y + t * ystride + b;
-                float acc = 0.f;
-                for (int j = 0; j < 8; j++)
-                    acc += (float)mn[j][r] *
-                           (float)((int32_t)yt->bsums[2*j] + yt->bsums[2*j+1]);
-                minv[r][t] -= yt->d * dm * acc;
+        float dmv[Q4K_X16_ROWS];
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            dmv[r] = f16_to_f32(*(const uint16_t *)(xp + 32 + r * 2));
+        for (uint64_t t = 0; t < lim; t++) {
+            const block_q8_K *yt = y + t * ystride + b;
+            __m512i acc = _mm512_setzero_si512();
+            for (int m = 0; m < 4; m++) {
+                const int32_t q0 = (int32_t)yt->bsums[4*m + 0] +
+                                   (int32_t)yt->bsums[4*m + 1];
+                const int32_t q1 = (int32_t)yt->bsums[4*m + 2] +
+                                   (int32_t)yt->bsums[4*m + 3];
+                const __m512i bs = _mm512_set1_epi32(
+                        (int32_t)(((uint32_t)q1 << 16) | ((uint32_t)q0 & 0xFFFFu)));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(mn16[m], bs));
             }
+            float lane[Q4K_X16_ROWS];
+            _mm512_storeu_ps(lane, _mm512_cvtepi32_ps(acc));
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+                minv[r][t] -= yt->d * dmv[r] * lane[r];
         }
     }
 

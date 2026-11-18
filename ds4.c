@@ -73934,6 +73934,31 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
     return buf;
 }
 
+typedef struct {
+    const ds4_model *m;
+    long built;
+    uint64_t bytes;
+} qwen35_x8_eager_t;
+
+/* Building one tensor touches every page of its buffer for the first time, so
+ * this is mostly page faults and runs about linearly with the tensor size -
+ * worth spreading over the threads, 5.2 s serially. */
+static void qwen35_x8_eager_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_x8_eager_t *e = vctx;
+    long n = 0;
+    uint64_t by = 0;
+    for (uint64_t ti = t0; ti < t1; ti++) {
+        const ds4_tensor *tt = &e->m->tensors[ti];
+        if (tt->type != DS4_TENSOR_Q4_K) continue;
+        if (qwen35_x8_build(e->m, tt)) {
+            n++;
+            by += tt->bytes;
+        }
+    }
+    InterlockedAdd(&e->built, n);
+    InterlockedAdd64((volatile LONG64 *)&e->bytes, (LONG64)by);
+}
+
 /* Sixteen rows x up to eight tokens. Lane r of every accumulator is row r, so
  * one weight load of sixty-four bytes feeds all sixteen rows and every token in
  * the pass. Eight tokens per call halves the number of walks over the weights
@@ -83857,19 +83882,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
              */
             struct timespec xt0, xt1;
             clock_gettime(CLOCK_MONOTONIC, &xt0);
-            int built = 0;
-            uint64_t xbytes = 0;
-            for (uint64_t ti = 0; ti < e->model.n_tensors; ti++) {
-                const ds4_tensor *tt = &e->model.tensors[ti];
-                if (tt->type != DS4_TENSOR_Q4_K) continue;
-                if (qwen35_x8_build(&e->model, tt)) {
-                    built++;
-                    xbytes += tt->bytes;
-                }
-            }
+            qwen35_x8_eager_t ev = { &e->model, 0, 0 };
+            ds4_parallel_for(e->model.n_tensors, qwen35_x8_eager_worker, &ev);
             clock_gettime(CLOCK_MONOTONIC, &xt1);
             fprintf(stderr, "[x8] eager built %d tensors, %.1f GB in %.0f ms\n",
-                    built, (double)xbytes / 1e9,
+                    (int)ev.built, (double)ev.bytes / 1e9,
                     (double)(xt1.tv_sec - xt0.tv_sec) * 1e3 +
                     (double)(xt1.tv_nsec - xt0.tv_nsec) / 1e6);
         }

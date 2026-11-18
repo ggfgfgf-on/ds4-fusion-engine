@@ -83349,6 +83349,8 @@ static bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
 }
 
+static void qwen35_rp16_eager(const ds4_model *m, const ds4_weights *w);
+
 static int ds4_session_tp_register(ds4_session *s) {
     if (!ds4_session_tp_leader(s)) return 1;
     ds4_engine *e = s->engine;
@@ -83390,6 +83392,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
+        /* Repack Q4_K into the sixteen-row layout here, at session start, so
+         * the first prompt does not carry the cost. Lazy repacking inside the
+         * matvec put 3.6 s into the first prefill, which is why the 16-row path
+         * measured 7 t/s while its kernel was six times faster than 2x4's. */
+        if (getenv("DS4_QWEN35_X16") != NULL &&
+            getenv("DS4_REPACK_WRITABLE_MAP") != NULL) {
+            qwen35_rp16_eager(&e->model, &e->weights);
+        }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);

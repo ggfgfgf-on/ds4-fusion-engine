@@ -73714,6 +73714,167 @@ static void qwen35_unpack_scales(const uint8_t *o, int j, uint8_t s[8], uint8_t 
  * interleaved 32 bytes per (block, j, k) = 4 tokens x 8 bytes, so one
  * 256-bit load feeds four dpbusd broadcasts out of registers instead of
  * four separate 8-byte loads. */
+/* --- 16-row Q4_K repack and kernel -------------------------------------- */
+/* Verified standalone before being wired in here:
+ *   repack16_test.c : make/unmake round trip, every byte, blocks 1..4
+ *   kernel16_test.c : kernel vs scalar reference, worst relative error 0
+ *
+ *   block_q4_K    : d 2 | dmin 2 | scales 12 | qs 128                = 144/row
+ *   block_q4_Kx16 : d[16] 32 | dmin[16] 32 | scales 192 | qs 2048    = 2304
+ *
+ * d and dmin sit contiguous at the front so one load gets all sixteen rows'
+ * scales. qs interleaves FOUR bytes per row, not eight: dpbusd lane k consumes
+ * bytes 4k..4k+3, so four bytes per row puts row k exactly in lane k and all
+ * sixteen lanes become output rows. That is why this shape needs four
+ * accumulators where the eight-row one needed four and the eight-token one
+ * needed sixteen scalar min accumulators that spilled every GP register. */
+#define Q4K_X16_BYTES 2304u
+#define Q4K_X16_ROWS    16u
+
+static void qwen35_pack6(const uint8_t *v, uint8_t *out) {
+    memset(out, 0, 12);
+    for (unsigned i = 0; i < Q4K_X16_ROWS; i++)
+        for (unsigned b = 0; b < 6; b++) {
+            const unsigned bit = i * 6u + b;
+            if (v[i] & (1u << b)) out[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+        }
+}
+
+static void qwen35_unpack6(const uint8_t *in, uint8_t *v) {
+    for (unsigned i = 0; i < Q4K_X16_ROWS; i++) {
+        unsigned x = 0;
+        for (unsigned b = 0; b < 6; b++) {
+            const unsigned bit = i * 6u + b;
+            if (in[bit >> 3] & (1u << (bit & 7))) x |= 1u << b;
+        }
+        v[i] = (uint8_t)x;
+    }
+}
+
+/* src: sixteen consecutive rows, row-major. dst: blocks * 2304, interleaved. */
+static void qwen35_repack16_group(const uint8_t *src, uint8_t *dst,
+                                  uint64_t row_bytes, uint64_t blocks) {
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint8_t *o = dst + b * Q4K_X16_BYTES;
+        const uint8_t *in[Q4K_X16_ROWS];
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            in[r] = src + (uint64_t)r * row_bytes + b * Q4K_ROW;
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+            memcpy(o + r * 2, in[r], 2);           /* d    */
+            memcpy(o + 32 + r * 2, in[r] + 2, 2);  /* dmin */
+        }
+        uint8_t sv[Q4K_X16_ROWS], mv[Q4K_X16_ROWS];
+        for (int j = 0; j < 8; j++) {
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+                const uint8_t *q = in[r] + 4;
+                uint8_t s, m;
+                if (j < 4) { s = q[j] & 63; m = q[j + 4] & 63; }
+                else {
+                    s = (uint8_t)(((q[j - 4] & 192) >> 2) | (q[j + 4] & 15));
+                    m = (uint8_t)(((q[j] & 192) >> 2) | ((q[j + 4] & 240) >> 4));
+                }
+                sv[r] = s; mv[r] = m;
+            }
+            qwen35_pack6(sv, o + 64 + j * 24);
+            qwen35_pack6(mv, o + 64 + j * 24 + 12);
+        }
+        for (int i = 0; i < 512; i++) {
+            const unsigned r = (unsigned)i % Q4K_X16_ROWS;
+            const int off = (i / (int)Q4K_X16_ROWS) * 4;
+            memcpy(o + 256 + (uint64_t)i * 4, in[r] + 4 + 12 + off, 4);
+        }
+    }
+}
+
+/* Sixteen rows, up to four tokens, main term in the lanes and the -dmin term
+ * as a separate scalar pass so it never touches the hot loop's registers. */
+static void qwen35_gemm_q4_K_16x4(
+        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
+        uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
+        uint64_t row0) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+    const uint64_t lim = nt < 4u ? nt : 4u;
+    float mainv[Q4K_X16_ROWS][4];
+    memset(mainv, 0, sizeof mainv);
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint8_t *xp = grp + b * Q4K_X16_BYTES;
+        for (int j = 0; j < 8; j++) {
+            const int sh = (j & 1) ? 4 : 0;
+            __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+            for (int c = 0; c < 8; c++) {
+                const __m512i raw = _mm512_loadu_si512(
+                        (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
+                const __m512i q = sh
+                        ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
+                        : _mm512_and_si512(raw, m0F);
+                for (uint64_t t = 0; t < lim; t++) {
+                    int32_t four;
+                    memcpy(&four, y[t * ystride + b].qs + j * 32 + c * 4, 4);
+                    const __m512i r = _mm512_dpbusd_epi32(
+                            _mm512_setzero_si512(), q, _mm512_set1_epi32(four));
+                    switch (t) {
+                    case 0: a0 = _mm512_add_epi32(a0, r); break;
+                    case 1: a1 = _mm512_add_epi32(a1, r); break;
+                    case 2: a2 = _mm512_add_epi32(a2, r); break;
+                    default: a3 = _mm512_add_epi32(a3, r); break;
+                    }
+                }
+            }
+            uint8_t sv[Q4K_X16_ROWS];
+            qwen35_unpack6(xp + 64 + j * 24, sv);
+            const __m512 scv = _mm512_set_ps(
+                    (float)sv[15],(float)sv[14],(float)sv[13],(float)sv[12],
+                    (float)sv[11],(float)sv[10],(float)sv[9],(float)sv[8],
+                    (float)sv[7],(float)sv[6],(float)sv[5],(float)sv[4],
+                    (float)sv[3],(float)sv[2],(float)sv[1],(float)sv[0]);
+            for (uint64_t t = 0; t < lim; t++) {
+                const __m512i pv = (t == 0) ? a0 : (t == 1) ? a1
+                                 : (t == 2) ? a2 : a3;
+                const float d = f16_to_f32(*(const uint16_t *)(xp + 0))
+                        * y[t * ystride + b].d;
+                float lane[16];
+                _mm512_storeu_ps(lane, _mm512_mul_ps(scv,
+                        _mm512_mul_ps(_mm512_cvtepi32_ps(pv), _mm512_set1_ps(d))));
+                for (unsigned r = 0; r < Q4K_X16_ROWS; r++) mainv[r][t] += lane[r];
+            }
+        }
+    }
+
+    /* the -dmin term: depends only on (row, token), never on qs */
+    float minv[Q4K_X16_ROWS][4];
+    memset(minv, 0, sizeof minv);
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint8_t *xp = grp + b * Q4K_X16_BYTES;
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+            const float dm = f16_to_f32(*(const uint16_t *)(xp + 32 + r * 2));
+            float mn[8];
+            for (int j = 0; j < 8; j++) {
+                uint8_t mvv[Q4K_X16_ROWS];
+                qwen35_unpack6(xp + 64 + j * 24 + 12, mvv);
+                mn[j] = (float)mvv[r];
+            }
+            for (uint64_t t = 0; t < lim; t++) {
+                const block_q8_K *yt = y + t * ystride + b;
+                float s = 0.f;
+                for (int j = 0; j < 8; j++)
+                    s += mn[j] * (float)((int32_t)yt->bsums[2*j] + yt->bsums[2*j+1]);
+                minv[r][t] -= yt->d * dm * s;
+            }
+        }
+    }
+
+    for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+        for (uint64_t t = 0; t < lim; t++)
+            out[t * out_stride + row0 + r] = mainv[r][t] + minv[r][t];
+#else
+    (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
+    (void)out; (void)out_stride; (void)row0;
+    ds4_die("16-row Q4_K kernel needs AVX-512");
+#endif
+}
+
 static void qwen35_gemm_repacked_8x4(
         const uint8_t *grp, uint64_t blocks, const int8_t *act,
         const block_q8_K *y, uint64_t ystride, uint64_t nt,
@@ -75072,6 +75233,32 @@ static void qwen35_cpu_matvec_batch(
     /* Repacked Q4_K tensors take the lane-packed 8x4 kernel. The repack is done
      * on first use, in place, through the copy-on-write mapping: the file is
      * untouched and resident memory does not grow (measured +0 MB for 4 GB). */
+    if (w->type == DS4_TENSOR_Q4_K && !exact &&
+        getenv("DS4_QWEN35_X16") != NULL &&
+        getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
+        rows >= 16u && (rows % 16u) == 0u &&
+        (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
+        int st = qwen35_rp_get(tdata);
+        if (st == 0) {
+            uint8_t *scratch = xmalloc((size_t)(16u * row_bytes));
+            for (uint64_t g = 0; g < rows / 16u; g++) {
+                uint8_t *grp = (uint8_t *)tdata + g * 16u * row_bytes;
+                qwen35_repack16_group(grp, scratch, row_bytes, blocks);
+                memcpy(grp, scratch, (size_t)(16u * row_bytes));
+            }
+            free(scratch);
+            qwen35_rp_set(tdata, 3);       /* 3 = 16-row layout */
+            st = 3;
+        }
+        if (st == 3) {
+            for (uint64_t g = 0; g < rows / 16u; g++)
+                qwen35_gemm_q4_K_16x4(tdata + g * blocks * Q4K_X16_BYTES, blocks,
+                                      xq, blocks, n_tok,
+                                      out, rows, g * 16u);
+            free(xq);
+            return;
+        }
+    }
     if (w->type == DS4_TENSOR_Q4_K && !exact &&
         getenv("DS4_QWEN35_NO_REPACK") == NULL &&
         getenv("DS4_QWEN35_LANE_GEMM") != NULL &&

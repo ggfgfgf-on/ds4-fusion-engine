@@ -74340,29 +74340,12 @@ static float qwen35_dot_q6_K_f32_avx2(const block_q6_K *x, const float *y) {
     return qwen35_hsum_f32(sum);
 }
 #endif
+/* Two Q6_K references existed and disagreed by ~1e-6 per value: this one
+ * accumulated in float, the batched tail used the integer _avx2 route, and 64
+ * residual layers turned the difference into ~1.0 on the logits. There is one
+ * kernel now - the same fix the Q4_K path needed. */
 static float qwen35_dot_q6_K_q8_K(const block_q6_K *x, const block_q8_K *y) {
-    /* Direct per-position float accumulation mirroring the reference decode;
-     * the reconstruction d*q8 reproduces the quantized activation. */
-    const float d = y->d * f16_to_f32(x->d);
-    float sumf = 0.0f;
-    for (int half = 0; half < 2; half++) {
-        const uint8_t *ql = x->ql + (uint64_t)half * 64u;
-        const uint8_t *qh = x->qh + (uint64_t)half * 32u;
-        const int8_t *sc = x->scales + (uint64_t)half * 8u;
-        const int8_t *q8 = y->qs + (uint64_t)half * 128u;
-        for (int l = 0; l < 32; l++) {
-            const int is = l / 16;
-            const int q1 = ((int)(ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
-            const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            const int q3 = ((int)(ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-            const int q4 = ((int)(ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-            sumf += (float)sc[is + 0] * (float)q1 * (float)q8[l];
-            sumf += (float)sc[is + 2] * (float)q2 * (float)q8[l + 32];
-            sumf += (float)sc[is + 4] * (float)q3 * (float)q8[l + 64];
-            sumf += (float)sc[is + 6] * (float)q4 * (float)q8[l + 96];
-        }
-    }
-    return d * sumf;
+    return qwen35_dot_q6_K_q8_K_avx2(x, y);
 }
 
 static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
@@ -74610,11 +74593,149 @@ typedef struct {
     bool exact;
 } qwen35_cpu_matvec_batch_ctx;
 
+/* Q6_K, two rows x four tokens, accumulated in integers exactly like
+ * qwen35_dot_q6_K_q8_K_avx2 so it is bit-identical to the per-token path
+ * rather than merely close.
+ *
+ * A float-scale route matched to 6e-7 per value, and 64 residual layers
+ * amplified that to ~1.0 on the logits. d and the q8 scale are per super-block,
+ * so the integer sum is flushed to float once per block, in the same order the
+ * per-token path uses.
+ *
+ * Field mapping, taken from dequantize_row_q6_K:
+ *   ql bytes at half*64 + (jj&1 ? 32 : 0), high nibble when jj >= 2
+ *   qh bytes at half*32, shifted right by jj*2 and masked to 2 bits
+ *   scales at half*8 + jj*2, taking sc[c] and sc[2+c] ... sc[6+c]
+ */
+static void qwen35_gemm_q6_K_q8_K_2x4(
+        const block_q6_K *x0, const block_q6_K *x1,
+        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
+        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
+    const __m256i m0F = _mm256_set1_epi16(0x0F);
+    const __m256i m3 = _mm256_set1_epi16(3);
+    const __m256i m32 = _mm256_set1_epi16(32);
+    const uint64_t lim = nt < 4u ? nt : 4u;
+    float f00 = 0.f, f01 = 0.f, f02 = 0.f, f03 = 0.f;
+    float f10 = 0.f, f11 = 0.f, f12 = 0.f, f13 = 0.f;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a03 = a00;
+        __m256i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+        for (int half = 0; half < 2; half++) {
+            for (int c = 0; c < 2; c++) {
+                __m256i q[2][4];
+                const block_q6_K *xs[2] = { x0, x1 };
+                for (int r = 0; r < 2; r++) {
+                    const uint8_t *rql = xs[r][b].ql + (uint64_t)half * 64u;
+                    const uint8_t *rqh = xs[r][b].qh + (uint64_t)half * 32u;
+                    const int8_t *rsc = xs[r][b].scales + (uint64_t)half * 8u;
+                    const __m256i qll = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rql + c * 16)));
+                    const __m256i qlh = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rql + 32 + c * 16)));
+                    const __m256i qhv = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rqh + c * 16)));
+                    __m256i g0 = _mm256_or_si256(_mm256_and_si256(qll, m0F),
+                                                 _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4));
+                    __m256i g1 = _mm256_or_si256(_mm256_and_si256(qlh, m0F),
+                                                 _mm256_slli_epi16(_mm256_and_si256(
+                                                         _mm256_srli_epi16(qhv, 2), m3), 4));
+                    __m256i g2 = _mm256_or_si256(_mm256_and_si256(
+                                                         _mm256_srli_epi16(qll, 4), m0F),
+                                                 _mm256_slli_epi16(_mm256_and_si256(
+                                                         _mm256_srli_epi16(qhv, 4), m3), 4));
+                    __m256i g3 = _mm256_or_si256(_mm256_and_si256(
+                                                         _mm256_srli_epi16(qlh, 4), m0F),
+                                                 _mm256_slli_epi16(_mm256_and_si256(
+                                                         _mm256_srli_epi16(qhv, 6), m3), 4));
+                    g0 = _mm256_sub_epi16(g0, m32);
+                    g1 = _mm256_sub_epi16(g1, m32);
+                    g2 = _mm256_sub_epi16(g2, m32);
+                    g3 = _mm256_sub_epi16(g3, m32);
+                    q[r][0] = _mm256_mullo_epi16(g0, _mm256_set1_epi16((short)rsc[0 + c]));
+                    q[r][1] = _mm256_mullo_epi16(g1, _mm256_set1_epi16((short)rsc[2 + c]));
+                    q[r][2] = _mm256_mullo_epi16(g2, _mm256_set1_epi16((short)rsc[4 + c]));
+                    q[r][3] = _mm256_mullo_epi16(g3, _mm256_set1_epi16((short)rsc[6 + c]));
+                }
+                const uint64_t base = (uint64_t)half * 4u;
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 0u) * 32u + c * 16)));
+                    const __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 1u) * 32u + c * 16)));
+                    const __m256i w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 2u) * 32u + c * 16)));
+                    const __m256i w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 3u) * 32u + c * 16)));
+#define Q6_ACC(acc, r)                                                        \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][0], w0)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][1], w1)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][2], w2)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][3], w3))
+                    switch (t) {
+                    case 0: Q6_ACC(a00, 0); Q6_ACC(a10, 1); break;
+                    case 1: Q6_ACC(a01, 0); Q6_ACC(a11, 1); break;
+                    case 2: Q6_ACC(a02, 0); Q6_ACC(a12, 1); break;
+                    default: Q6_ACC(a03, 0); Q6_ACC(a13, 1); break;
+                    }
+#undef Q6_ACC
+                }
+            }
+        }
+        const float d0 = f16_to_f32(x0[b].d), d1 = f16_to_f32(x1[b].d);
+        const float yv[4] = { y0d(y, ystride, b, 0, nt), y0d(y, ystride, b, 1, nt),
+                              y0d(y, ystride, b, 2, nt), y0d(y, ystride, b, 3, nt) };
+        for (uint64_t t = 0; t < lim; t++) {
+            const float k0 = d0 * yv[t], k1 = d1 * yv[t];
+            switch (t) {
+            case 0: f00 += k0 * (float)qwen35_hsum_i32(a00);
+                    f10 += k1 * (float)qwen35_hsum_i32(a10); break;
+            case 1: f01 += k0 * (float)qwen35_hsum_i32(a01);
+                    f11 += k1 * (float)qwen35_hsum_i32(a11); break;
+            case 2: f02 += k0 * (float)qwen35_hsum_i32(a02);
+                    f12 += k1 * (float)qwen35_hsum_i32(a12); break;
+            default: f03 += k0 * (float)qwen35_hsum_i32(a03);
+                     f13 += k1 * (float)qwen35_hsum_i32(a13); break;
+            }
+        }
+    }
+    for (uint64_t t = 0; t < lim; t++) {
+        float v0, v1;
+        switch (t) {
+        case 0: v0 = f00; v1 = f10; break;
+        case 1: v0 = f01; v1 = f11; break;
+        case 2: v0 = f02; v1 = f12; break;
+        default: v0 = f03; v1 = f13; break;
+        }
+        out[t * out_stride + row + 0] = v0;
+        out[t * out_stride + row + 1] = v1;
+    }
+}
+
 static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t row1) {
     qwen35_cpu_matvec_batch_ctx *ctx = vctx;
     const uint64_t blocks = ctx->in_dim / QK_K;
 #if defined(__AVX2__)
     uint64_t row = row0;
+    if (ctx->type == DS4_TENSOR_Q6_K && !ctx->exact &&
+        getenv("DS4_QWEN35_NO_X4") == NULL) {
+        /* Q6_K used to fall through to the per-row, per-token tail: one
+         * accumulator chain and no weight sharing across tokens. It is 22% of
+         * the weight bytes. */
+        for (; row + 1u < row1; row += 2u) {
+            const block_q6_K *u0 = (const block_q6_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
+            const block_q6_K *u1 = (const block_q6_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
+            _mm_prefetch((const char *)(ctx->data + (row + 16u) * ctx->row_bytes), _MM_HINT_T0);
+            for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u) {
+                uint64_t nt = ctx->n_tok - tt;
+                if (nt > 4u) nt = 4u;
+                qwen35_gemm_q6_K_q8_K_2x4(u0, u1, ctx->xq + tt * blocks, blocks,
+                                          blocks, nt, ctx->out + tt * ctx->out_dim,
+                                          ctx->out_dim, row);
+            }
+        }
+    }
     if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
         getenv("DS4_QWEN35_NO_X4") == NULL) {
         /* four rows at a time: the activation loads are shared and the four

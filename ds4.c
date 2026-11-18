@@ -73938,6 +73938,13 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
  * one weight load of sixty-four bytes feeds all sixteen rows and every token in
  * the pass. Eight tokens per call halves the number of walks over the weights
  * compared with the four-token kernel. */
+typedef struct {
+    const uint8_t *data;
+    block_q8_K *xq;
+    float *out;
+    uint64_t blocks, n_tok, out_dim;
+} qwen35_x8_work;
+
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -74084,6 +74091,14 @@ static void qwen35_gemm_q4_K_16x8(
     (void)out; (void)out_stride; (void)row0;
     ds4_die("16x8 Q4_K kernel needs AVX-512");
 #endif
+}
+
+static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    qwen35_x8_work *c = vctx;
+    for (uint64_t g = g0; g < g1; g++)
+        qwen35_gemm_q4_K_16x8(c->data + g * c->blocks * Q4K_X16X8_BYTES,
+                              c->blocks, c->xq, c->blocks, c->n_tok,
+                              c->out, c->out_dim, g * 16u);
 }
 
 static void qwen35_gemm_q4_K_16x4(
@@ -75675,14 +75690,19 @@ static void qwen35_cpu_matvec_batch(
          * never runs the in-place sixteen-row repack. */
         if (!xb) xb = qwen35_x8_build(m, w);
         if (xb) {
+            /* On all threads, like every other path here. This ran serially at
+             * first, which is one core against twenty-eight. */
+            qwen35_x8_work w8;
+            w8.data = xb;
+            w8.blocks = blocks;
+            w8.out_dim = rows;
             for (uint64_t tt = 0; tt < n_tok; tt += 8u) {
                 uint64_t nt8 = n_tok - tt;
                 if (nt8 > 8u) nt8 = 8u;
-                for (uint64_t g = 0; g < rows / 16u; g++)
-                    qwen35_gemm_q4_K_16x8(
-                            xb + g * blocks * Q4K_X16X8_BYTES, blocks,
-                            xq + tt * blocks, blocks, nt8,
-                            out + tt * rows, rows, g * 16u);
+                w8.xq = xq + tt * blocks;
+                w8.out = out + tt * rows;
+                w8.n_tok = nt8;
+                ds4_parallel_for(rows / 16u, qwen35_x8_worker, &w8);
             }
             free(xq);
             return;
@@ -83821,22 +83841,31 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             qwen35_rp8_eager(&e->model, &e->weights);
         }
         if (getenv("DS4_QWEN35_X8") != NULL) {
+            /* Every Q4_K tensor, from the model's own table. An explicit list of
+             * layer fields missed projections the forward pass does reach, and
+             * whatever was missed got built lazily inside the first prefill -
+             * which is where the wide kernel's 10.7 GB/s went, since the buffer
+             * is a separate 17.6 GB allocation and every page faulted on first
+             * touch there. Building here moves that cost out of the request
+             * path, the same way the sixteen-row eager repack already does.
+             */
+            struct timespec xt0, xt1;
+            clock_gettime(CLOCK_MONOTONIC, &xt0);
             int built = 0;
-            for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-                const ds4_layer_weights *l = &e->weights.layer[il];
-                if (qwen35_x8_build(&e->model, l->lin_qkv)) built++;
-                if (qwen35_x8_build(&e->model, l->lin_gate)) built++;
-                if (qwen35_x8_build(&e->model, l->lin_out)) built++;
-                if (qwen35_x8_build(&e->model, l->attn_q)) built++;
-                if (qwen35_x8_build(&e->model, l->attn_k)) built++;
-                if (qwen35_x8_build(&e->model, l->attn_v)) built++;
-                if (qwen35_x8_build(&e->model, l->attn_output)) built++;
-                if (qwen35_x8_build(&e->model, l->ffn_gate)) built++;
-                if (qwen35_x8_build(&e->model, l->ffn_up)) built++;
-                if (qwen35_x8_build(&e->model, l->ffn_down)) built++;
+            uint64_t xbytes = 0;
+            for (uint64_t ti = 0; ti < e->model.n_tensors; ti++) {
+                const ds4_tensor *tt = &e->model.tensors[ti];
+                if (tt->type != DS4_TENSOR_Q4_K) continue;
+                if (qwen35_x8_build(&e->model, tt)) {
+                    built++;
+                    xbytes += tt->bytes;
+                }
             }
-            if (qwen35_x8_build(&e->model, e->weights.output)) built++;
-            fprintf(stderr, "[x8] eager built %d tensors\n", built);
+            clock_gettime(CLOCK_MONOTONIC, &xt1);
+            fprintf(stderr, "[x8] eager built %d tensors, %.1f GB in %.0f ms\n",
+                    built, (double)xbytes / 1e9,
+                    (double)(xt1.tv_sec - xt0.tv_sec) * 1e3 +
+                    (double)(xt1.tv_nsec - xt0.tv_nsec) / 1e6);
         }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,

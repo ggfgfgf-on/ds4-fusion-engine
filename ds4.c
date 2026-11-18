@@ -73823,6 +73823,269 @@ static void qwen35_repack16_group(const uint8_t *src, uint8_t *dst,
  * d is folded into the per-lane scale vector rather than applied as one scalar:
  * d[16] is contiguous precisely so all sixteen rows' scales arrive in one load,
  * and using d[0] for every row was the bug that made this read 10.06 off. */
+/* ============================================================================
+ * Free-layout Q4_K: sixteen rows x up to eight tokens, no llama compatibility.
+ *
+ * The layout is whatever the kernel wants, because nothing else reads it:
+ *
+ *   struct { float d[16]; float dmin[16]; uint8_t sc[8][16]; uint8_t mn[8][16];
+ *            uint8_t qs[2048]; }                            = 2432 bytes
+ *
+ *   d/dmin as f32       one load, no f16 conversion and no set_ps assembly
+ *   sc/mn as plain bytes cvtepu8_epi32 widens sixteen to sixteen, no unpacking
+ *   qs four-byte stride  dpbusd lane k consumes bytes 4k..4k+3, so row k lands
+ *                        in lane k and all sixteen lanes are rows
+ *
+ * Kept in one record rather than split into streams: a block is processed with
+ * its scales, and separating them would cost a second cache line and a second
+ * index for 1.5 percent of the volume.
+ *
+ * Verified standalone in bench/kernel16x8_test.c at 1.126e-05 against a scalar
+ * reference for every token count.
+ * ========================================================================== */
+#define Q4K_X16X8_BYTES 2432u
+
+typedef struct {
+    float d[Q4K_X16_ROWS];
+    float dmin[Q4K_X16_ROWS];
+    uint8_t sc[8][Q4K_X16_ROWS];
+    uint8_t mn[8][Q4K_X16_ROWS];
+    uint8_t qs[2048];
+} qwen35_blk16x8;
+
+/* A table of its own. The state registry hashes the same keys and a shared
+ * table let a probe for one tensor land on another's slot, which is what made
+ * the earlier side-array attempt fault. */
+#define QWEN35_X8_SLOTS 4096u
+static const uint8_t *g_x8_key[QWEN35_X8_SLOTS];
+static uint8_t *g_x8_buf[QWEN35_X8_SLOTS];
+
+static uint32_t qwen35_x8_hash(const uint8_t *d) {
+    return (uint32_t)((((uintptr_t)d) >> 6) * 2654435761u) & (QWEN35_X8_SLOTS - 1u);
+}
+
+static uint8_t *qwen35_x8_get(const uint8_t *d) {
+    const uint32_t h = qwen35_x8_hash(d);
+    for (uint32_t i = 0; i < QWEN35_X8_SLOTS; i++) {
+        const uint32_t s = (h + i) & (QWEN35_X8_SLOTS - 1u);
+        if (!g_x8_key[s]) return NULL;
+        if (g_x8_key[s] == d) return g_x8_buf[s];
+    }
+    return NULL;
+}
+
+static void qwen35_x8_put(const uint8_t *d, uint8_t *v) {
+    const uint32_t h = qwen35_x8_hash(d);
+    for (uint32_t i = 0; i < QWEN35_X8_SLOTS; i++) {
+        const uint32_t s = (h + i) & (QWEN35_X8_SLOTS - 1u);
+        if (!g_x8_key[s] || g_x8_key[s] == d) {
+            g_x8_key[s] = d;
+            g_x8_buf[s] = v;
+            return;
+        }
+    }
+}
+
+/* Build the free layout for one tensor. Reads the original row-major bytes, so
+ * it must run before the in-place sixteen-row repack, and it never shares
+ * storage with it. */
+static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
+    if (!w || w->type != DS4_TENSOR_Q4_K) return NULL;
+    if (w->ndim < 2 || w->dim[0] % QK_K != 0) return NULL;
+    const uint64_t rows = w->dim[1];
+    const uint64_t blocks = w->dim[0] / QK_K;
+    const uint64_t row_bytes = blocks * Q4K_ROW;
+    if (rows < 16u || (rows % 16u) != 0u || row_bytes < Q4K_ROW) return NULL;
+    const uint8_t *src = (const uint8_t *)tensor_data(m, w);
+    if (!src) return NULL;
+    if (getenv("DS4_QWEN35_X8DBG"))
+        fprintf(stderr, "[x8build] rows=%llu blocks=%llu src=%p\n",
+                (unsigned long long)rows, (unsigned long long)blocks,
+                (const void *)src);
+    const uint64_t ng = rows / 16u;
+    uint8_t *buf = xmalloc((size_t)(ng * blocks * Q4K_X16X8_BYTES));
+    for (uint64_t g = 0; g < ng; g++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            qwen35_blk16x8 *o = (qwen35_blk16x8 *)
+                    (buf + ((g * blocks + b) * Q4K_X16X8_BYTES));
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+                const uint8_t *rp = src + ((g * 16u + r) * row_bytes) + b * Q4K_ROW;
+                o->d[r] = f16_to_f32(*(const uint16_t *)(rp + 0));
+                o->dmin[r] = f16_to_f32(*(const uint16_t *)(rp + 2));
+                const uint8_t *q = rp + 4;
+                for (int j = 0; j < 8; j++) {
+                    if (j < 4) {
+                        o->sc[j][r] = q[j] & 63;
+                        o->mn[j][r] = q[j + 4] & 63;
+                    } else {
+                        o->sc[j][r] = (uint8_t)(((q[j - 4] & 192) >> 2) |
+                                                (q[j + 4] & 15));
+                        o->mn[j][r] = (uint8_t)(((q[j] & 192) >> 2) |
+                                                ((q[j + 4] & 240) >> 4));
+                    }
+                }
+                /* four-byte interleave over the sixteen rows */
+                for (int c = 0; c < 32; c++)
+                    memcpy(o->qs + c * 64 + r * 4, rp + 16 + c * 4, 4);
+            }
+        }
+    }
+    qwen35_x8_put(src, buf);
+    return buf;
+}
+
+/* Sixteen rows x up to eight tokens. Lane r of every accumulator is row r, so
+ * one weight load of sixty-four bytes feeds all sixteen rows and every token in
+ * the pass. Eight tokens per call halves the number of walks over the weights
+ * compared with the four-token kernel. */
+static void qwen35_gemm_q4_K_16x8(
+        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
+        uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
+        uint64_t row0) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+    const uint64_t lim = nt < 8u ? nt : 8u;
+    __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+    __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
+                (grp + b * Q4K_X16X8_BYTES);
+        const __m512 dv = _mm512_loadu_ps(xp->d);
+        for (int jp = 0; jp < 4; jp++) {
+            const int jlo = 2 * jp;
+            __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0, lo3 = lo0;
+            __m512i lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
+            __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
+            __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+            for (int c = 0; c < 8; c++) {
+                const __m512i raw = _mm512_loadu_si512(
+                        (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                const __m512i ql = _mm512_and_si512(raw, m0F);
+                const __m512i qh = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F);
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    const int32_t al = *(const int32_t *)(yt->qs + jlo * 32 + c * 4);
+                    const int32_t ah = *(const int32_t *)(yt->qs + (jlo+1)*32 + c*4);
+                    const __m512i bl = _mm512_set1_epi32(al);
+                    const __m512i bh = _mm512_set1_epi32(ah);
+                    switch (t) {
+                    case 0:
+                        lo0 = _mm512_dpbusd_epi32(lo0, ql, bl);
+                        hi0 = _mm512_dpbusd_epi32(hi0, qh, bh); break;
+                    case 1:
+                        lo1 = _mm512_dpbusd_epi32(lo1, ql, bl);
+                        hi1 = _mm512_dpbusd_epi32(hi1, qh, bh); break;
+                    case 2:
+                        lo2 = _mm512_dpbusd_epi32(lo2, ql, bl);
+                        hi2 = _mm512_dpbusd_epi32(hi2, qh, bh); break;
+                    case 3:
+                        lo3 = _mm512_dpbusd_epi32(lo3, ql, bl);
+                        hi3 = _mm512_dpbusd_epi32(hi3, qh, bh); break;
+                    case 4:
+                        lo4 = _mm512_dpbusd_epi32(lo4, ql, bl);
+                        hi4 = _mm512_dpbusd_epi32(hi4, qh, bh); break;
+                    case 5:
+                        lo5 = _mm512_dpbusd_epi32(lo5, ql, bl);
+                        hi5 = _mm512_dpbusd_epi32(hi5, qh, bh); break;
+                    case 6:
+                        lo6 = _mm512_dpbusd_epi32(lo6, ql, bl);
+                        hi6 = _mm512_dpbusd_epi32(hi6, qh, bh); break;
+                    default:
+                        lo7 = _mm512_dpbusd_epi32(lo7, ql, bl);
+                        hi7 = _mm512_dpbusd_epi32(hi7, qh, bh); break;
+                    }
+                }
+            }
+            const __m512 bl2 = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)xp->sc[jlo]))), dv);
+            const __m512 bh2 = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)xp->sc[jlo + 1]))), dv);
+            for (uint64_t t = 0; t < lim; t++) {
+                const __m512i il = (t == 0) ? lo0 : (t == 1) ? lo1
+                                 : (t == 2) ? lo2 : (t == 3) ? lo3
+                                 : (t == 4) ? lo4 : (t == 5) ? lo5
+                                 : (t == 6) ? lo6 : lo7;
+                const __m512i ih = (t == 0) ? hi0 : (t == 1) ? hi1
+                                 : (t == 2) ? hi2 : (t == 3) ? hi3
+                                 : (t == 4) ? hi4 : (t == 5) ? hi5
+                                 : (t == 6) ? hi6 : hi7;
+                const __m512 ydk = _mm512_set1_ps(y[t * ystride + b].d);
+                __m512 v = _mm512_mul_ps(_mm512_cvtepi32_ps(il),
+                                         _mm512_mul_ps(bl2, ydk));
+                v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ih),
+                                    _mm512_mul_ps(bh2, ydk), v);
+                switch (t) {
+                case 0: f0 = _mm512_add_ps(f0, v); break;
+                case 1: f1 = _mm512_add_ps(f1, v); break;
+                case 2: f2 = _mm512_add_ps(f2, v); break;
+                case 3: f3 = _mm512_add_ps(f3, v); break;
+                case 4: f4 = _mm512_add_ps(f4, v); break;
+                case 5: f5 = _mm512_add_ps(f5, v); break;
+                case 6: f6 = _mm512_add_ps(f6, v); break;
+                default: f7 = _mm512_add_ps(f7, v); break;
+                }
+            }
+        }
+    }
+
+    /* the -dmin term depends only on (row, token), never on qs */
+    float minv[Q4K_X16_ROWS][8];
+    memset(minv, 0, sizeof minv);
+    for (uint64_t b = 0; b < blocks; b++) {
+        const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
+                (grp + b * Q4K_X16X8_BYTES);
+        __m128i mvr[8];
+        for (int j = 0; j < 8; j++)
+            mvr[j] = _mm_loadu_si128((const __m128i *)xp->mn[j]);
+        __m512i mn16[4];
+        for (int m = 0; m < 4; m++) {
+            const __m128i lo = mvr[2 * m];
+            const __m128i hi = mvr[2 * m + 1];
+            const __m128i il = _mm_unpacklo_epi8(lo, hi);
+            const __m128i ih2 = _mm_unpackhi_epi8(lo, hi);
+            mn16[m] = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_cvtepu8_epi16(il)),
+                    _mm256_cvtepu8_epi16(ih2), 1);
+        }
+        const __m512 dmv = _mm512_loadu_ps(xp->dmin);
+        for (uint64_t t = 0; t < lim; t++) {
+            const block_q8_K *yt = y + t * ystride + b;
+            __m512i acc = _mm512_setzero_si512();
+            for (int m = 0; m < 4; m++) {
+                const int32_t q0 = (int32_t)yt->bsums[4*m + 0] +
+                                   (int32_t)yt->bsums[4*m + 1];
+                const int32_t q1 = (int32_t)yt->bsums[4*m + 2] +
+                                   (int32_t)yt->bsums[4*m + 3];
+                const __m512i bs = _mm512_set1_epi32(
+                        (int32_t)(((uint32_t)q1 << 16) | ((uint32_t)q0 & 0xFFFFu)));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(mn16[m], bs));
+            }
+            float lane[Q4K_X16_ROWS];
+            _mm512_storeu_ps(lane, _mm512_cvtepi32_ps(acc));
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+                minv[r][t] -= yt->d * dmv[r] * lane[r];
+        }
+    }
+
+    for (uint64_t t = 0; t < lim; t++) {
+        const __m512 fv = (t == 0) ? f0 : (t == 1) ? f1 : (t == 2) ? f2
+                         : (t == 3) ? f3 : (t == 4) ? f4 : (t == 5) ? f5
+                         : (t == 6) ? f6 : f7;
+        float lane[Q4K_X16_ROWS];
+        _mm512_storeu_ps(lane, fv);
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            out[t * out_stride + row0 + r] = lane[r] + minv[r][t];
+    }
+#else
+    (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
+    (void)out; (void)out_stride; (void)row0;
+    ds4_die("16x8 Q4_K kernel needs AVX-512");
+#endif
+}
+
 static void qwen35_gemm_q4_K_16x4(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -75394,6 +75657,37 @@ static void qwen35_cpu_matvec_batch(
     /* Repacked Q4_K tensors take the lane-packed 8x4 kernel. The repack is done
      * on first use, in place, through the copy-on-write mapping: the file is
      * untouched and resident memory does not grow (measured +0 MB for 4 GB). */
+    if (getenv("DS4_QWEN35_X8") != NULL) {
+        const uint8_t *xb = qwen35_x8_get(tdata);
+        static int shown = 0;
+        if (!shown) {
+            shown = 1;
+            fprintf(stderr, "[x8] dispatch tdata=%p lookup=%p rows=%llu "
+                    "blocks=%llu n_tok=%llu\n", (const void *)tdata,
+                    (const void *)xb, (unsigned long long)rows,
+                    (unsigned long long)blocks,
+                    (unsigned long long)n_tok);
+        }
+        /* Build on first use instead of from an explicit tensor list: the list
+         * missed a 10240-row projection the forward pass does reach, and
+         * keeping it in step with the model is maintenance this does not need.
+         * The original row-major bytes are still intact because the x8 path
+         * never runs the in-place sixteen-row repack. */
+        if (!xb) xb = qwen35_x8_build(m, w);
+        if (xb) {
+            for (uint64_t tt = 0; tt < n_tok; tt += 8u) {
+                uint64_t nt8 = n_tok - tt;
+                if (nt8 > 8u) nt8 = 8u;
+                for (uint64_t g = 0; g < rows / 16u; g++)
+                    qwen35_gemm_q4_K_16x8(
+                            xb + g * blocks * Q4K_X16X8_BYTES, blocks,
+                            xq + tt * blocks, blocks, nt8,
+                            out + tt * rows, rows, g * 16u);
+            }
+            free(xq);
+            return;
+        }
+    }
     if (w->type == DS4_TENSOR_Q4_K && !exact &&
         getenv("DS4_QWEN35_X16") != NULL &&
         getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
@@ -83525,6 +83819,24 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (getenv("DS4_QWEN35_LANE_GEMM") != NULL &&
             getenv("DS4_REPACK_WRITABLE_MAP") != NULL) {
             qwen35_rp8_eager(&e->model, &e->weights);
+        }
+        if (getenv("DS4_QWEN35_X8") != NULL) {
+            int built = 0;
+            for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+                const ds4_layer_weights *l = &e->weights.layer[il];
+                if (qwen35_x8_build(&e->model, l->lin_qkv)) built++;
+                if (qwen35_x8_build(&e->model, l->lin_gate)) built++;
+                if (qwen35_x8_build(&e->model, l->lin_out)) built++;
+                if (qwen35_x8_build(&e->model, l->attn_q)) built++;
+                if (qwen35_x8_build(&e->model, l->attn_k)) built++;
+                if (qwen35_x8_build(&e->model, l->attn_v)) built++;
+                if (qwen35_x8_build(&e->model, l->attn_output)) built++;
+                if (qwen35_x8_build(&e->model, l->ffn_gate)) built++;
+                if (qwen35_x8_build(&e->model, l->ffn_up)) built++;
+                if (qwen35_x8_build(&e->model, l->ffn_down)) built++;
+            }
+            if (qwen35_x8_build(&e->model, e->weights.output)) built++;
+            fprintf(stderr, "[x8] eager built %d tensors\n", built);
         }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,

@@ -73845,6 +73845,47 @@ static void qwen35_gemm_q4_K_16x4(
         for (int j = 0; j < 8; j++) {
             const int sh = (j & 1) ? 4 : 0;
             __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+            const block_q8_K *y0 = y + 0 * ystride + b;
+            const block_q8_K *y1 = y + 1 * ystride + b;
+            const block_q8_K *y2 = y + 2 * ystride + b;
+            const block_q8_K *y3 = y + 3 * ystride + b;
+            if (lim == 4u) {
+                /* Unrolled deliberately. The generic loop below put a four-way
+                 * switch after every dpbusd - a branch per product in the
+                 * hottest loop of the kernel - and dpbusd already accumulates,
+                 * so the separate add was doubling the dependency chain. */
+                for (int c = 0; c < 8; c++) {
+                    const __m512i raw = _mm512_loadu_si512(
+                            (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
+                    const __m512i q = sh
+                            ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
+                            : _mm512_and_si512(raw, m0F);
+                    int32_t f0, f1, f2, f3;
+                    memcpy(&f0, y0->qs + j * 32 + c * 4, 4);
+                    memcpy(&f1, y1->qs + j * 32 + c * 4, 4);
+                    memcpy(&f2, y2->qs + j * 32 + c * 4, 4);
+                    memcpy(&f3, y3->qs + j * 32 + c * 4, 4);
+                    a0 = _mm512_dpbusd_epi32(a0, q, _mm512_set1_epi32(f0));
+                    a1 = _mm512_dpbusd_epi32(a1, q, _mm512_set1_epi32(f1));
+                    a2 = _mm512_dpbusd_epi32(a2, q, _mm512_set1_epi32(f2));
+                    a3 = _mm512_dpbusd_epi32(a3, q, _mm512_set1_epi32(f3));
+                }
+            } else
+            if (lim == 1u) {
+                /* Decode is one token and accounts for the large majority of
+                 * the calls, so it needs its own loop: only a0 is live, and the
+                 * switch below would otherwise run on every product. */
+                for (int c = 0; c < 8; c++) {
+                    const __m512i raw = _mm512_loadu_si512(
+                            (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));
+                    const __m512i q = sh
+                            ? _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F)
+                            : _mm512_and_si512(raw, m0F);
+                    int32_t f0;
+                    memcpy(&f0, y0->qs + j * 32 + c * 4, 4);
+                    a0 = _mm512_dpbusd_epi32(a0, q, _mm512_set1_epi32(f0));
+                }
+            } else
             for (int c = 0; c < 8; c++) {
                 const __m512i raw = _mm512_loadu_si512(
                         (const void *)(xp + 256 + (((j / 2) * 8 + c) * 64)));

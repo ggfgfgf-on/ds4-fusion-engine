@@ -186,3 +186,41 @@ knew; this is code it does not.
 
 Recorded so the next attempt starts from line 64861 rather than from the
 beginning.
+
+
+## Implemented and measured: the cost is cuInit itself
+
+The head offload is written and works. Host-side it requantises Q6_K to Q8_0
+with qwen35_q6k_at - the same extraction the CPU reference uses, so the two
+cannot disagree about where a value lives - uploads 1.3 GB, and per token calls
+ds4_gpu_qwen4_matmul_q8_0_weights_tensor and reads the logits back. It is gated
+behind DS4_QWEN35_GPU_HEAD and off by default.
+
+Per token on the device: 0.1 ms up, 6.1 ms matvec, 4.6 ms down. Ten point eight
+milliseconds against the CPU head's seventy-nine, so the kernel itself is seven
+times faster and the transfers are noise.
+
+It still loses, and four modes isolate why:
+
+    mode 0  no GPU at all                 2.84 2.83 t/s
+    mode 3  ds4_gpu_init() and nothing    2.10 2.10      -26 percent
+    mode 2  plus the 1.3 GB allocation    2.09 2.09
+    mode 1  plus using it every token     2.05 2.14
+
+Opening CUDA costs 124 ms per token - 352 to 476 - with no allocation and no
+work. The head saves 68 of those (79 down to 11) and the allocation adds nothing
+further, so the net is 56 ms slower. It is not memory pressure: the machine has
+61.7 GB and 47 free, and the same regression appears whether the tensor is
+allocated with cudaMalloc or cudaMallocManaged.
+
+So on this laptop the price of a CUDA context exceeds what the head is worth.
+That is a property of the machine, not of the design.
+
+It does not close the door on the combined plan. The 124 ms is fixed and paid
+once; the draft's payoff scales with how many tokens a round accepts. At three
+tokens per CPU pass the arithmetic inverts:
+
+    now                       352 ms / 1 token   2.84 t/s
+    GPU head and draft        488 ms / 3 tokens  6.1 t/s
+
+which is why the two belong together and neither is worth doing alone.

@@ -76925,6 +76925,160 @@ static bool qwen35_cpu_matvec_multi1(
     return true;
 }
 
+/* GPU output head for Qwen3.8 decode.
+ *
+ * Decode is the one path this session did not improve: 2.97 t/s, 362 ms per
+ * token, bound by bytes. The head is 22 percent of them - 151936 rows by 5120,
+ * Q6_K, 3.4 GB - and 79 ms of the 362.
+ *
+ * The trunk (12.3 GB) cannot go to the device: the machine has 8151 MiB. The
+ * head can, and does not interrupt the layer chain because it is one independent
+ * matvec after the last layer.
+ *
+ * No new device code. ds4_gpu_qwen4_matmul_q8_0_weights_tensor is a single-token
+ * Q8_0 matvec over weights resident on the device, written for the gathered MTP
+ * draft head, and ds4_gpu_qwen4_argmax_tensor returns the token index with the
+ * CPU's tie rule - so greedy decoding reads back four bytes, not 600 KB of
+ * logits.
+ *
+ * The head is requantised from Q6_K to Q8_0 on the host at startup. That is an
+ * upgrade, not a degradation: 6.5 bits per value to 8.5. 778M parameters is
+ * about 826 MB at Q8_0, comfortable inside 8 GB. Requantising to Q4_K would be
+ * the opposite direction and is the trade this deliberately avoids.
+ */
+#if !defined(DS4_NO_GPU)
+
+typedef struct {
+    int ready;
+    ds4_gpu_tensor *w, *x, *out, *idx, *scratch;
+    uint32_t K, M;
+    uint64_t wbytes;
+} qwen35_gpu_head_ctx;
+
+static qwen35_gpu_head_ctx g_qgh;
+
+/* Q6_K rows to Q8_0 rows. The values are produced with qwen35_q6k_at, the same
+ * extraction the CPU reference uses at ds4.c:4721, so the two cannot disagree
+ * about where a six-bit value lives. */
+static uint8_t *qwen35_head_to_q8_0(const ds4_model *m, const ds4_tensor *w,
+                                    uint64_t *out_bytes) {
+    const uint64_t K = w->dim[0], M = w->dim[1];
+    if (K % QK_K != 0) return NULL;
+    const uint64_t blocks = K / QK_K;
+    const uint64_t q6_row = blocks * (uint64_t)sizeof(block_q6_K);
+    const uint64_t q8_row = (K / 32u) * 34u;
+    uint8_t *buf = malloc((size_t)(M * q8_row));
+    if (!buf) return NULL;
+    const uint8_t *src = m->map + w->abs_offset;
+    float vals[QK_K];
+    for (uint64_t r = 0; r < M; r++) {
+        const block_q6_K *row = (const block_q6_K *)(src + r * q6_row);
+        uint8_t *dst = buf + r * q8_row;
+        for (uint64_t b = 0; b < blocks; b++) {
+            const block_q6_K *blk = &row[b];
+            const float d = f16_to_f32(blk->d);
+            for (int p = 0; p < (int)QK_K; p++) {
+                const float sc = (float)blk->scales[p / 16];
+                vals[p] = d * sc * ((float)qwen35_q6k_at(blk, (uint32_t)p) - 32.0f);
+            }
+            for (int q = 0; q < 8; q++) {
+                const float *v = vals + q * 32;
+                float amax = 0.0f;
+                for (int i = 0; i < 32; i++) {
+                    const float a = fabsf(v[i]);
+                    if (a > amax) amax = a;
+                }
+                const float dq = amax / 127.0f;
+                const float inv = (dq > 0.0f) ? (1.0f / dq) : 0.0f;
+                uint8_t *o = dst + (uint64_t)(b * 8u + (uint64_t)q) * 34u;
+                const uint16_t dh = f32_to_f16(dq);
+                memcpy(o, &dh, 2);
+                int8_t *qo = (int8_t *)(o + 2);
+                for (int i = 0; i < 32; i++) {
+                    float s = v[i] * inv;
+                    s = (s > 127.0f) ? 127.0f : (s < -127.0f) ? -127.0f : s;
+                    qo[i] = (int8_t)lrintf(s);
+                }
+            }
+        }
+    }
+    *out_bytes = M * q8_row;
+    return buf;
+}
+
+static int qwen35_gpu_head_init(const ds4_model *m, const ds4_tensor *w) {
+    if (g_qgh.ready) return 1;
+    if (w->type != DS4_TENSOR_Q6_K || w->ndim < 2) return 0;
+    if (!ds4_gpu_init()) return 0;
+    const uint32_t K = (uint32_t)w->dim[0], M = (uint32_t)w->dim[1];
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t bytes = 0;
+    uint8_t *host = qwen35_head_to_q8_0(m, w, &bytes);
+    if (!host) return 0;
+    /* Managed memory first. On Windows cudaMalloc goes through WDDM, which
+     * draws the allocation out of system RAM and can push the model's mmap out
+     * of the page cache - measured as a 24 percent decode regression when only
+     * the allocation was added. Managed memory is pageable and the driver can
+     * evict it under pressure, so it competes with the mmap less. Falls back if
+     * it fails. */
+    g_qgh.w = ds4_gpu_tensor_alloc_managed(bytes);
+    if (!g_qgh.w) g_qgh.w = ds4_gpu_tensor_alloc(bytes);
+    const int wok = g_qgh.w && ds4_gpu_tensor_write(g_qgh.w, 0, host, bytes);
+    free(host);
+    if (!wok) { g_qgh.w = NULL; return 0; }
+    g_qgh.x = ds4_gpu_tensor_alloc((uint64_t)K * 4u);
+    g_qgh.out = ds4_gpu_tensor_alloc((uint64_t)M * 4u);
+    g_qgh.idx = ds4_gpu_tensor_alloc(4u);
+    const uint64_t scratch = ((uint64_t)M + 4095u) / 4096u * 8u;
+    g_qgh.scratch = ds4_gpu_tensor_alloc(scratch);
+    if (!g_qgh.x || !g_qgh.out || !g_qgh.idx || !g_qgh.scratch) return 0;
+    g_qgh.K = K; g_qgh.M = M; g_qgh.wbytes = bytes;
+    g_qgh.ready = 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "[gpuhead] %.0f MB on device in %.0f ms\n",
+            (double)bytes / 1048576.0,
+            (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+            (double)(t1.tv_nsec - t0.tv_nsec) / 1e6);
+    return 1;
+}
+
+/* One token through the device head, logits back into caller memory.
+ *
+ * Downloads the full row rather than only the argmax: 600 KB over PCIe is about
+ * seventy microseconds, and keeping the same signature as qwen35_cpu_matvec
+ * means sampling, softmax and every downstream consumer work unchanged. The
+ * argmax kernel exists if a greedy-only path ever wants the four-byte version. */
+static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
+    if (!g_qgh.ready) return 0;
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_QWEN35_GPU_HEAD_DBG") != NULL;
+    struct timespec a, b, c, d;
+    if (dbg) clock_gettime(CLOCK_MONOTONIC, &a);
+    if (!ds4_gpu_tensor_write(g_qgh.x, 0, hidden, (uint64_t)g_qgh.K * 4u)) return 0;
+    if (dbg) clock_gettime(CLOCK_MONOTONIC, &b);
+    if (!ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g_qgh.out, g_qgh.w,
+                                                  g_qgh.K, g_qgh.M, g_qgh.x))
+        return 0;
+    if (dbg) clock_gettime(CLOCK_MONOTONIC, &c);
+    if (!ds4_gpu_tensor_read(g_qgh.out, 0, logits, (uint64_t)g_qgh.M * 4u))
+        return 0;
+    if (dbg) {
+        clock_gettime(CLOCK_MONOTONIC, &d);
+        static double tw, tm, tr;
+        static long n;
+        tw += (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
+        tm += (double)(c.tv_sec - b.tv_sec) * 1e3 + (double)(c.tv_nsec - b.tv_nsec) / 1e6;
+        tr += (double)(d.tv_sec - c.tv_sec) * 1e3 + (double)(d.tv_nsec - c.tv_nsec) / 1e6;
+        if ((++n % 8) == 0)
+            fprintf(stderr, "[gpuhead] n=%ld  up=%.1f ms  matvec=%.1f ms  down=%.1f ms\n",
+                    (long)n, tw / (double)n, tm / (double)n, tr / (double)n);
+    }
+    return 1;
+}
+
+#endif /* !DS4_NO_GPU */
+
 static void qwen35_cpu_forward_token(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
@@ -77138,6 +77292,25 @@ static void qwen35_cpu_forward_token(
     }
     PROF_TICK();
     qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, w->output_norm), E, eps);
+    if (getenv("DS4_QWEN35_GPU_HEAD") != NULL) {
+        if (!g_qgh.ready) qwen35_gpu_head_init(m, w->output);
+        /* =2 initialises and allocates but keeps using the CPU head, so the
+         * cost of holding 1.3 GB can be separated from the cost of using it. */
+        static int mode = -1;
+        if (mode < 0) {
+            const char *e = getenv("DS4_QWEN35_GPU_HEAD");
+            if (e && e[0] == '3') {
+                mode = 3;
+                /* init only: no allocation, no use */
+                (void)ds4_gpu_init();
+                g_qgh.ready = -1;      /* sentinel: do not try to init again */
+                return;
+            }
+            mode = (e && e[0] == '2') ? 2 : 1;
+        }
+        if (mode == 1 && g_qgh.ready && qwen35_gpu_head_logits(blk, logits))
+            return;
+    }
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
     if (getenv("DS4_QWEN35_MTP_TEST") || getenv("DS4_QWEN35_MTP_SPEC")) {
         static int prev_draft = -1;

@@ -66,3 +66,53 @@ Requantise just the output head from Q6_K to Q4_K. That halves its traffic,
 with no GPU involved at all. It changes the head's numerics, so it needs the
 same bit-comparison discipline, but it is a repack rather than a new backend and
 is far less work than the offload.
+
+
+## The part that makes it worth doing: the MTP draft rides along
+
+Offloading the head alone is 27 percent. Offloading the head and the MTP draft
+together is a different order of thing, because CPU verification is almost free.
+
+Measured, in this session:
+
+    CPU decode, one token                2.77 t/s    362 ms
+    CPU decode with MTP speculation     1.25 t/s    800 ms
+
+MTP loses on the CPU because the draft costs about as much as the forward it is
+meant to save - a nextn layer plus a 3.4 GB walk of the head, roughly 360 ms
+against 362. With the head already resident on the GPU the draft reuses it and
+costs milliseconds instead.
+
+The reason that compounds is this: verifying k tokens on the CPU costs the same
+as verifying one, because the batched path reads the 12.3 GB trunk once for up
+to eight tokens per pass. That path already exists - it is the same
+qwen35_cpu_forward_batch that the output-head change made reachable.
+
+So the arithmetic becomes:
+
+    head on GPU, one token per pass       283 ms   ->  3.5 t/s
+    head and draft on GPU, 2 accepted     283 ms   -> 10.6 t/s
+    head and draft on GPU, 3 accepted     283 ms   -> 14.1 t/s
+
+The upper rows depend on the acceptance rate, which is a property of the draft
+model and not something this document can assume. But the shape is right: the
+CPU does one pass and emits several tokens, and the piece that made speculation
+unprofitable - the draft reading the head - is exactly the piece that moving the
+head removes.
+
+Nothing about this changes the numerics. It is not the requantisation trade
+described below, which buys 11 percent for a quality risk.
+
+## Scope
+
+Around four hundred lines, most of it new CUDA:
+
+    initialise CUDA under --cpu without putting the trunk on the device   100
+    a Qwen35 Q6_K matvec kernel for the device                            150
+    upload the 3.4 GB head and the nextn layer, once                       50
+    per round: hidden up 20 KB, logits and drafts down, one sync           80
+    CPU batch verification                                                 exists
+
+The last line is already there. The rest is a feature, not a patch, and it wants
+a session with budget to build and verify it rather than the tail of one that has
+already spent its own.

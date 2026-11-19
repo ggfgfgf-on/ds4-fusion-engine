@@ -76513,6 +76513,89 @@ static void qwen35_cpu_mtp_forward(
  *   attn_norm -> layer(GDN or gated GQA) -> residual
  *   post_attn_norm -> dense FFN(silu) -> residual
  * The GDN's output gate is silu(z) (the qwen35 form, see the GPU driver). */
+/* Several single-token matvecs over one shared activation, in one region.
+ *
+ * Decode calls qwen35_cpu_matvec once per tensor - ten times a layer, 256 times
+ * a token - and each call ends in its own ds4_parallel_for. The work per region
+ * is one tensor for one token, so the workers finish almost immediately and wait;
+ * a profile with a long generation put 41 percent of samples idle while the
+ * Q4_K kernel itself was only 19.6.
+ *
+ * Three of those groups read the same activation vector, so the quantisation and
+ * the whole region can be shared, exactly as qwen35_cpu_matvec_multi does for
+ * the batched path:
+ *
+ *   lin_qkv + lin_gate
+ *   attn_q + attn_k + attn_v
+ *   ffn_gate + ffn_up
+ *
+ * The worker reuses qwen35_cpu_matvec_worker one row at a time, so results are
+ * identical by construction rather than by reimplementation.
+ */
+typedef struct {
+    qwen35_cpu_matvec_ctx ctx[4];
+    uint64_t rows[4];
+    uint64_t n;
+    uint64_t total;
+} qwen35_mv1_multi;
+
+static void qwen35_mv1_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
+    qwen35_mv1_multi *mm = vctx;
+    /* Hand the worker a contiguous run within one tensor, not one row at a
+     * time. ds4_parallel_for gives each chunk roughly total/threads rows, and
+     * the per-row version dropped that to a single row per call, which took
+     * decode from 2.71 to 0.09 t/s - the worker's row-range assumptions (its
+     * prefetch distance, the four-row Q4_K kernel, the eight-row lane path) all
+     * collapse at a range of one. */
+    uint64_t idx = c0;
+    while (idx < c1) {
+        uint64_t j = 0, k = idx;
+        while (j + 1u < mm->n && k >= mm->rows[j]) {
+            k -= mm->rows[j];
+            j++;
+        }
+        uint64_t run = mm->rows[j] - k;
+        if (run > c1 - idx) run = c1 - idx;
+        qwen35_cpu_matvec_worker(&mm->ctx[j], k, k + run);
+        idx += run;
+    }
+}
+
+static bool qwen35_cpu_matvec_multi1(
+        const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
+        uint64_t n, const float *x, block_q8_K *q8_scratch, bool exact) {
+    if (n == 0 || n > 4u) return false;
+    qwen35_mv1_multi mm;
+    memset(&mm, 0, sizeof mm);
+    mm.n = n;
+    uint64_t in_dim = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const ds4_tensor *w = ws[i];
+        if (!w) return false;
+        if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) return false;
+        if (w->ndim < 2 || w->dim[0] % QK_K != 0) return false;
+        const uint64_t rows = w->dim[1];
+        if (i == 0) in_dim = w->dim[0];
+        else if (w->dim[0] != in_dim) return false;
+        const uint64_t blocks = w->dim[0] / QK_K;
+        mm.ctx[i].data = (const uint8_t *)tensor_data(m, w);
+        mm.ctx[i].xq = q8_scratch;
+        mm.ctx[i].xraw = x;
+        mm.ctx[i].in_dim = in_dim;
+        mm.ctx[i].row_bytes = blocks * (w->type == DS4_TENSOR_Q4_K
+                                            ? (uint64_t)sizeof(block_q4_K)
+                                            : (uint64_t)sizeof(block_q6_K));
+        mm.ctx[i].type = w->type;
+        mm.ctx[i].exact = exact;
+        mm.ctx[i].out = outs[i];
+        mm.rows[i] = rows;
+        mm.total += rows;
+    }
+    if (!exact) ds4_quantize_row_q8_K(x, q8_scratch, (int64_t)in_dim);
+    ds4_parallel_for(mm.total, qwen35_mv1_multi_worker, &mm);
+    return true;
+}
+
 static void qwen35_cpu_forward_token(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
@@ -76570,8 +76653,15 @@ static void qwen35_cpu_forward_token(
             /* GDN: qkv + gate projections, causal conv (silu), scan. */
             PROF_TICK();
             const bool gdn_f32 = getenv("DS4_QWEN35_GDN_F32") != NULL;
-            qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, gdn_f32);
-            qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, gdn_f32);
+            {
+                const ds4_tensor *ws[2] = { l->lin_qkv, l->lin_gate };
+                float *os[2] = { qkv, z };
+                if (!qwen35_cpu_matvec_multi1(m, ws, os, 2, blk,
+                                              s->qwen35_cpu_q8, gdn_f32)) {
+                    qwen35_cpu_matvec(m, l->lin_qkv, blk, qkv, s->qwen35_cpu_q8, gdn_f32);
+                    qwen35_cpu_matvec(m, l->lin_gate, blk, z, s->qwen35_cpu_q8, gdn_f32);
+                }
+            }
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
                 fprintf(stderr, "[gater] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
                         (unsigned long long)l->lin_gate->dim[0],
@@ -76606,9 +76696,16 @@ static void qwen35_cpu_forward_token(
         } else {
             /* Full attention: q/k/v projections, per-head norms, rope, GQA. */
             PROF_TICK();
-            qwen35_cpu_matvec(m, l->attn_q, blk, qkv, s->qwen35_cpu_q8, false); /* 2*H*HD: q + gate */
-            qwen35_cpu_matvec(m, l->attn_k, blk, k2, s->qwen35_cpu_q8, false);
-            qwen35_cpu_matvec(m, l->attn_v, blk, v2, s->qwen35_cpu_q8, false);
+            {
+                const ds4_tensor *ws[3] = { l->attn_q, l->attn_k, l->attn_v };
+                float *os[3] = { qkv, k2, v2 };
+                if (!qwen35_cpu_matvec_multi1(m, ws, os, 3, blk,
+                                              s->qwen35_cpu_q8, false)) {
+                    qwen35_cpu_matvec(m, l->attn_q, blk, qkv, s->qwen35_cpu_q8, false);
+                    qwen35_cpu_matvec(m, l->attn_k, blk, k2, s->qwen35_cpu_q8, false);
+                    qwen35_cpu_matvec(m, l->attn_v, blk, v2, s->qwen35_cpu_q8, false);
+                }
+            }
             PROF_TOCK(t_mv);
             PROF_TICK();
             for (uint32_t h = 0; h < H; h++) {
@@ -76690,8 +76787,15 @@ static void qwen35_cpu_forward_token(
         qwen4_ref_rms(blk, cur, qwen4_ref_f32(m, l->post_attn_norm), E, eps);
         PROF_TOCK(t_norm);
         PROF_TICK();
-        qwen35_cpu_matvec(m, l->ffn_gate, blk, ff_a, s->qwen35_cpu_q8, false);
-        qwen35_cpu_matvec(m, l->ffn_up, blk, ff_b, s->qwen35_cpu_q8, false);
+        {
+            const ds4_tensor *ws[2] = { l->ffn_gate, l->ffn_up };
+            float *os[2] = { ff_a, ff_b };
+            if (!qwen35_cpu_matvec_multi1(m, ws, os, 2, blk,
+                                          s->qwen35_cpu_q8, false)) {
+                qwen35_cpu_matvec(m, l->ffn_gate, blk, ff_a, s->qwen35_cpu_q8, false);
+                qwen35_cpu_matvec(m, l->ffn_up, blk, ff_b, s->qwen35_cpu_q8, false);
+            }
+        }
         PROF_TOCK(t_mv);
         PROF_TICK();
         for (uint32_t i = 0; i < FF; i++)

@@ -73911,12 +73911,35 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
                 (unsigned long long)rows, (unsigned long long)blocks,
                 (const void *)src);
     const uint64_t ng = rows / 16u;
-    /* Sixty-four byte aligned. The record is a multiple of sixty-four and qv
-     * sits at offset 320, also a multiple, so aligning the base makes every
-     * _mm512_loadu_si512 land inside one cache line. xmalloc only guarantees
-     * sixteen, and a split load costs about double. */
-    uint8_t *raw = xmalloc((size_t)(ng * blocks * Q4K_X16X8_BYTES) + 64u);
-    uint8_t *buf = (uint8_t *)(((uintptr_t)raw + 63u) & ~(uintptr_t)63u);
+    /* Large pages when the privilege is available. The buffer is 12.3 GB, so
+     * with 4 KB pages it needs three million TLB entries and the walker becomes
+     * a real cost on a path that is already waiting on DRAM; with 2 MB pages it
+     * needs six thousand. Falls back to a plain allocation when the process does
+     * not hold SeLockMemoryPrivilege, which is the normal case for a non-service
+     * start. DS4_QWEN35_NO_HUGE turns the attempt off. */
+    const size_t need = (size_t)(ng * blocks * Q4K_X16X8_BYTES);
+    uint8_t *buf = NULL;
+    if (getenv("DS4_QWEN35_NO_HUGE") == NULL) {
+        /* The policy may grant SeLockMemoryPrivilege but it arrives disabled;
+         * win_compat already knows how to turn it on for the pinned-page pool. */
+        extern void ds4_win_enable_lock_memory(void);
+        ds4_win_enable_lock_memory();
+        const size_t hs = (size_t)2u << 20;
+        const size_t want = (need + hs - 1u) & ~(hs - 1u);
+        buf = (uint8_t *)VirtualAlloc(NULL, want,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                      PAGE_READWRITE);
+        if (buf && getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr, "[x8] large pages, %.1f MB rounded to %.1f MB\n",
+                    (double)need / 1048576.0, (double)want / 1048576.0);
+    }
+    if (!buf) {
+        uint8_t *raw = xmalloc(need + 64u);
+        buf = (uint8_t *)(((uintptr_t)raw + 63u) & ~(uintptr_t)63u);
+        if (getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr, "[x8] normal pages, %.1f MB\n",
+                    (double)need / 1048576.0);
+    }
     for (uint64_t g = 0; g < ng; g++) {
         for (uint64_t b = 0; b < blocks; b++) {
             qwen35_blk16x8 *o = (qwen35_blk16x8 *)

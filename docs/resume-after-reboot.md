@@ -25,11 +25,26 @@ block granularity prefetch - all came back neutral or negative.
 
 ## What the reboot changed
 
-`bcdedit /set hypervisorlaunchtype off`. This also stops Windows Sandbox and
-WSL2, which need it. To undo:
+Not bcdedit. `hypervisorlaunchtype` stays Auto; what was disabled are the features
+that make Auto mean something:
 
-    bcdedit /set hypervisorlaunchtype auto
+    Microsoft-Hyper-V-Hypervisor      Enabled -> Disabled
+    VirtualMachinePlatform            Enabled -> Disabled     (WSL2)
+    Containers-DisposableClientVM     Enabled -> Disabled     (Windows Sandbox)
+
+Memory integrity was already off - HVCI registry Enabled = 0, and DeviceGuard
+reported no security services running - so the hypervisor was there for the
+virtualisation features, not for security.
+
+To put it back:
+
+    Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor
+    Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+    Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM
     (then reboot)
+
+Disabling Containers-DisposableClientVM takes the Windows Sandbox with it, so the
+sandbox_* tools stop working until it is re-enabled.
 
 ## First thing to check
 

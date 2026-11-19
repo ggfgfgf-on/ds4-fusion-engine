@@ -1,0 +1,5 @@
+# written by bench/autotune.py
+DS4_QWEN35_TGS=8
+DS4_THREADS=28
+DS4_POOL_MIN_ROWS=32
+DS4_PREFILL_BATCH=64

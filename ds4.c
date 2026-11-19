@@ -74153,8 +74153,14 @@ static void qwen35_gemm_q6_K_16x8(
                 /* d[r] varies per block, so it is applied here rather than
                  * factored out afterwards: the correction is
                  * sum_b sum_g -32 * d[r][b] * sc[g][r][b] * bsums[t][g][b]. */
-                const __m512 p = _mm512_mul_ps(_mm512_mul_ps(sv, dv),
-                                               _mm512_set1_ps((float)yt->bsums[g]));
+                /* bsums is an integer sum, so the term has to carry the q8
+                 * block's own scale as well - without yd it is dimensionally
+                 * unrelated to the accumulator it is subtracted from, and the
+                 * max abs diff reads 529. */
+                const __m512 p = _mm512_mul_ps(
+                        _mm512_mul_ps(sv, dv),
+                        _mm512_set1_ps((float)yt->bsums[g] *
+                                       y[t * ystride + b].d));
                 switch (t) {
                 case 0: c0 = _mm512_add_ps(c0, p); break;
                 case 1: c1 = _mm512_add_ps(c1, p); break;
@@ -76225,7 +76231,22 @@ static void qwen35_cpu_matvec_batch(
         getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
         rows >= 16u && (rows % 16u) == 0u &&
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
-        if (w->type == DS4_TENSOR_Q6_K && !exact &&
+        /* Unreachable: the enclosing condition requires Q4_K and this one
+         * requires Q6_K. Left in place rather than deleted, and the kernel's
+         * correction term above is now numerically right, because deleting it
+         * would take qwen35_q6k_at with it and the GPU head uses that.
+         *
+         * Do not simply move it outward. Measured: the wide Q6_K record is 4928
+         * bytes per sixteen rows per block against 3360 in the packed form, so
+         * forty-seven percent more to read, and building it dequantises and
+         * requantises every value on the host, seconds against the 1.1 the Q4_K
+         * builder needs for twice the bytes because that one is a copy. Running
+         * it gave 6.5 t/s against 36.
+         *
+         * What actually fixed the Q6_K side was the loop order in
+         * qwen35_x8_worker: it applies to the 2x4 path through the batched
+         * dispatch and needs no new layout at all. */
+        if (0 && w->type == DS4_TENSOR_Q6_K && !exact &&
             getenv("DS4_QWEN35_NO_Q6W") == NULL) {
             if (getenv("DS4_QWEN35_Q6DBG")) {
                 static int shown = 0;
@@ -76931,13 +76952,15 @@ static void qwen35_cpu_forward_batch(
                     n_tok, wall, (unsigned long long)acc_calls, acc_ms,
                     100.0 * acc_ms / (wall > 0.0 ? wall : 1.0),
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
-            (void)gdn_batch_ms;
+    
             if (getenv("DS4_QWEN35_BYTE_DBG"))
                 fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "
                         "everything-else=%.0f ms (%.0f%%)\n",
                         attn_ms, 100.0 * attn_ms / (wall > 0.0 ? wall : 1.0),
                         wall - acc_ms - attn_ms,
                         100.0 * (wall - acc_ms - attn_ms) / (wall > 0.0 ? wall : 1.0));
+        fprintf(stderr, "[prefill] gdn serial=%.0f ms (%.0f%%)\n",
+                gdn_batch_ms, 100.0 * gdn_batch_ms / (wall > 0.0 ? wall : 1.0));
     }
 }
 

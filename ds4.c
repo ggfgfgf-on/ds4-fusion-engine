@@ -47,6 +47,7 @@
 #include "ds4_image.h"
 #include "ds4_engram.h"
 #include "ds4_tp.h"
+#include "win_compat/sampling_profiler.h"
 #if !defined(DS4_NO_GPU)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
@@ -73895,7 +73896,14 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
     const uint64_t rows = w->dim[1];
     const uint64_t blocks = w->dim[0] / QK_K;
     const uint64_t row_bytes = blocks * Q4K_ROW;
-    if (rows < 16u || (rows % 16u) != 0u || row_bytes < Q4K_ROW) return NULL;
+    if (rows < 16u || (rows % 16u) != 0u || row_bytes < Q4K_ROW) {
+        if (getenv("DS4_QWEN35_X8DBG"))
+            fprintf(stderr, "[x8skip] dim0=%llu dim1=%llu bytes=%llu "
+                    "rows16=%d\n", (unsigned long long)w->dim[0],
+                    (unsigned long long)rows, (unsigned long long)w->bytes,
+                    (int)(rows % 16u));
+        return NULL;
+    }
     const uint8_t *src = (const uint8_t *)tensor_data(m, w);
     if (!src) return NULL;
     if (getenv("DS4_QWEN35_X8DBG"))
@@ -83856,6 +83864,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
+        if (getenv("DS4_PROF") != NULL) {
+            qwen35_prof_start();
+            atexit(qwen35_prof_stop);
+        }
         /* Repack Q4_K into the sixteen-row layout here, at session start, so
          * the first prompt does not carry the cost. Lazy repacking inside the
          * matvec put 3.6 s into the first prefill, which is why the 16-row path

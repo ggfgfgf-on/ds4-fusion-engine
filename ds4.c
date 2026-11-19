@@ -74193,7 +74193,14 @@ static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w) {
     const uint64_t rows = w->dim[1];
     const uint64_t blocks = w->dim[0] / QK_K;
     const uint64_t row_bytes = blocks * (uint64_t)sizeof(block_q6_K);
-    if (rows < 16u || (rows % 16u) != 0u) return NULL;
+    if (rows < 16u || (rows % 16u) != 0u) {
+        if (getenv("DS4_QWEN35_Q6DBG"))
+            fprintf(stderr, "[q6skip] rows=%llu mod16=%llu blocks=%llu\n",
+                    (unsigned long long)rows,
+                    (unsigned long long)(rows % 16u),
+                    (unsigned long long)blocks);
+        return NULL;
+    }
     const uint8_t *src = (const uint8_t *)tensor_data(m, w);
     if (!src) return NULL;
     const uint64_t ng = rows / 16u;
@@ -76000,6 +76007,13 @@ static void qwen35_cpu_matvec_batch(
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
         if (w->type == DS4_TENSOR_Q6_K && !exact &&
             getenv("DS4_QWEN35_NO_Q6W") == NULL) {
+            if (getenv("DS4_QWEN35_Q6DBG")) {
+                static int shown = 0;
+                if (!shown) { shown = 1;
+                    fprintf(stderr, "[q6see] rows=%llu blocks=%llu\n",
+                            (unsigned long long)rows,
+                            (unsigned long long)blocks); }
+            }
             uint8_t *qb = qwen35_q6k_get(tdata);
             if (!qb) qb = qwen35_q6k_build(m, w);
             if (qb) {

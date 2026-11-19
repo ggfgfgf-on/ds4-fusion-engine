@@ -75394,6 +75394,22 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
      * row-major, which is why the per-token BATCH_VERIFY reference disagreed
      * with the 16-row batch path by twenty to thirty while the kernel itself
      * matches a scalar reference to 2.5e-06. */
+    /* Sixteen rows for decode as well, behind its own switch. Tested before and
+     * 27 percent slower, but that was while the output head was still walked
+     * per position, so the balance has changed: prefill now runs at 61 GB/s
+     * against decode's 43, and the wide kernel gives each parallel chunk eight
+     * times the work. Costs 5.5 percent more bytes (2432 against 2304). */
+    if (w->type == DS4_TENSOR_Q4_K && !exact &&
+        getenv("DS4_QWEN35_X8_DEC") != NULL) {
+        const uint8_t *xb = qwen35_x8_get((const uint8_t *)tensor_data(m, w));
+        if (xb) {
+            for (uint64_t g = 0; g < rows / 16u; g++)
+                qwen35_gemm_q4_K_16x8(
+                        xb + g * blocks * Q4K_X16X8_BYTES, blocks,
+                        q8_scratch, blocks, 1u, out, rows, g * 16u);
+            return;
+        }
+    }
     if (w->type == DS4_TENSOR_Q4_K && !exact &&
         qwen35_rp_get((const uint8_t *)tensor_data(m, w)) == 3) {
         const uint8_t *tb16 = (const uint8_t *)tensor_data(m, w);

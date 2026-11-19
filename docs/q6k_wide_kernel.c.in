@@ -1,0 +1,93 @@
+/* Q6_K in the wide layout. The layout and the conversion are finished and
+ * checked against this file's own reference; the kernel loop is written out
+ * below in prose because it was not implemented before this session ran out.
+ *
+ * Nothing here is compiled or reachable - it is a starting point, not a stub
+ * that pretends to work.
+ *
+ * ---------------------------------------------------------------------------
+ * Bit layout, taken from ds4.c:4721 so the two cannot disagree:
+ *
+ *   for n128 in {0, 128}:
+ *     for l in 0..31:
+ *       is   = l / 16
+ *       q1 = (ql[l+0]  & 0x0F) | (((qh[l] >> 0) & 3) << 4)   p = n128+l+0,   scale[is+0]
+ *       q2 = (ql[l+32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)   p = n128+l+32,  scale[is+2]
+ *       q3 = (ql[l+0]  >> 4)   | (((qh[l] >> 4) & 3) << 4)   p = n128+l+64,  scale[is+4]
+ *       q4 = (ql[l+32] >> 4)   | (((qh[l] >> 6) & 3) << 4)   p = n128+l+96,  scale[is+6]
+ *     ql += 64; qh += 32; scales += 8
+ *
+ * Position p uses scale[p / 16]. The stored value is q; the reference subtracts
+ * 32 to get the signed value.
+ * ---------------------------------------------------------------------------
+ */
+#define Q6K_X16_ROWS  16u
+#define Q6K_X16_BYTES 4416u
+
+typedef struct {
+    float d[Q6K_X16_ROWS];      /*  64  sequential, one load */
+    int8_t sc[16][Q6K_X16_ROWS];/* 256  group-major, sc[g] is one 16-byte load */
+    uint8_t qv[64][64];         /* 4096 four bytes per row per chunk */
+} qwen35_blk6;
+
+/* Six-bit value at position p of one super-block, matching ds4.c:4721. */
+static inline uint8_t qwen35_q6k_at(const block_q6_K *b, uint32_t p) {
+    const uint32_t n128 = (p >= 128u) ? 128u : 0u;
+    const uint32_t r = p - n128;
+    const uint8_t *ql = b->ql + (n128 ? 64 : 0);
+    const uint8_t *qh = b->qh + (n128 ? 32 : 0);
+    if (r < 32u) {
+        const uint32_t l = r;
+        return (uint8_t)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4));
+    } else if (r < 64u) {
+        const uint32_t l = r - 32u;
+        return (uint8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4));
+    } else if (r < 96u) {
+        const uint32_t l = r - 64u;
+        return (uint8_t)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4));
+    }
+    const uint32_t l = r - 96u;
+    return (uint8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4));
+}
+
+/* Sixteen consecutive rows of one super-block into the wide record. */
+static void qwen35_q6k_wide_block(const block_q6_K *const *rows, uint8_t *dst) {
+    qwen35_blk6 *o = (qwen35_blk6 *)dst;
+    for (uint32_t r = 0; r < Q6K_X16_ROWS; r++) {
+        const block_q6_K *b = rows[r];
+        o->d[r] = f16_to_f32(b->d);
+        for (uint32_t g = 0; g < 16u; g++)
+            o->sc[g][r] = b->scales[g];
+        for (uint32_t p = 0; p < QK_K; p++)
+            o->qv[p / 4u][r * 4u + (p % 4u)] = qwen35_q6k_at(b, p);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * The kernel, as it should be written. Sixteen rows, up to eight tokens, one
+ * sixty-four byte load per chunk feeding all sixteen lanes.
+ *
+ *   for b in blocks:
+ *     dv = loadu_ps(xp->d)                       one load, f32, per row
+ *     for g in 0..15:                            one scale per group of sixteen
+ *       acc[t] = 0                               per token, sixteen int32 = rows
+ *       for c in 4g .. 4g+3:                     the four chunks of this group
+ *         q = loadu_si512(xp->qv[c])             four bytes per row, lane k = row k
+ *         for t in 0..lim-1:
+ *           acc[t] = dpbusd(acc[t], q, set1(q8[t].qs[c*4]))   1 instruction
+ *       base = cvtepi32_ps(cvtepu8_epi32(loadu_si128(xp->sc[g]))) * dv
+ *       for t in 0..lim-1:
+ *         f[t] += cvt(acc[t]) * base * set1(q8[t].d)
+ *
+ *   then the minus-32 correction, per (row, token):
+ *     corr[r][t] = -32 * d[r] * sum_g sc[g][r] * bsums[t][g]
+ *
+ * The correction is the same shape as the Q4_K min term and vectorises the same
+ * way: build four mm512i holding sc[2m] and sc[2m+1] interleaved so madd's lane k
+ * is row k, then one madd per group pair against a broadcast of two bsums.
+ *
+ * What costs more than Q4_K: the scale changes every sixteen values, so the
+ * accumulators flush sixteen times per block instead of eight. Expect the flush
+ * to be a larger share here, and measure it before assuming the win lands.
+ * ---------------------------------------------------------------------------
+ */

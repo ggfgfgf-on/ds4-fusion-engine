@@ -75929,7 +75929,7 @@ static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
         float *qk, const float *blk, const float *zz,
         float *tmp_row, uint32_t tmp_dim, float *lin_o, float *ga, float *gb,
-        int skip_scan) {
+        int skip_scan, int ga_gb_pre) {
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t OW = Hv * D;
@@ -75952,8 +75952,15 @@ static void qwen35_gdn_token(
      * runs a 5120-iteration scalar loop. Across 48 layers x every token that
      * was ~296 ms of the GDN block, the largest serial cost left in the
      * forward. The AVX2 kernel does the same math from the packed weights. */
-    qwen35_cpu_matvec(m, l->lin_alpha, blk, ga, s->qwen35_cpu_q8, true);
-    qwen35_cpu_matvec(m, l->lin_beta, blk, gb, s->qwen35_cpu_q8, true);
+    /* Two matvecs per token meant two parallel regions per token per layer -
+     * sixty-four tokens by forty-nine linear layers is six thousand regions of
+     * forty-eight rows each, so the barriers cost far more than the arithmetic.
+     * The batched forward fills every token's ga/gb in one region before this
+     * loop and passes ga_gb_pre; the per-token path still does its own. */
+    if (!ga_gb_pre) {
+        qwen35_cpu_matvec(m, l->lin_alpha, blk, ga, s->qwen35_cpu_q8, true);
+        qwen35_cpu_matvec(m, l->lin_beta, blk, gb, s->qwen35_cpu_q8, true);
+    }
     const float *A = qwen4_ref_f32(m, l->lin_a);
     const float *bias = qwen4_ref_f32(m, l->lin_dt_bias);
     for (uint32_t h = 0; h < Hv; h++) {
@@ -76095,6 +76102,28 @@ static void qwen35_rms_par(float *out, const float *src, const float *w,
     ds4_parallel_for(n_tok, qwen35_rms_worker, &r);
 }
 
+/* Phase accounting for the batched forward.
+ *
+ * Sampling said 57 percent idle and never explained it: the sampler cannot tell
+ * a thread at a barrier from one waiting on memory, and attributes both to
+ * whichever DLL owns the frame. This measures the phases directly. They have to
+ * add up to the wall time, so anything unaccounted shows as a remainder instead
+ * of hiding inside "idle". */
+static struct {
+    double rms, matvec, gdn, attn, silu, add, head;
+    long layers;
+} g_ph;
+static int g_ph_on = -1;
+static double qwen35_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+#define QPH_INIT()  do { if (g_ph_on < 0) \
+        g_ph_on = getenv("DS4_QWEN35_PHASE") != NULL; } while (0)
+#define QPH_T0(t)   const double t = g_ph_on ? qwen35_now_ms() : 0.0
+#define QPH_ACC(f, t) do { if (g_ph_on) g_ph.f += qwen35_now_ms() - (t); } while (0)
+
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
@@ -76172,7 +76201,21 @@ static void qwen35_cpu_matvec_batch(
             w8.xq = xq;
             w8.out = out;
             w8.n_tok = n_tok;
+            struct timespec x8t0, x8t1;
+            clock_gettime(CLOCK_MONOTONIC, &x8t0);
             ds4_parallel_for(rows / 16u, qwen35_x8_worker, &w8);
+            clock_gettime(CLOCK_MONOTONIC, &x8t1);
+            /* This path returns before the accounting at the end of the
+             * function, which is why the breakdown reported q4 = 0.0 GB and
+             * left the whole Q4_K half of prefill inside "everything else". */
+            acc_ms += (double)(x8t1.tv_sec - x8t0.tv_sec) * 1e3 +
+                      (double)(x8t1.tv_nsec - x8t0.tv_nsec) / 1e6;
+            acc_calls++;
+            acc_tok_sum += n_tok;
+            if (n_tok > acc_tok_max) acc_tok_max = n_tok;
+            acc_tensors += w->bytes;
+            acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
+            acc_q4 += w->bytes;
             free(xq);
             return;
         }
@@ -76663,12 +76706,21 @@ static void qwen35_cpu_forward_batch(
             const uint32_t ZW = (uint32_t)l->lin_gate->dim[1];
             /* tmp rows are lin_out's input width, NOT C (they differ). */
             const uint32_t TW = (uint32_t)l->lin_out->dim[0];
+            int gdn_ga_gb_pre = 0;
             static double gdn2_ms = 0.0;
             struct timespec g2a, g2b;
             clock_gettime(CLOCK_MONOTONIC, &g2a);
             static double gdn_ms = 0.0;
             struct timespec gt0, gt1;
             clock_gettime(CLOCK_MONOTONIC, &gt0);
+            /* Every token's alpha and beta in two regions, not 2 * n_tok. */
+            if (DS4_N_LIN_V_HEAD == (uint32_t)l->lin_alpha->dim[1]) {
+                qwen35_cpu_matvec_batch(m, l->lin_alpha, blk, ga, n_tok, true);
+                qwen35_cpu_matvec_batch(m, l->lin_beta, blk, gb, n_tok, true);
+                gdn_ga_gb_pre = 1;
+            } else {
+                gdn_ga_gb_pre = 0;
+            }
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
@@ -76678,7 +76730,8 @@ static void qwen35_cpu_forward_batch(
                                  lin_o + (uint64_t)t * OW,
                                  ga + (uint64_t)t * Hv,
                                  gb + (uint64_t)t * Hv,
-                                 getenv("DS4_QWEN35_NO_WHOLE_SCAN") ? 0 : 1);
+                                 getenv("DS4_QWEN35_NO_WHOLE_SCAN") ? 0 : 1,
+                                 gdn_ga_gb_pre);
             }
             clock_gettime(CLOCK_MONOTONIC, &g2b);
             gdn2_ms += (double)(g2b.tv_sec - g2a.tv_sec) * 1e3 +
@@ -77320,7 +77373,7 @@ static void qwen35_cpu_forward_token(
             PROF_TICK();
             /* the same shared per-token block the batched path uses */
             qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
-                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb, 0);
+                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb, 0, 0);
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, gdn_f32);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {

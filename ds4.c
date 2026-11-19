@@ -75899,6 +75899,104 @@ static void qwen35_silu_worker(void *vctx, uint64_t c0, uint64_t c1) {
         c->b[i] *= c->a[i] / (1.0f + expf(-c->a[i]));
 }
 
+/* Attention split in two, because the single loop had a causal dependency
+ * inside it: token t's attention reads the KV entries tokens 0..t wrote.
+ *
+ *   phase A  every token normalises q and k, applies rope and stores its own KV
+ *            slot. Independent across tokens - each writes only its own kv_pos.
+ *   phase B  attention over a fully populated cache. Token t still only reads
+ *            the first visible == pos + 1 entries, so it is read-only and safe.
+ *
+ * Both phases parallelise over tokens. H, KV, HD, C and QW are const locals
+ * inside the forward pass, so they travel in this struct rather than being
+ * recomputed.
+ *
+ * This block was 312 ms of the early breakdown and ran entirely on the main
+ * thread; the sampling profiler put the matvec kernel at 2.1 percent of all
+ * samples, so the serial blocks are where the time is. */
+typedef struct {
+    float *qkv, *gate, *k2, *v2, *q2, *kv, *score, *attn_o;
+    const float *qnorm, *knorm;
+    float eps;
+    uint32_t kv_cap, pos0, n_tok;
+    uint32_t nH, nKV, nHD, nC, nQW;
+} qwen35_attn_work;
+
+static void qwen35_attn_phase_a(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_attn_work *w = vctx;
+    const uint64_t nHD = w->nHD, nKV = w->nKV, nH = w->nH;
+    for (uint64_t t = t0; t < t1; t++) {
+        const uint32_t pos = w->pos0 + (uint32_t)t;
+        float *qk = w->qkv + t * w->nQW;
+        float *gt = w->gate + t * w->nC;
+        float *kt = w->k2 + t * nKV * nHD;
+        float *vt = w->v2 + t * nKV * nHD;
+        float *q2t = w->q2 + t * nH * nHD;
+        for (uint32_t h = 0; h < (uint32_t)nH; h++) {
+            qwen4_ref_rms(q2t + (uint64_t)h * nHD, qk + (uint64_t)h * 2u * nHD,
+                          w->qnorm, (int)nHD, w->eps);
+            memcpy(gt + (uint64_t)h * nHD, qk + (uint64_t)h * 2u * nHD + nHD,
+                   (size_t)nHD * sizeof(float));
+        }
+        for (uint32_t h = 0; h < (uint32_t)nKV; h++)
+            qwen4_ref_rms(kt + (uint64_t)h * nHD, kt + (uint64_t)h * nHD,
+                          w->knorm, (int)nHD, w->eps);
+        for (uint32_t h = 0; h < (uint32_t)nH; h++)
+            qwen35_cpu_rope(q2t + (uint64_t)h * nHD, (int32_t)pos);
+        for (uint32_t h = 0; h < (uint32_t)nKV; h++)
+            qwen35_cpu_rope(kt + (uint64_t)h * nHD, (int32_t)pos);
+        const uint32_t kv_pos = pos % w->kv_cap;
+        memcpy(w->kv + (uint64_t)kv_pos * nKV * nHD, kt,
+               (size_t)(nKV * nHD) * sizeof(float));
+        memcpy(w->kv + (uint64_t)(w->kv_cap * nKV * nHD) +
+                   (uint64_t)kv_pos * nKV * nHD, vt,
+               (size_t)(nKV * nHD) * sizeof(float));
+    }
+}
+
+static void qwen35_attn_phase_b(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_attn_work *w = vctx;
+    const uint64_t nHD = w->nHD, nKV = w->nKV, nH = w->nH;
+    const float scale = 1.0f / sqrtf((float)nHD);
+    const uint64_t vbase = (uint64_t)(w->kv_cap * nKV * nHD);
+    for (uint64_t t = t0; t < t1; t++) {
+        const uint32_t pos = w->pos0 + (uint32_t)t;
+        const uint32_t visible = pos + 1u;
+        float *gt = w->gate + t * w->nC;
+        float *q2t = w->q2 + t * nH * nHD;
+        float *sc_t = w->score + t * w->kv_cap;
+        for (uint32_t h = 0; h < (uint32_t)nH; h++) {
+            const uint32_t kh = h / (uint32_t)(nH / nKV);
+            for (uint32_t u = 0; u < visible; u++) {
+                const uint32_t p = u % w->kv_cap;
+                float dd = 0.0f;
+                for (uint32_t i = 0; i < (uint32_t)nHD; i++)
+                    dd += q2t[(uint64_t)h * nHD + i] *
+                          w->kv[(uint64_t)p * nKV * nHD + (uint64_t)kh * nHD + i];
+                sc_t[u] = dd * scale;
+            }
+            float mx = sc_t[0];
+            for (uint32_t u = 1; u < visible; u++) mx = fmaxf(mx, sc_t[u]);
+            double ss = 0.0;
+            for (uint32_t u = 0; u < visible; u++) {
+                sc_t[u] = expf(sc_t[u] - mx);
+                ss += sc_t[u];
+            }
+            for (uint32_t i = 0; i < (uint32_t)nHD; i++) {
+                float o = 0.0f;
+                for (uint32_t u = 0; u < visible; u++) {
+                    const uint32_t p = u % w->kv_cap;
+                    o += sc_t[u] * w->kv[vbase + (uint64_t)p * nKV * nHD +
+                                         (uint64_t)kh * nHD + i];
+                }
+                w->attn_o[t * nH * nHD + (uint64_t)h * nHD + i] =
+                        o / (float)ss *
+                        (1.0f / (1.0f + expf(-gt[(uint64_t)h * nHD + i])));
+            }
+        }
+    }
+}
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -76055,54 +76153,15 @@ static void qwen35_cpu_forward_batch(
             const uint32_t kv_cap = (uint32_t)s->ctx_size;
             struct timespec at0, at1;
             clock_gettime(CLOCK_MONOTONIC, &at0);
-            for (uint32_t t = 0; t < n_tok; t++) {
-                const uint32_t pos = pos0 + t;
-                float *qk = qkv + (uint64_t)t * QW;
-                float *gt = gate + (uint64_t)t * C;
-                float *kt = k2 + (uint64_t)t * KV * HD;
-                float *vt = v2 + (uint64_t)t * KV * HD;
-                float *q2t = q2 + (uint64_t)t * H * HD;
-                for (uint32_t h = 0; h < H; h++) {
-                    qwen4_ref_rms(q2t + (uint64_t)h * HD, qk + (uint64_t)h * 2u * HD, qnorm, HD, eps);
-                    memcpy(gt + (uint64_t)h * HD, qk + (uint64_t)h * 2u * HD + HD,
-                           HD * sizeof(float));
-                }
-                for (uint32_t h = 0; h < KV; h++)
-                    qwen4_ref_rms(kt + (uint64_t)h * HD, kt + (uint64_t)h * HD, knorm, HD, eps);
-                for (uint32_t h = 0; h < H; h++) qwen35_cpu_rope(q2t + (uint64_t)h * HD, (int32_t)pos);
-                for (uint32_t h = 0; h < KV; h++) qwen35_cpu_rope(kt + (uint64_t)h * HD, (int32_t)pos);
-                const uint32_t kv_pos = pos % kv_cap;
-                memcpy(kv + (uint64_t)kv_pos * KV * HD, kt, (size_t)KV * HD * sizeof(float));
-                memcpy(kv + (uint64_t)(kv_cap * KV * HD) + (uint64_t)kv_pos * KV * HD,
-                       vt, (size_t)KV * HD * sizeof(float));
-                const uint32_t visible = pos + 1u;
-                const float scale = 1.0f / sqrtf((float)HD);
-                float *sc_t = score + (uint64_t)t * kv_cap;
-                for (uint32_t h = 0; h < H; h++) {
-                    const uint32_t kh = h / (H / KV);
-                    for (uint32_t u = 0; u < visible; u++) {
-                        const uint32_t p = u % kv_cap;
-                        float dd = 0.0f;
-                        for (uint32_t i = 0; i < HD; i++)
-                            dd += q2t[(uint64_t)h * HD + i] *
-                                  kv[(uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
-                        sc_t[u] = dd * scale;
-                    }
-                    float mx = sc_t[0];
-                    for (uint32_t u = 1; u < visible; u++) mx = fmaxf(mx, sc_t[u]);
-                    double ss = 0.0;
-                    for (uint32_t u = 0; u < visible; u++) { sc_t[u] = expf(sc_t[u] - mx); ss += sc_t[u]; }
-                    for (uint32_t i = 0; i < HD; i++) {
-                        float o = 0.0f;
-                        for (uint32_t u = 0; u < visible; u++) {
-                            const uint32_t p = u % kv_cap;
-                            o += sc_t[u] * kv[(uint64_t)(kv_cap * KV * HD) +
-                                              (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
-                        }
-                        attn_o[(uint64_t)t * (uint64_t)(H * HD) + (uint64_t)h * HD + i] =
-                                o / (float)ss * (1.0f / (1.0f + expf(-gt[h * HD + i])));                    }
-                }
-            }
+            /* Two phases instead of one loop, see qwen35_attn_phase_a. */
+            qwen35_attn_work aw;
+            aw.qkv = qkv; aw.gate = gate; aw.k2 = k2; aw.v2 = v2; aw.q2 = q2;
+            aw.kv = kv; aw.score = score; aw.attn_o = attn_o;
+            aw.qnorm = qnorm; aw.knorm = knorm; aw.eps = eps;
+            aw.kv_cap = kv_cap; aw.pos0 = pos0; aw.n_tok = n_tok;
+            aw.nH = H; aw.nKV = KV; aw.nHD = HD; aw.nC = C; aw.nQW = QW;
+            ds4_parallel_for(n_tok, qwen35_attn_phase_a, &aw);
+            ds4_parallel_for(n_tok, qwen35_attn_phase_b, &aw);
             clock_gettime(CLOCK_MONOTONIC, &at1);
             attn_ms += (double)(at1.tv_sec - at0.tv_sec) * 1e3 +
                        (double)(at1.tv_nsec - at0.tv_nsec) / 1e6;

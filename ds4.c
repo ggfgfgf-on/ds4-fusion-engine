@@ -74447,78 +74447,76 @@ static void qwen35_gemm_q4_K_16x8(
             const __m512 dv = _mm512_loadu_ps(xp->d);
             for (int jp = 0; jp < 4; jp++) {
                 const int jlo = 2 * jp;
-                __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0, lo3 = lo0;
-                __m512i lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
-                __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
-                __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+                /* The two nibble groups of a sub-block are done in two passes
+                 * over the chunks instead of one.
+                 *
+                 * Doing both at once needs sixteen integer accumulators - eight
+                 * tokens by two groups - and with the eight float accumulators
+                 * that is twenty-four of the thirty-two zmm registers before any
+                 * temporaries. The disassembly says what clang did with that:
+                 *
+                 *   vmovdqa64 -0x100(%rdx), %zmm5
+                 *   vpdpbusd  %zmm1, %zmm0, %zmm2
+                 *   vmovdqa64 %zmm2, -0x1c0(%rdx)
+                 *
+                 * eight accumulators living in stack slots sixty-four bytes
+                 * apart, loaded and stored around every dpbusd. That is the
+                 * eightfold gap between the kernel and the dpbusd ceiling, not
+                 * bandwidth and not arithmetic.
+                 *
+                 * Two passes halve the live accumulators to eight, and the
+                 * second pass re-reads qs from L1 rather than memory. */
+                __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+                __m512i a4 = a0, a5 = a0, a6 = a0, a7 = a0;
                 for (int c = 0; c < 8; c++) {
                     const __m512i raw = _mm512_loadu_si512(
                             (const void *)(xp->qs + ((jp * 8 + c) * 64)));
                     const __m512i ql = _mm512_and_si512(raw, m0F);
-                    const __m512i qh = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F);
-#define Q4K8_TK(k) do {                                                    \
+#define Q4K8L(k) do {                                                      \
                     const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
-                    (void)_y;                                               \
+                    a##k = _mm512_dpbusd_epi32(a##k, ql, _mm512_set1_epi32( \
+                            *(const int32_t *)(_y->qs + jlo * 32 + c * 4))); \
                 } while (0)
-#define Q4K8_TK_REAL(k) do {                                               \
-                    const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
-                    const int32_t _al = *(const int32_t *)                  \
-                            (_y->qs + jlo * 32 + c * 4);                    \
-                    const int32_t _ah = *(const int32_t *)                  \
-                            (_y->qs + (jlo + 1) * 32 + c * 4);              \
-                    lo##k = _mm512_dpbusd_epi32(lo##k, ql,                  \
-                                                _mm512_set1_epi32(_al));    \
-                    hi##k = _mm512_dpbusd_epi32(hi##k, qh,                  \
-                                                _mm512_set1_epi32(_ah));    \
-                } while (0)
-#ifdef DS4_NOBCAST
-                    /* Probe: constant instead of the activation broadcast, to
-                     * measure what the sixteen per-chunk broadcasts cost. The
-                     * results are wrong by design; only the timing is read. */
-                    const __m512i _k0 = _mm512_set1_epi32(0x01010101);
-                    lo0 = _mm512_dpbusd_epi32(lo0, ql, _k0);
-                    hi0 = _mm512_dpbusd_epi32(hi0, qh, _k0);
-                    lo1 = _mm512_dpbusd_epi32(lo1, ql, _k0);
-                    hi1 = _mm512_dpbusd_epi32(hi1, qh, _k0);
-                    lo2 = _mm512_dpbusd_epi32(lo2, ql, _k0);
-                    hi2 = _mm512_dpbusd_epi32(hi2, qh, _k0);
-                    lo3 = _mm512_dpbusd_epi32(lo3, ql, _k0);
-                    hi3 = _mm512_dpbusd_epi32(hi3, qh, _k0);
-                    lo4 = _mm512_dpbusd_epi32(lo4, ql, _k0);
-                    hi4 = _mm512_dpbusd_epi32(hi4, qh, _k0);
-                    lo5 = _mm512_dpbusd_epi32(lo5, ql, _k0);
-                    hi5 = _mm512_dpbusd_epi32(hi5, qh, _k0);
-                    lo6 = _mm512_dpbusd_epi32(lo6, ql, _k0);
-                    hi6 = _mm512_dpbusd_epi32(hi6, qh, _k0);
-                    lo7 = _mm512_dpbusd_epi32(lo7, ql, _k0);
-                    hi7 = _mm512_dpbusd_epi32(hi7, qh, _k0);
-#else
-                    Q4K8_TK_REAL(0); Q4K8_TK_REAL(1);
-                    Q4K8_TK_REAL(2); Q4K8_TK_REAL(3);
-                    Q4K8_TK_REAL(4); Q4K8_TK_REAL(5);
-                    Q4K8_TK_REAL(6); Q4K8_TK_REAL(7);
-#endif
-#undef Q4K8_TK
-#undef Q4K8_TK_REAL
+                    Q4K8L(0); Q4K8L(1); Q4K8L(2); Q4K8L(3);
+                    Q4K8L(4); Q4K8L(5); Q4K8L(6); Q4K8L(7);
+#undef Q4K8L
                 }
                 const __m512 bl2 = _mm512_mul_ps(
                         _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
                                 _mm_loadu_si128((const __m128i *)xp->sc[jlo]))), dv);
+#define Q4K8LF(k) f##k = _mm512_fmadd_ps(                                  \
+                        _mm512_cvtepi32_ps(a##k),                          \
+                        _mm512_mul_ps(bl2, _mm512_set1_ps(                  \
+                                y[(uint64_t)(k) * ystride + b].d)), f##k)
+                Q4K8LF(0); Q4K8LF(1); Q4K8LF(2); Q4K8LF(3);
+                Q4K8LF(4); Q4K8LF(5); Q4K8LF(6); Q4K8LF(7);
+#undef Q4K8LF
+                /* second pass: the high nibbles, reusing the same eight slots */
+                a0 = a1 = a2 = a3 = a4 = a5 = a6 = a7 = _mm512_setzero_si512();
+                for (int c = 0; c < 8; c++) {
+                    const __m512i raw = _mm512_loadu_si512(
+                            (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                    const __m512i qh = _mm512_and_si512(
+                            _mm512_srli_epi16(raw, 4), m0F);
+#define Q4K8H(k) do {                                                      \
+                    const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
+                    a##k = _mm512_dpbusd_epi32(a##k, qh, _mm512_set1_epi32( \
+                            *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4))); \
+                } while (0)
+                    Q4K8H(0); Q4K8H(1); Q4K8H(2); Q4K8H(3);
+                    Q4K8H(4); Q4K8H(5); Q4K8H(6); Q4K8H(7);
+#undef Q4K8H
+                }
                 const __m512 bh2 = _mm512_mul_ps(
                         _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
                                 _mm_loadu_si128((const __m128i *)xp->sc[jlo + 1]))), dv);
-#define Q4K8_FL(k) do {                                                    \
-                    const __m512 _yd = _mm512_set1_ps(y[(uint64_t)(k) *     \
-                                                       ystride + b].d);    \
-                    __m512 _v = _mm512_mul_ps(_mm512_cvtepi32_ps(lo##k),    \
-                                              _mm512_mul_ps(bl2, _yd));    \
-                    _v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi##k),         \
-                                         _mm512_mul_ps(bh2, _yd), _v);     \
-                    f##k = _mm512_add_ps(f##k, _v);                        \
-                } while (0)
-                Q4K8_FL(0); Q4K8_FL(1); Q4K8_FL(2); Q4K8_FL(3);
-                Q4K8_FL(4); Q4K8_FL(5); Q4K8_FL(6); Q4K8_FL(7);
-#undef Q4K8_FL
+#define Q4K8HF(k) f##k = _mm512_fmadd_ps(                                  \
+                        _mm512_cvtepi32_ps(a##k),                          \
+                        _mm512_mul_ps(bh2, _mm512_set1_ps(                  \
+                                y[(uint64_t)(k) * ystride + b].d)), f##k)
+                Q4K8HF(0); Q4K8HF(1); Q4K8HF(2); Q4K8HF(3);
+                Q4K8HF(4); Q4K8HF(5); Q4K8HF(6); Q4K8HF(7);
+#undef Q4K8HF
             }
         }
     } else {

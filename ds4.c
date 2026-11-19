@@ -76488,7 +76488,7 @@ static void qwen35_cpu_matvec_batch(
             acc_tok_sum += n_tok;
             if (n_tok > acc_tok_max) acc_tok_max = n_tok;
             acc_tensors += w->bytes;
-            acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
+            acc_bytes += w->bytes;
             acc_q4 += w->bytes;
             free(xq);
             return;
@@ -76614,8 +76614,19 @@ static void qwen35_cpu_matvec_batch(
     acc_calls++;
     acc_tok_sum += n_tok;
     if (n_tok > acc_tok_max) acc_tok_max = n_tok;
-    acc_tensors += w->bytes;      /* one pass over the tensor, no multiplier */
-    acc_bytes += w->bytes * ((n_tok + 3u) / 4u);
+    acc_tensors += w->bytes;
+    /* One pass over the tensor, no token multiplier.
+     *
+     * This used to be bytes * ((n_tok + 3) / 4), on the assumption that the
+     * kernel walked the weights once per four tokens. The loop order was changed
+     * so that one worker holds a row group and runs every token group against it
+     * before moving on, which means the weights leave memory once per call no
+     * matter how many tokens it carries. The multiplier was inflating the
+     * reported DRAM traffic by n_tok/4 - twenty-nine fold at a hundred and
+     * seventeen tokens - and every bandwidth figure derived from it in this
+     * session was wrong in that direction. The true figure is six gigabytes per
+     * second, not fourteen. */
+    acc_bytes += w->bytes;
     if (w->type == DS4_TENSOR_Q6_K) acc_q6 += w->bytes;
     else acc_q4 += w->bytes;
     if (getenv("DS4_QWEN35_BYTE_DBG") && (acc_calls % 96u) == 0u)
@@ -76916,7 +76927,7 @@ static bool qwen35_cpu_matvec_multi(
               (double)(mm1.tv_nsec - mm0.tv_nsec) / 1e6;
     for (uint64_t i = 0; i < n; i++) {
         acc_tensors += ws[i]->bytes;
-        acc_bytes += ws[i]->bytes * ((n_tok + 3u) / 4u);
+        acc_bytes += ws[i]->bytes;
         acc_q4 += ws[i]->bytes;
     }
     acc_calls++;

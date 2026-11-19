@@ -224,3 +224,32 @@ tokens per CPU pass the arithmetic inverts:
     GPU head and draft        488 ms / 3 tokens  6.1 t/s
 
 which is why the two belong together and neither is worth doing alone.
+
+
+## Measured: the head and the draft together, and what is left
+
+The head is implemented, so the two halves can be put together with the CPU MTP
+that already exists, and the four combinations answer the question directly:
+
+    mtp=0 head=0   2.90 2.88 t/s    baseline
+    mtp=0 head=1   2.18 2.17        the head alone, paying cuInit
+    mtp=1 head=0   1.34 1.21        the draft alone, reading the head on CPU
+    mtp=1 head=1   2.04 2.11        both
+
+So the prediction holds in the direction it was made: the device head lifts the
+draft from 1.28 to 2.08, sixty-two percent, because the 3.4 GB read that made
+speculation unprofitable is exactly what it removes. It is still under the 2.89
+baseline, and the arithmetic says why.
+
+    2.08 t/s is 481 ms per accepted token. At two accepted per round that is a
+    962 ms round, against roughly 350 for one CPU pass, 11 for the device head,
+    and therefore about 600 ms for the nextn layer on the CPU.
+
+The nextn layer is the last large piece, and it costs about what a full forward
+costs. Moving it to the device is the remaining work, and unlike the head it is
+not a single matvec: it is a whole layer through the qwen35 GPU graph, which
+exists - ds4.c:64407 onwards has the qwen35 branches - but which the MTP path
+does not use.
+
+That is the next session's job, and it is a graph integration rather than a
+kernel.

@@ -76636,14 +76636,17 @@ static void qwen35_cpu_forward_batch(
                         qwen35_dbg_l2(blk + (uint64_t)t * E, E));
         }
     }
-    /* the output head per position. */
-    for (uint32_t t = 0; t < n_tok; t++) {
-        float *row = logits_all + (uint64_t)t * DS4_N_VOCAB;
+    /* the output head per position.
+     *
+     * This used to call the single-token matvec once per position, so the 3.4 GB
+     * head was walked n_tok times - sixty-four separate parallel regions and
+     * 218 GB of traffic for a sixty-four token prompt. Every position needs its
+     * own logits, but they all multiply the same head, so it is one batched
+     * matvec: normalise each position first, then read the head once. */
+    for (uint32_t t = 0; t < n_tok; t++)
         qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
                       qwen4_ref_f32(m, w->output_norm), E, eps);
-        qwen35_cpu_matvec(m, w->output, blk + (uint64_t)t * E, row,
-                          s->qwen35_cpu_q8, false);
-    }
+    qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts
      * for the following positions (each step is a cheap nextn-layer pass). */

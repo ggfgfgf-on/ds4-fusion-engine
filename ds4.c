@@ -76035,6 +76035,66 @@ static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
 static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
 
+/* Element-wise residual add, in parallel.
+ *
+ * for (i = 0; i < NT * E; i++) xb[i] += blk[i] runs two or three times per layer
+ * on the main thread while twenty-seven workers sit idle: 64 tokens times 5120
+ * is 327 thousand elements each time, 65 layers, so around 64 million additions
+ * per pass with nobody else helping. There is no dependence anywhere in it. */
+typedef struct {
+    float *dst, *src;
+    uint64_t n, chunk;
+} qwen35_add_work;
+
+static void qwen35_add_worker(void *vctx, uint64_t c0, uint64_t c1) {
+    qwen35_add_work *a = vctx;
+    uint64_t lo = c0 * a->chunk;
+    const uint64_t hi = (c1 * a->chunk < a->n) ? c1 * a->chunk : a->n;
+    for (uint64_t i = lo; i < hi; i++) a->dst[i] += a->src[i];
+}
+
+static void qwen35_add_par(float *dst, const float *src, uint64_t n) {
+    qwen35_add_work a;
+    a.dst = dst;
+    a.src = src;
+    a.n = n;
+    const uint64_t chunk = 4096u;
+    const uint64_t units = (n + chunk - 1u) / chunk;
+    if (units < 2u) {
+        for (uint64_t i = 0; i < n; i++) dst[i] += src[i];
+        return;
+    }
+    a.chunk = chunk;
+    ds4_parallel_for(units, qwen35_add_worker, &a);
+}
+
+/* Per-token RMS norm over a contiguous range of tokens. Same arithmetic as
+ * qwen4_ref_rms, called once per token, just no longer on one thread. */
+typedef struct {
+    float *out, *src;
+    const float *w;
+    uint64_t e, n_tok;
+    float eps;
+} qwen35_rms_work;
+
+static void qwen35_rms_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_rms_work *r = vctx;
+    for (uint64_t t = t0; t < t1; t++)
+        qwen4_ref_rms(r->out + t * r->e, r->src + t * r->e, r->w, r->e, r->eps);
+}
+
+static void qwen35_rms_par(float *out, const float *src, const float *w,
+                           uint64_t e, uint64_t n_tok, float eps) {
+    if (n_tok < 4u) {
+        for (uint64_t t = 0; t < n_tok; t++)
+            qwen4_ref_rms(out + t * e, src + t * e, w, e, eps);
+        return;
+    }
+    qwen35_rms_work r;
+    r.out = out; r.src = src; r.w = w; r.e = e; r.n_tok = n_tok; r.eps = eps;
+    ds4_parallel_for(n_tok, qwen35_rms_worker, &r);
+}
+
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
@@ -76565,9 +76625,7 @@ static void qwen35_cpu_forward_batch(
 
     for (uint32_t il = 0; il < n_trunk; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        for (uint32_t t = 0; t < n_tok; t++)
-            qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
-                          qwen4_ref_f32(m, l->attn_norm), E, eps);
+        qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->attn_norm), E, n_tok, eps);
         if (getenv("DS4_QWEN35_BDBG") && il < 3) {
             for (uint32_t t = 0; t < n_tok; t++) {
                 double s = 0.0, sx = 0.0;
@@ -76662,7 +76720,7 @@ static void qwen35_cpu_forward_batch(
                             qwen35_dbg_l2(blk + (uint64_t)t * E, E),
                             (double)tmp[(uint64_t)t * C]);
             }
-            for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+            qwen35_add_par(xb, blk, NT * E);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
                 for (uint32_t t = 0; t < n_tok; t++)
                     fprintf(stderr, "[gdnb] t=%u POST-resid xb_l2=%.6f xb0=%.6f\n",
@@ -76699,12 +76757,10 @@ static void qwen35_cpu_forward_batch(
             attn_ms += (double)(at1.tv_sec - at0.tv_sec) * 1e3 +
                        (double)(at1.tv_nsec - at0.tv_nsec) / 1e6;
             qwen35_cpu_matvec_batch(m, l->attn_output, attn_o, blk, NT, false);
-            for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
+            qwen35_add_par(xb, blk, NT * E);
         }
         /* the dense FFN: the batched post norm, gate/up/down. */
-        for (uint32_t t = 0; t < n_tok; t++)
-            qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
-                          qwen4_ref_f32(m, l->post_attn_norm), E, eps);
+        qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->post_attn_norm), E, n_tok, eps);
         const int ffn_dbg = getenv("DS4_QWEN35_GDN_DBG") != NULL && il == 0;
 #define FFN_CHK(tag) do { if (ffn_dbg) { \
             fprintf(stderr, "[ffn] " tag " xb_l2=%.6f blk_l2=%.6f fa=%.6f fb=%.6f\n", \
@@ -76749,9 +76805,7 @@ static void qwen35_cpu_forward_batch(
      * 218 GB of traffic for a sixty-four token prompt. Every position needs its
      * own logits, but they all multiply the same head, so it is one batched
      * matvec: normalise each position first, then read the head once. */
-    for (uint32_t t = 0; t < n_tok; t++)
-        qwen4_ref_rms(blk + (uint64_t)t * E, xb + (uint64_t)t * E,
-                      qwen4_ref_f32(m, w->output_norm), E, eps);
+    qwen35_rms_par(blk, xb, qwen4_ref_f32(m, w->output_norm), E, n_tok, eps);
     qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts

@@ -2478,6 +2478,12 @@ static struct {
     double dispatch_ms;
     double dispatch_max_ms;
     uint64_t dispatch_n;
+    /* Time spent blocked acquiring the pool mutex on the wake path. Every
+     * worker takes it on every region even on the spin fast path, so this is
+     * twenty-eight contended acquisitions per region. */
+    double lock_ms;
+    double lock_max_ms;
+    uint64_t lock_n;
 } g_pf;
 
 static void *ds4_worker_main(void *arg) {
@@ -2499,7 +2505,13 @@ static void *ds4_worker_main(void *arg) {
             DS4_CPU_PAUSE();
         }
 
+        const double t_lock0 = now_sec();
         pthread_mutex_lock(&g_pool.mutex);
+        const double t_locked = now_sec();
+        g_pf.lock_ms += (t_locked - t_lock0) * 1e3;
+        g_pf.lock_n++;
+        if ((t_locked - t_lock0) * 1e3 > g_pf.lock_max_ms)
+            g_pf.lock_max_ms = (t_locked - t_lock0) * 1e3;
         while (seen_generation == g_pool.generation && !g_pool.shutdown) {
             pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
         }
@@ -77359,6 +77371,15 @@ static void qwen35_cpu_forward_batch(
                     100.0 * g_pf.dispatch_ms / (g_pf.work_ms > 0.0 ? g_pf.work_ms : 1.0),
                     g_pf.work_ms);
         g_pf.work_ms = 0.0; g_pf.work_calls = 0; g_pf.empty_calls = 0;
+        if (getenv("DS4_PF_STATS"))
+            fprintf(stderr, "[pool] mutex block total=%.0f ms over %llu takes  "
+                    "avg=%.2f us  worst=%.0f us  (%.1f%% of the %.0f ms in regions)\n",
+                    g_pf.lock_ms, (unsigned long long)g_pf.lock_n,
+                    g_pf.lock_n ? g_pf.lock_ms / (double)g_pf.lock_n * 1e3 : 0.0,
+                    g_pf.lock_max_ms * 1e3,
+                    100.0 * g_pf.lock_ms / (g_pf.work_ms > 0.0 ? g_pf.work_ms : 1.0),
+                    g_pf.work_ms);
+        g_pf.lock_ms = 0.0; g_pf.lock_max_ms = 0.0; g_pf.lock_n = 0;
         g_pf.dispatch_ms = 0.0; g_pf.dispatch_max_ms = 0.0; g_pf.dispatch_n = 0;
     }
 }

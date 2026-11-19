@@ -74679,7 +74679,9 @@ static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
      * it is correct and because the reasoning that produced it - 54 KB of
      * activations against a 48 KB L1, and weight prefetching changing nothing -
      * is worth a reader having. DS4_QWEN35_TRANS turns it on. */
-    if (c->n_tok == 8u && getenv("DS4_QWEN35_TRANS") != NULL) {
+    static int want_trans = -1;
+    if (want_trans < 0) want_trans = getenv("DS4_QWEN35_TRANS") != NULL;
+    if (c->n_tok == 8u && want_trans) {
         xt = xmalloc((size_t)c->blocks * 4u * 8u * 16u * sizeof(int32_t));
         if (xt) qwen35_xq8_transpose(c->xq, c->blocks, c->blocks, xt);
     }

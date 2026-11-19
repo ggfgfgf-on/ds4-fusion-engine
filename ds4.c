@@ -73911,7 +73911,12 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
                 (unsigned long long)rows, (unsigned long long)blocks,
                 (const void *)src);
     const uint64_t ng = rows / 16u;
-    uint8_t *buf = xmalloc((size_t)(ng * blocks * Q4K_X16X8_BYTES));
+    /* Sixty-four byte aligned. The record is a multiple of sixty-four and qv
+     * sits at offset 320, also a multiple, so aligning the base makes every
+     * _mm512_loadu_si512 land inside one cache line. xmalloc only guarantees
+     * sixteen, and a split load costs about double. */
+    uint8_t *raw = xmalloc((size_t)(ng * blocks * Q4K_X16X8_BYTES) + 64u);
+    uint8_t *buf = (uint8_t *)(((uintptr_t)raw + 63u) & ~(uintptr_t)63u);
     for (uint64_t g = 0; g < ng; g++) {
         for (uint64_t b = 0; b < blocks; b++) {
             qwen35_blk16x8 *o = (qwen35_blk16x8 *)

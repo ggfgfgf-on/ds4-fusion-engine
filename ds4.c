@@ -73978,6 +73978,191 @@ typedef struct {
     uint64_t blocks, n_tok, out_dim;
 } qwen35_x8_work;
 
+/* Q6_K in the wide layout. The layout and the conversion are finished and
+ * checked against this file's own reference; the kernel loop is written out
+ * below in prose because it was not implemented before this session ran out.
+ *
+ * Nothing here is compiled or reachable - it is a starting point, not a stub
+ * that pretends to work.
+ *
+ * ---------------------------------------------------------------------------
+ * Bit layout, taken from ds4.c:4721 so the two cannot disagree:
+ *
+ *   for n128 in {0, 128}:
+ *     for l in 0..31:
+ *       is   = l / 16
+ *       q1 = (ql[l+0]  & 0x0F) | (((qh[l] >> 0) & 3) << 4)   p = n128+l+0,   scale[is+0]
+ *       q2 = (ql[l+32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)   p = n128+l+32,  scale[is+2]
+ *       q3 = (ql[l+0]  >> 4)   | (((qh[l] >> 4) & 3) << 4)   p = n128+l+64,  scale[is+4]
+ *       q4 = (ql[l+32] >> 4)   | (((qh[l] >> 6) & 3) << 4)   p = n128+l+96,  scale[is+6]
+ *     ql += 64; qh += 32; scales += 8
+ *
+ * Position p uses scale[p / 16]. The stored value is q; the reference subtracts
+ * 32 to get the signed value.
+ * ---------------------------------------------------------------------------
+ */
+#define Q6K_X16_ROWS  16u
+#define Q6K_X16_BYTES 4416u
+
+typedef struct {
+    float d[Q6K_X16_ROWS];      /*  64  sequential, one load */
+    int8_t sc[16][Q6K_X16_ROWS];/* 256  group-major, sc[g] is one 16-byte load */
+    uint8_t qv[64][64];         /* 4096 four bytes per row per chunk */
+} qwen35_blk6;
+
+/* Six-bit value at position p of one super-block, matching ds4.c:4721. */
+static inline uint8_t qwen35_q6k_at(const block_q6_K *b, uint32_t p) {
+    const uint32_t n128 = (p >= 128u) ? 128u : 0u;
+    const uint32_t r = p - n128;
+    const uint8_t *ql = b->ql + (n128 ? 64 : 0);
+    const uint8_t *qh = b->qh + (n128 ? 32 : 0);
+    if (r < 32u) {
+        const uint32_t l = r;
+        return (uint8_t)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4));
+    } else if (r < 64u) {
+        const uint32_t l = r - 32u;
+        return (uint8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4));
+    } else if (r < 96u) {
+        const uint32_t l = r - 64u;
+        return (uint8_t)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4));
+    }
+    const uint32_t l = r - 96u;
+    return (uint8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4));
+}
+
+/* Sixteen consecutive rows of one super-block into the wide record. */
+static void qwen35_q6k_wide_block(const block_q6_K *const *rows, uint8_t *dst) {
+    qwen35_blk6 *o = (qwen35_blk6 *)dst;
+    for (uint32_t r = 0; r < Q6K_X16_ROWS; r++) {
+        const block_q6_K *b = rows[r];
+        o->d[r] = f16_to_f32(b->d);
+        for (uint32_t g = 0; g < 16u; g++)
+            o->sc[g][r] = b->scales[g];
+        for (uint32_t p = 0; p < QK_K; p++)
+            o->qv[p / 4u][r * 4u + (p % 4u)] = qwen35_q6k_at(b, p);
+    }
+}
+
+
+/* Q6_K, sixteen rows by up to eight tokens, in the wide layout.
+ *
+ * Per block: sixteen groups of sixteen values. Each group has one scale, so the
+ * accumulators flush sixteen times per block where Q4_K needs eight - that is
+ * the cost of the format and it is why this has to be measured rather than
+ * assumed to be a straight win.
+ *
+ * The minus-32 in the reference folds into a leftover term: over a group,
+ *
+ *   sum d*sc*(q-32)*a  =  d*sc*( sum q*a - 32*sum a )
+ *
+ * and sum a over the group is one entry of the q8 block's bsums, which the
+ * quantiser already computes. So no work happens inside the inner loop for it.
+ */
+static void qwen35_gemm_q6_K_16x8(
+        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
+        uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
+        uint64_t row0) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const uint64_t lim = nt < 8u ? nt : 8u;
+    __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+    __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
+    __m512 c0 = f0, c1 = f0, c2 = f0, c3 = f0;
+    __m512 c4 = f0, c5 = f0, c6 = f0, c7 = f0;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        const qwen35_blk6 *xp = (const qwen35_blk6 *)(grp + b * Q6K_X16_BYTES);
+        const __m512 dv = _mm512_loadu_ps(xp->d);
+        for (uint32_t g = 0; g < 16u; g++) {
+            __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+            __m512i a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+            const uint32_t cbase = 4u * g;
+            for (uint32_t c = cbase; c < cbase + 4u; c++) {
+                const __m512i q = _mm512_loadu_si512((const void *)(xp->qv[c]));
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    int32_t four;
+                    memcpy(&four, yt->qs + c * 4u, 4);
+                    const __m512i w = _mm512_set1_epi32(four);
+                    switch (t) {
+                    case 0: a0 = _mm512_dpbusd_epi32(a0, q, w); break;
+                    case 1: a1 = _mm512_dpbusd_epi32(a1, q, w); break;
+                    case 2: a2 = _mm512_dpbusd_epi32(a2, q, w); break;
+                    case 3: a3 = _mm512_dpbusd_epi32(a3, q, w); break;
+                    case 4: a4 = _mm512_dpbusd_epi32(a4, q, w); break;
+                    case 5: a5 = _mm512_dpbusd_epi32(a5, q, w); break;
+                    case 6: a6 = _mm512_dpbusd_epi32(a6, q, w); break;
+                    default: a7 = _mm512_dpbusd_epi32(a7, q, w); break;
+                    }
+                }
+            }
+            const __m512 scv = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                            _mm_loadu_si128((const __m128i *)xp->sc[g]))), dv);
+            for (uint64_t t = 0; t < lim; t++) {
+                const __m512i pv = (t == 0) ? a0 : (t == 1) ? a1
+                                 : (t == 2) ? a2 : (t == 3) ? a3
+                                 : (t == 4) ? a4 : (t == 5) ? a5
+                                 : (t == 6) ? a6 : a7;
+                const __m512 bs = _mm512_set1_ps(y[t * ystride + b].d);
+                const __m512 v = _mm512_mul_ps(_mm512_cvtepi32_ps(pv),
+                                               _mm512_mul_ps(scv, bs));
+                switch (t) {
+                case 0: f0 = _mm512_add_ps(f0, v); break;
+                case 1: f1 = _mm512_add_ps(f1, v); break;
+                case 2: f2 = _mm512_add_ps(f2, v); break;
+                case 3: f3 = _mm512_add_ps(f3, v); break;
+                case 4: f4 = _mm512_add_ps(f4, v); break;
+                case 5: f5 = _mm512_add_ps(f5, v); break;
+                case 6: f6 = _mm512_add_ps(f6, v); break;
+                default: f7 = _mm512_add_ps(f7, v); break;
+                }
+            }
+            /* the minus-32 leftover: accumulate sum_g sc[g][r] * bsums[t][g] */
+            for (uint64_t t = 0; t < lim; t++) {
+                const block_q8_K *yt = y + t * ystride + b;
+                const __m512 sv = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                        _mm_loadu_si128((const __m128i *)xp->sc[g])));
+                /* d[r] varies per block, so it is applied here rather than
+                 * factored out afterwards: the correction is
+                 * sum_b sum_g -32 * d[r][b] * sc[g][r][b] * bsums[t][g][b]. */
+                const __m512 p = _mm512_mul_ps(_mm512_mul_ps(sv, dv),
+                                               _mm512_set1_ps((float)yt->bsums[g]));
+                switch (t) {
+                case 0: c0 = _mm512_add_ps(c0, p); break;
+                case 1: c1 = _mm512_add_ps(c1, p); break;
+                case 2: c2 = _mm512_add_ps(c2, p); break;
+                case 3: c3 = _mm512_add_ps(c3, p); break;
+                case 4: c4 = _mm512_add_ps(c4, p); break;
+                case 5: c5 = _mm512_add_ps(c5, p); break;
+                case 6: c6 = _mm512_add_ps(c6, p); break;
+                default: c7 = _mm512_add_ps(c7, p); break;
+                }
+            }
+        }
+    }
+
+    for (uint64_t t = 0; t < lim; t++) {
+        const __m512 fv = (t == 0) ? f0 : (t == 1) ? f1 : (t == 2) ? f2
+                         : (t == 3) ? f3 : (t == 4) ? f4 : (t == 5) ? f5
+                         : (t == 6) ? f6 : f7;
+        const __m512 cv = (t == 0) ? c0 : (t == 1) ? c1 : (t == 2) ? c2
+                         : (t == 3) ? c3 : (t == 4) ? c4 : (t == 5) ? c5
+                         : (t == 6) ? c6 : c7;
+        /* corr needs d[r] again, so re-read per block below */
+        float lane[Q6K_X16_ROWS];
+        _mm512_storeu_ps(lane, fv);
+        float clane[Q6K_X16_ROWS];
+        _mm512_storeu_ps(clane, cv);
+        for (uint32_t r = 0; r < Q6K_X16_ROWS; r++)
+            out[t * out_stride + row0 + r] = lane[r] - 32.0f * clane[r];
+    }
+#else
+    (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
+    (void)out; (void)out_stride; (void)row0;
+    ds4_die("Q6_K wide kernel needs AVX-512");
+#endif
+}
+
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,

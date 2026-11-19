@@ -75997,6 +75997,111 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
+/* Several batched matvecs over one shared activation, in one parallel region.
+ *
+ * The forward pass calls the batched matvec ten times per layer, each one its
+ * own barrier: qwen35_cpu_matvec_batch ends in ds4_parallel_for, so every call
+ * costs a dispatch and a join. Three of those groups are adjacent and share the
+ * same input vector, which means the quantised activation and the entire
+ * parallel region can be shared:
+ *
+ *   lin_qkv + lin_gate          both from blk
+ *   attn_q + attn_k + attn_v    both from blk
+ *   ffn_gate + ffn_up           both from blk
+ *
+ * That turns ten barriers per layer into seven, and lets one region carry two or
+ * three tensors' worth of work, which is the thing the sampling profiler asked
+ * for: 29.7 percent of samples were workers idle between regions, and the matvec
+ * kernel itself was only 3.4.
+ *
+ * A job is (tensor, output). Chunks are the unit handed out, and each chunk
+ * resolves to (job, group) by walking the per-job group counts - three jobs at
+ * most, so the walk is a couple of compares.
+ */
+typedef struct {
+    const ds4_tensor *w;
+    float *out;
+    uint64_t rows, blocks, groups;
+} qwen35_mv_job;
+
+typedef struct {
+    const ds4_model *m;
+    qwen35_mv_job jobs[4];
+    uint64_t njobs;
+    uint64_t total;
+    block_q8_K *xq;
+    uint64_t n_tok;
+    uint64_t *tq_pad;
+} qwen35_mv_multi_ctx;
+
+static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
+    qwen35_mv_multi_ctx *c = vctx;
+    for (uint64_t idx = c0; idx < c1; idx++) {
+        uint64_t j = 0, k = idx;
+        while (j + 1u < c->njobs && k >= c->jobs[j].groups) {
+            k -= c->jobs[j].groups;
+            j++;
+        }
+        const qwen35_mv_job *jb = &c->jobs[j];
+        const uint8_t *tb = (const uint8_t *)tensor_data(c->m, jb->w);
+        const uint8_t *xb = qwen35_x8_get(tb);
+        if (!xb) continue;
+        for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+            uint64_t nt8 = c->n_tok - tt;
+            if (nt8 > 8u) nt8 = 8u;
+            qwen35_gemm_q4_K_16x8(
+                    xb + k * jb->blocks * Q4K_X16X8_BYTES, jb->blocks,
+                    c->xq + tt * jb->blocks, jb->blocks, nt8,
+                    jb->out + tt * jb->rows, jb->rows, k * 16u);
+        }
+    }
+}
+
+/* Every job must be Q4_K, have a wide buffer, and share the same in_dim and
+ * n_tok, which the call sites guarantee by construction. Returns false if any
+ * job does not qualify, and then the caller falls back to the single-tensor
+ * path - no partial work is done, so nothing is written twice. */
+static bool qwen35_cpu_matvec_multi(
+        const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
+        uint64_t n, const float *x, uint64_t n_tok) {
+    if (n == 0 || n > 4u) return false;
+    qwen35_mv_multi_ctx c;
+    memset(&c, 0, sizeof c);
+    c.m = m;
+    c.n_tok = n_tok;
+    uint64_t blocks = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const ds4_tensor *w = ws[i];
+        if (!w || w->type != DS4_TENSOR_Q4_K) return false;
+        if (w->ndim < 2 || w->dim[0] % QK_K != 0) return false;
+        const uint64_t rows = w->dim[1];
+        const uint64_t bl = w->dim[0] / QK_K;
+        if (rows < 16u || (rows % 16u) != 0u) return false;
+        if (i == 0) blocks = bl;
+        else if (bl != blocks) return false;
+        const uint8_t *tb = (const uint8_t *)tensor_data(m, w);
+        if (!qwen35_x8_get(tb)) return false;
+        c.jobs[i].w = w;
+        c.jobs[i].out = outs[i];
+        c.jobs[i].rows = rows;
+        c.jobs[i].blocks = bl;
+        c.jobs[i].groups = rows / 16u;
+        c.total += c.jobs[i].groups;
+    }
+    c.njobs = n;
+    const uint64_t tq_pad = (n_tok + 7u) & ~(uint64_t)7u;
+    c.xq = xmalloc((size_t)(tq_pad * blocks) * sizeof(block_q8_K));
+    for (uint64_t t = 0; t < n_tok; t++)
+        ds4_quantize_row_q8_K(x + t * (uint64_t)blocks * QK_K,
+                              c.xq + t * blocks, (int64_t)(blocks * QK_K));
+    if (tq_pad > n_tok)
+        memset(c.xq + n_tok * blocks, 0,
+               (size_t)((tq_pad - n_tok) * blocks) * sizeof(block_q8_K));
+    ds4_parallel_for(c.total, qwen35_mv_multi_worker, &c);
+    free(c.xq);
+    return true;
+}
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -76064,8 +76169,14 @@ static void qwen35_cpu_forward_batch(
             /* GDN: the batched qkv/gate projections, then the shared
              * per-token block so this path cannot drift from the reference. */
             const bool gdn_exact = getenv("DS4_QWEN35_GDN_F32") != NULL;
-            qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
-            qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
+            {
+                const ds4_tensor *ws[2] = { l->lin_qkv, l->lin_gate };
+                float *os[2] = { qkv, z };
+                if (!qwen35_cpu_matvec_multi(m, ws, os, 2, blk, NT)) {
+                    qwen35_cpu_matvec_batch(m, l->lin_qkv, blk, qkv, NT, gdn_exact);
+                    qwen35_cpu_matvec_batch(m, l->lin_gate, blk, z, NT, gdn_exact);
+                }
+            }
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0)
                 fprintf(stderr, "[gateb] dim0=%llu dim1=%llu z[6142]=%.6f z[6143]=%.6f\n",
                         (unsigned long long)l->lin_gate->dim[0],
@@ -76144,9 +76255,15 @@ static void qwen35_cpu_forward_batch(
             }
         } else {
             /* full attention: the batched q|gate, k, v projections. */
-            qwen35_cpu_matvec_batch(m, l->attn_q, blk, qkv, NT, false);
-            qwen35_cpu_matvec_batch(m, l->attn_k, blk, k2, NT, false);
-            qwen35_cpu_matvec_batch(m, l->attn_v, blk, v2, NT, false);
+            {
+                const ds4_tensor *ws[3] = { l->attn_q, l->attn_k, l->attn_v };
+                float *os[3] = { qkv, k2, v2 };
+                if (!qwen35_cpu_matvec_multi(m, ws, os, 3, blk, NT)) {
+                    qwen35_cpu_matvec_batch(m, l->attn_q, blk, qkv, NT, false);
+                    qwen35_cpu_matvec_batch(m, l->attn_k, blk, k2, NT, false);
+                    qwen35_cpu_matvec_batch(m, l->attn_v, blk, v2, NT, false);
+                }
+            }
             const float *qnorm = qwen4_ref_f32(m, l->attn_q_norm);
             const float *knorm = qwen4_ref_f32(m, l->attn_k_norm);
             float *kv = s->qwen35_cpu_kv[il];
@@ -76181,9 +76298,15 @@ static void qwen35_cpu_forward_batch(
         } } while (0)
         FFN_CHK("post-norm");
         const bool ffn_exact = getenv("DS4_QWEN35_FFN_EXACT") != NULL;
-        qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, ffn_exact);
+        {
+            const ds4_tensor *ws[2] = { l->ffn_gate, l->ffn_up };
+            float *os[2] = { ff_a, ff_b };
+            if (!qwen35_cpu_matvec_multi(m, ws, os, 2, blk, NT)) {
+                qwen35_cpu_matvec_batch(m, l->ffn_gate, blk, ff_a, NT, ffn_exact);
+                qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, ffn_exact);
+            }
+        }
         FFN_CHK("gate");
-        qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, ffn_exact);
         FFN_CHK("up");
         /* This ran on the main thread: NT * FF expf calls per layer, which is
          * about 380k of them, times 65 layers. expf costs twenty-odd cycles, so

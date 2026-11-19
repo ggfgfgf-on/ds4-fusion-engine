@@ -253,3 +253,39 @@ does not use.
 
 That is the next session's job, and it is a graph integration rather than a
 kernel.
+
+
+## Measured across six configurations: speculation does not pay on this machine
+
+The chain length is now configurable, DS4_QWEN35_MTP_CHAIN, so the draft cost can
+be traded against acceptance instead of assumed. Six runs, two head settings by
+three chain lengths, against a 2.71 baseline with MTP off:
+
+    gpuhead=0 chain=0   2.48 2.48
+    gpuhead=0 chain=1   2.30 2.20
+    gpuhead=0 chain=2   1.21 1.63
+    gpuhead=1 chain=0   2.03 2.03
+    gpuhead=1 chain=1   2.00 1.92
+    gpuhead=1 chain=2   2.08 2.08
+
+Nothing beats the baseline.
+
+Shorter chains are better, which is the opposite of what speculation wants: each
+chain step is a whole nextn layer plus a head pass, and the verify gate at
+ds4.c:98249 requires the first draft to match the target exactly before any of
+the chain is used at all, so most steps are paid for and thrown away.
+
+The device head behaves exactly as its measurements predict and no better. It
+loses at chain 0 and 1, where one or two head passes at 68 ms saved cannot cover
+the 124 ms cuInit costs, and only shows a gain at chain 2, where three passes
+saved finally exceed it - but by then the configuration is already worse than
+doing nothing.
+
+The arithmetic that closes it: verification is one full forward, 345 ms whether
+it checks one token or three, so the break-even draft budget is 345*(A-1) for an
+acceptance rate A. At A of 1.5 that is 173 ms, at 2.0 it is 345 ms, and the draft
+costs 80 to 180 ms per step with no acceptance above 1.5 observed. Speculation
+needs the draft to be nearly free, and on a CPU where one forward is 345 ms, no
+draft model that shares these weights is.
+
+This is a property of the machine and the workload, not of the implementation.

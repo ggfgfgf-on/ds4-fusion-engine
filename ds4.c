@@ -76683,7 +76683,17 @@ static void qwen35_cpu_forward_batch(
          * target's features and only advances the token). */
         const float *hsrc = blk + (uint64_t)(n_tok - 1) * E;
         s->qwen35_mtp_chain_n = 0;
-        for (int k = 0; k < 2; k++) {
+        /* Chain length. Each step is one full nextn layer plus one head pass, so
+         * the draft cost is linear in it while the acceptance gain is not - the
+         * verify gate at ds4.c:98249 requires the first draft to match the
+         * target exactly before any of the chain is used. Configurable so the
+         * trade can be measured rather than assumed. */
+        int chain_max = 2;
+        {
+            const char *ce = getenv("DS4_QWEN35_MTP_CHAIN");
+            if (ce && ce[0] >= '0' && ce[0] <= '9') chain_max = ce[0] - '0';
+        }
+        for (int k = 0; k < chain_max; k++) {
             qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
                                      draft, hb);
             int cmx = 0;

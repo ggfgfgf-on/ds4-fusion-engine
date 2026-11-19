@@ -74421,6 +74421,8 @@ static void qwen35_gemm_q4_K_16x8_t(
 #endif
 }
 
+static int g_nibs1 = -1;   /* DS4_QWEN35_NIBS=1 selects the one-pass form */
+
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -74428,6 +74430,15 @@ static void qwen35_gemm_q4_K_16x8(
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
     const uint64_t lim = nt < 8u ? nt : 8u;
+    if (g_nibs1 < 0) {
+        /* One pass is the default. The two-pass split was added here on the
+         * theory that sixteen live accumulators were spilling; the disassembly
+         * later showed the hot loop had no spills, and five interleaved pairs
+         * showed the split costs 1.4 percent - 45.89 against 45.29, ranges
+         * disjoint. Found by bench/autotune.py, which is the point of it. */
+        const char *e = getenv("DS4_QWEN35_NIBS");
+        g_nibs1 = (e && e[0] == '2') ? 0 : 1;
+    }
     __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
     __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
 
@@ -74447,6 +74458,57 @@ static void qwen35_gemm_q4_K_16x8(
             const __m512 dv = _mm512_loadu_ps(xp->d);
             for (int jp = 0; jp < 4; jp++) {
                 const int jlo = 2 * jp;
+                /* DS4_QWEN35_NIBS=1 runs both nibble groups in one pass, which
+                 * is what the kernel did originally and needs sixteen live
+                 * accumulators; =2 (the default) splits them into two passes of
+                 * eight. Kept as a switch because the choice is a register
+                 * pressure trade that differs by machine - on AVX2 with sixteen
+                 * ymm registers only the two-pass form fits at all - and because
+                 * it is the one layout knob that can be swept at runtime. */
+                if (g_nibs1) {
+                    __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0;
+                    __m512i lo3 = lo0, lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
+                    __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
+                    __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+                    for (int c = 0; c < 8; c++) {
+                        const __m512i raw = _mm512_loadu_si512(
+                                (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                        const __m512i ql = _mm512_and_si512(raw, m0F);
+                        const __m512i qh = _mm512_and_si512(
+                                _mm512_srli_epi16(raw, 4), m0F);
+#define Q4K8N(k) do {                                                      \
+                        const block_q8_K *_y =                             \
+                                y + (uint64_t)(k) * ystride + b;           \
+                        lo##k = _mm512_dpbusd_epi32(lo##k, ql,             \
+                                _mm512_set1_epi32(                         \
+                                    *(const int32_t *)(_y->qs + jlo * 32 + c * 4))); \
+                        hi##k = _mm512_dpbusd_epi32(hi##k, qh,             \
+                                _mm512_set1_epi32(                         \
+                                    *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4))); \
+                    } while (0)
+                        Q4K8N(0); Q4K8N(1); Q4K8N(2); Q4K8N(3);
+                        Q4K8N(4); Q4K8N(5); Q4K8N(6); Q4K8N(7);
+#undef Q4K8N
+                    }
+                    const __m512 bl2 = _mm512_mul_ps(
+                            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                    _mm_loadu_si128((const __m128i *)xp->sc[jlo]))), dv);
+                    const __m512 bh2 = _mm512_mul_ps(
+                            _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                    _mm_loadu_si128((const __m128i *)xp->sc[jlo + 1]))), dv);
+#define Q4K8NF(k) do {                                                    \
+                        const __m512 _yd = _mm512_set1_ps(                \
+                                y[(uint64_t)(k) * ystride + b].d);        \
+                        f##k = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lo##k), \
+                                _mm512_mul_ps(bl2, _yd), f##k);           \
+                        f##k = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi##k), \
+                                _mm512_mul_ps(bh2, _yd), f##k);           \
+                    } while (0)
+                    Q4K8NF(0); Q4K8NF(1); Q4K8NF(2); Q4K8NF(3);
+                    Q4K8NF(4); Q4K8NF(5); Q4K8NF(6); Q4K8NF(7);
+#undef Q4K8NF
+                    continue;
+                }
                 /* The two nibble groups of a sub-block are done in two passes
                  * over the chunks instead of one.
                  *

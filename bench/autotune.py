@@ -57,8 +57,9 @@ PROMPT = (
 # if the knob is unset, and it is also what was chosen by hand.
 KNOBS = {
     "DS4_QWEN35_TGS":     ["8", "4"],
+    "DS4_QWEN35_NIBS":    ["1", "2"],
     "DS4_THREADS":        ["28", "24", "32"],
-    "DS4_POOL_MIN_ROWS":  ["64", "32", "96"],
+    "DS4_POOL_MIN_ROWS":  ["32", "64"],
     "DS4_PREFILL_BATCH":  ["64", "32"],
 }
 

@@ -74163,6 +74163,70 @@ static void qwen35_gemm_q6_K_16x8(
 #endif
 }
 
+
+/* Q6_K wide buffers, in a table of their own for the same reason the Q4_K ones
+ * have one: the state registry hashes the same keys. */
+static const uint8_t *g_q6_key[QWEN35_X8_SLOTS];
+static uint8_t *g_q6_buf[QWEN35_X8_SLOTS];
+
+static uint8_t *qwen35_q6k_get(const uint8_t *d) {
+    const uint32_t h = qwen35_x8_hash(d);
+    for (uint32_t i = 0; i < QWEN35_X8_SLOTS; i++) {
+        const uint32_t s = (h + i) & (QWEN35_X8_SLOTS - 1u);
+        if (!g_q6_key[s]) return NULL;
+        if (g_q6_key[s] == d) return g_q6_buf[s];
+    }
+    return NULL;
+}
+
+static void qwen35_q6k_put(const uint8_t *d, uint8_t *v) {
+    const uint32_t h = qwen35_x8_hash(d);
+    for (uint32_t i = 0; i < QWEN35_X8_SLOTS; i++) {
+        const uint32_t s = (h + i) & (QWEN35_X8_SLOTS - 1u);
+        if (!g_q6_key[s] || g_q6_key[s] == d) { g_q6_key[s] = d; g_q6_buf[s] = v; return; }
+    }
+}
+
+static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w) {
+    if (!w || w->type != DS4_TENSOR_Q6_K) return NULL;
+    if (w->ndim < 2 || w->dim[0] % QK_K != 0) return NULL;
+    const uint64_t rows = w->dim[1];
+    const uint64_t blocks = w->dim[0] / QK_K;
+    const uint64_t row_bytes = blocks * (uint64_t)sizeof(block_q6_K);
+    if (rows < 16u || (rows % 16u) != 0u) return NULL;
+    const uint8_t *src = (const uint8_t *)tensor_data(m, w);
+    if (!src) return NULL;
+    const uint64_t ng = rows / 16u;
+    uint8_t *buf = xmalloc((size_t)(ng * blocks * Q6K_X16_BYTES));
+    const block_q6_K *rows16[Q6K_X16_ROWS];
+    for (uint64_t g = 0; g < ng; g++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            for (uint32_t r = 0; r < Q6K_X16_ROWS; r++)
+                rows16[r] = (const block_q6_K *)
+                        (src + (g * 16u + r) * row_bytes) + b;
+            qwen35_q6k_wide_block(rows16,
+                    buf + (g * blocks + b) * Q6K_X16_BYTES);
+        }
+    }
+    qwen35_q6k_put(src, buf);
+    return buf;
+}
+
+typedef struct {
+    const uint8_t *data;
+    block_q8_K *xq;
+    float *out;
+    uint64_t blocks, n_tok, out_dim;
+} qwen35_q6_work;
+
+static void qwen35_q6_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    qwen35_q6_work *c = vctx;
+    for (uint64_t g = g0; g < g1; g++)
+        qwen35_gemm_q6_K_16x8(c->data + g * c->blocks * Q6K_X16_BYTES,
+                              c->blocks, c->xq, c->blocks, c->n_tok,
+                              c->out, c->out_dim, g * 16u);
+}
+
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -75934,6 +75998,25 @@ static void qwen35_cpu_matvec_batch(
         getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
         rows >= 16u && (rows % 16u) == 0u &&
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
+        if (w->type == DS4_TENSOR_Q6_K && !exact &&
+            getenv("DS4_QWEN35_NO_Q6W") == NULL) {
+            uint8_t *qb = qwen35_q6k_get(tdata);
+            if (!qb) qb = qwen35_q6k_build(m, w);
+            if (qb) {
+                qwen35_q6_work w6;
+                w6.data = qb; w6.blocks = blocks; w6.out_dim = rows;
+                for (uint64_t tt = 0; tt < n_tok; tt += 8u) {
+                    uint64_t nt8 = n_tok - tt;
+                    if (nt8 > 8u) nt8 = 8u;
+                    w6.xq = xq + tt * blocks;
+                    w6.out = out + tt * rows;
+                    w6.n_tok = nt8;
+                    ds4_parallel_for(rows / 16u, qwen35_q6_worker, &w6);
+                }
+                free(xq);
+                return;
+            }
+        }
         int st = qwen35_rp_get(tdata);
         static double rp_ms = 0.0;
         if (st == 0) {

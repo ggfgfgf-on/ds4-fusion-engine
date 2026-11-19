@@ -76608,6 +76608,8 @@ static bool qwen35_cpu_matvec_multi(
         c.total += c.jobs[i].groups;
     }
     c.njobs = n;
+    struct timespec mm0, mm1;
+    clock_gettime(CLOCK_MONOTONIC, &mm0);
     const uint64_t tq_pad = (n_tok + 7u) & ~(uint64_t)7u;
     c.xq = xmalloc((size_t)(tq_pad * blocks) * sizeof(block_q8_K));
     for (uint64_t t = 0; t < n_tok; t++)
@@ -76617,6 +76619,18 @@ static bool qwen35_cpu_matvec_multi(
         memset(c.xq + n_tok * blocks, 0,
                (size_t)((tq_pad - n_tok) * blocks) * sizeof(block_q8_K));
     ds4_parallel_for(c.total, qwen35_mv_multi_worker, &c);
+    clock_gettime(CLOCK_MONOTONIC, &mm1);
+    /* This path was never counted, and it carries lin_qkv and lin_gate - about
+     * 1.5 GB of the model - so the breakdown was attributing its share to
+     * "everything else" and the Q4_K total read zero. */
+    acc_ms += (double)(mm1.tv_sec - mm0.tv_sec) * 1e3 +
+              (double)(mm1.tv_nsec - mm0.tv_nsec) / 1e6;
+    for (uint64_t i = 0; i < n; i++) {
+        acc_tensors += ws[i]->bytes;
+        acc_bytes += ws[i]->bytes * ((n_tok + 3u) / 4u);
+        acc_q4 += ws[i]->bytes;
+    }
+    acc_calls++;
     free(c.xq);
     return true;
 }

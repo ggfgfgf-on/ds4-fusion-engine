@@ -74268,6 +74268,159 @@ static void qwen35_q6_worker(void *vctx, uint64_t g0, uint64_t g1) {
                               c->out, c->out_dim, g * 16u);
 }
 
+/* Transpose one token group of activations to [block][jp][chunk][token].
+ *
+ * The kernel wants one int32 per (token, sub-block, chunk), and consecutive
+ * tokens are ystride apart - blocks * 340 bytes, 6.8 KB for these shapes - so
+ * the eight tokens of a chunk land on eight different cache lines. The whole
+ * activation working set for a group is 8 * 20 * 340 = 54 KB against a 48 KB L1,
+ * so those reads miss to L2 and each chunk waits fourteen cycles on them.
+ *
+ * Prefetching the weights changed nothing, which is the evidence that the wait
+ * is here rather than there. Transposed, the eight tokens of a chunk are
+ * sixty-four adjacent bytes and the working set is a forty-one kilobyte
+ * sequential stream. The cost is one pass over tens of kilobytes against a
+ * weight stream measured in gigabytes. */
+static void qwen35_xq8_transpose(const block_q8_K *y, uint64_t ystride,
+                                 uint64_t blocks, int32_t *out) {
+    uint64_t o = 0;
+    for (uint64_t b = 0; b < blocks; b++) {
+        for (int jp = 0; jp < 4; jp++) {
+            const int jlo = 2 * jp;
+            for (int c = 0; c < 8; c++) {
+                for (uint64_t t = 0; t < 8u; t++)
+                    memcpy(&out[o + t], y[t * ystride + b].qs + jlo * 32 + c * 4, 4);
+                o += 8u;
+                for (uint64_t t = 0; t < 8u; t++)
+                    memcpy(&out[o + t], y[t * ystride + b].qs + (jlo + 1) * 32 + c * 4, 4);
+                o += 8u;
+            }
+        }
+    }
+}
+
+/* Sixteen rows, eight tokens, activations transposed.
+ *
+ * The arithmetic and its order are the same as the lim == 8 path in
+ * qwen35_gemm_q4_K_16x8, so the results are bit-identical. What changes is that
+ * the two int32 groups the kernel needs per chunk arrive as one contiguous
+ * sixty-four byte read instead of sixteen four-byte reads spread over eight
+ * kilobyte-apart cache lines. */
+static void qwen35_gemm_q4_K_16x8_t(
+        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
+        const int32_t *xt, uint64_t ystride,
+        float *out, uint64_t out_stride, uint64_t row0) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+    const uint64_t lim = 8u;
+    __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+    __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
+                (grp + b * Q4K_X16X8_BYTES);
+        const __m512 dv = _mm512_loadu_ps(xp->d);
+        for (int jp = 0; jp < 4; jp++) {
+            const int jlo = 2 * jp;
+            __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0, lo3 = lo0;
+            __m512i lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
+            __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
+            __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+            for (int c = 0; c < 8; c++) {
+                const __m512i raw = _mm512_loadu_si512(
+                        (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                const __m512i ql = _mm512_and_si512(raw, m0F);
+                const __m512i qh = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F);
+                const int32_t *w = xt + (((uint64_t)b * 4u + (uint64_t)jp) * 8u
+                                         + (uint64_t)c) * 16u;
+                const __m256i b8 = _mm256_loadu_si256((const __m256i *)w);
+                const __m256i h8 = _mm256_loadu_si256((const __m256i *)(w + 8));
+#define Q4K8T(k) do {                                                      \
+                    lo##k = _mm512_dpbusd_epi32(lo##k, ql,                 \
+                            _mm512_set1_epi32(_mm256_extract_epi32(b8, k))); \
+                    hi##k = _mm512_dpbusd_epi32(hi##k, qh,                 \
+                            _mm512_set1_epi32(_mm256_extract_epi32(h8, k))); \
+                } while (0)
+                Q4K8T(0); Q4K8T(1); Q4K8T(2); Q4K8T(3);
+                Q4K8T(4); Q4K8T(5); Q4K8T(6); Q4K8T(7);
+#undef Q4K8T
+            }
+            const __m512 bl2 = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)xp->sc[jlo]))), dv);
+            const __m512 bh2 = _mm512_mul_ps(
+                    _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                            _mm_loadu_si128((const __m128i *)xp->sc[jlo + 1]))), dv);
+#define Q4K8TFL(k) do {                                                    \
+                    const __m512 yd = _mm512_set1_ps(                         \
+                            y[(uint64_t)(k) * ystride + b].d);                \
+                    __m512 v = _mm512_mul_ps(_mm512_cvtepi32_ps(lo##k),       \
+                                             _mm512_mul_ps(bl2, yd));         \
+                    v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi##k),            \
+                                        _mm512_mul_ps(bh2, yd), v);           \
+                    f##k = _mm512_add_ps(f##k, v);                            \
+                } while (0)
+            Q4K8TFL(0); Q4K8TFL(1); Q4K8TFL(2); Q4K8TFL(3);
+            Q4K8TFL(4); Q4K8TFL(5); Q4K8TFL(6); Q4K8TFL(7);
+#undef Q4K8TFL
+        }
+    }
+
+    /* the -dmin term depends only on (row, token), never on qs */
+    float minv[Q4K_X16_ROWS][8];
+    memset(minv, 0, sizeof minv);
+    for (uint64_t b = 0; b < blocks; b++) {
+        const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
+                (grp + b * Q4K_X16X8_BYTES);
+        __m128i mvr[8];
+        for (int j = 0; j < 8; j++)
+            mvr[j] = _mm_loadu_si128((const __m128i *)xp->mn[j]);
+        __m512i mn16[4];
+        for (int m = 0; m < 4; m++) {
+            const __m128i lo = mvr[2 * m];
+            const __m128i hi = mvr[2 * m + 1];
+            const __m128i il = _mm_unpacklo_epi8(lo, hi);
+            const __m128i ih2 = _mm_unpackhi_epi8(lo, hi);
+            mn16[m] = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_cvtepu8_epi16(il)),
+                    _mm256_cvtepu8_epi16(ih2), 1);
+        }
+        const __m512 dmv = _mm512_loadu_ps(xp->dmin);
+        for (uint64_t t = 0; t < lim; t++) {
+            const block_q8_K *yt = y + t * ystride + b;
+            __m512i acc = _mm512_setzero_si512();
+            for (int m = 0; m < 4; m++) {
+                const int32_t q0 = (int32_t)yt->bsums[4 * m + 0] +
+                                   (int32_t)yt->bsums[4 * m + 1];
+                const int32_t q1 = (int32_t)yt->bsums[4 * m + 2] +
+                                   (int32_t)yt->bsums[4 * m + 3];
+                const __m512i bs = _mm512_set1_epi32(
+                        (int32_t)(((uint32_t)q1 << 16) | ((uint32_t)q0 & 0xFFFFu)));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(mn16[m], bs));
+            }
+            float lane[Q4K_X16_ROWS];
+            _mm512_storeu_ps(lane, _mm512_cvtepi32_ps(acc));
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+                minv[r][t] -= yt->d * dmv[r] * lane[r];
+        }
+    }
+
+    for (uint64_t t = 0; t < lim; t++) {
+        const __m512 fv = (t == 0) ? f0 : (t == 1) ? f1 : (t == 2) ? f2
+                         : (t == 3) ? f3 : (t == 4) ? f4 : (t == 5) ? f5
+                         : (t == 6) ? f6 : f7;
+        float lane[Q4K_X16_ROWS];
+        _mm512_storeu_ps(lane, fv);
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+            out[t * out_stride + row0 + r] = lane[r] + minv[r][t];
+    }
+#else
+    (void)grp; (void)blocks; (void)y; (void)xt; (void)ystride;
+    (void)out; (void)out_stride; (void)row0;
+    ds4_die("Q4_K wide kernel needs AVX-512");
+#endif
+}
+
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
@@ -74305,6 +74458,10 @@ static void qwen35_gemm_q4_K_16x8(
                     const __m512i qh = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F);
 #define Q4K8_TK(k) do {                                                    \
                     const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
+                    (void)_y;                                               \
+                } while (0)
+#define Q4K8_TK_REAL(k) do {                                               \
+                    const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
                     const int32_t _al = *(const int32_t *)                  \
                             (_y->qs + jlo * 32 + c * 4);                    \
                     const int32_t _ah = *(const int32_t *)                  \
@@ -74314,9 +74471,35 @@ static void qwen35_gemm_q4_K_16x8(
                     hi##k = _mm512_dpbusd_epi32(hi##k, qh,                  \
                                                 _mm512_set1_epi32(_ah));    \
                 } while (0)
-                    Q4K8_TK(0); Q4K8_TK(1); Q4K8_TK(2); Q4K8_TK(3);
-                    Q4K8_TK(4); Q4K8_TK(5); Q4K8_TK(6); Q4K8_TK(7);
+#ifdef DS4_NOBCAST
+                    /* Probe: constant instead of the activation broadcast, to
+                     * measure what the sixteen per-chunk broadcasts cost. The
+                     * results are wrong by design; only the timing is read. */
+                    const __m512i _k0 = _mm512_set1_epi32(0x01010101);
+                    lo0 = _mm512_dpbusd_epi32(lo0, ql, _k0);
+                    hi0 = _mm512_dpbusd_epi32(hi0, qh, _k0);
+                    lo1 = _mm512_dpbusd_epi32(lo1, ql, _k0);
+                    hi1 = _mm512_dpbusd_epi32(hi1, qh, _k0);
+                    lo2 = _mm512_dpbusd_epi32(lo2, ql, _k0);
+                    hi2 = _mm512_dpbusd_epi32(hi2, qh, _k0);
+                    lo3 = _mm512_dpbusd_epi32(lo3, ql, _k0);
+                    hi3 = _mm512_dpbusd_epi32(hi3, qh, _k0);
+                    lo4 = _mm512_dpbusd_epi32(lo4, ql, _k0);
+                    hi4 = _mm512_dpbusd_epi32(hi4, qh, _k0);
+                    lo5 = _mm512_dpbusd_epi32(lo5, ql, _k0);
+                    hi5 = _mm512_dpbusd_epi32(hi5, qh, _k0);
+                    lo6 = _mm512_dpbusd_epi32(lo6, ql, _k0);
+                    hi6 = _mm512_dpbusd_epi32(hi6, qh, _k0);
+                    lo7 = _mm512_dpbusd_epi32(lo7, ql, _k0);
+                    hi7 = _mm512_dpbusd_epi32(hi7, qh, _k0);
+#else
+                    Q4K8_TK_REAL(0); Q4K8_TK_REAL(1);
+                    Q4K8_TK_REAL(2); Q4K8_TK_REAL(3);
+                    Q4K8_TK_REAL(4); Q4K8_TK_REAL(5);
+                    Q4K8_TK_REAL(6); Q4K8_TK_REAL(7);
+#endif
 #undef Q4K8_TK
+#undef Q4K8_TK_REAL
                 }
                 const __m512 bl2 = _mm512_mul_ps(
                         _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
@@ -74489,8 +74672,24 @@ static void qwen35_gemm_q4_K_16x8(
  * prefetch distance and the sixteen-row kernel depend on is unchanged. */
 static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
     qwen35_x8_work *c = vctx;
+    /* The activations are identical for every row group this worker owns, so the
+     * transposed copy is built once here, not once per group. */
+    int32_t *xt = NULL;
+    /* Off by default: measured 45.45 against 45.51, no difference. Kept because
+     * it is correct and because the reasoning that produced it - 54 KB of
+     * activations against a 48 KB L1, and weight prefetching changing nothing -
+     * is worth a reader having. DS4_QWEN35_TRANS turns it on. */
+    if (c->n_tok == 8u && getenv("DS4_QWEN35_TRANS") != NULL) {
+        xt = xmalloc((size_t)c->blocks * 4u * 8u * 16u * sizeof(int32_t));
+        if (xt) qwen35_xq8_transpose(c->xq, c->blocks, c->blocks, xt);
+    }
     for (uint64_t g = g0; g < g1; g++) {
         const uint8_t *row = c->data + g * c->blocks * Q4K_X16X8_BYTES;
+        if (xt) {
+            qwen35_gemm_q4_K_16x8_t(row, c->blocks, c->xq, xt, c->blocks,
+                                    c->out, c->out_dim, g * 16u);
+            continue;
+        }
         for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
             uint64_t nt8 = c->n_tok - tt;
             if (nt8 > 8u) nt8 = 8u;
@@ -74499,6 +74698,7 @@ static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
                                   c->out_dim, g * 16u);
         }
     }
+    free(xt);
 }
 
 static void qwen35_gemm_q4_K_16x4(

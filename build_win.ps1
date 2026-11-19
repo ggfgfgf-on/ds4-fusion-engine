@@ -60,7 +60,7 @@ if ($Clean) { Remove-Item "$ObjDir\*" -Force -ErrorAction SilentlyContinue }
 $CFlagsCommon = @(
     '--target=x86_64-pc-windows-msvc',
     '-std=c99', '-O2', '-ffast-math', '-fno-finite-math-only', '-g',
-    '-march=native',
+    '-march=native', $env:DS4_EXTRA_CFLAGS,
     '-Wall', '-Wextra', '-Wno-unused-function', '-Wno-unused-parameter',
     '-Wno-unused-variable', '-Wno-missing-braces', '-Wno-deprecated-declarations',
     '-Wno-unknown-attributes', '-Wno-ignored-attributes',

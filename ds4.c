@@ -74410,12 +74410,27 @@ static void qwen35_gemm_q4_K_16x8(
 #endif
 }
 
+/* Every token group for one row group, in that order.
+ *
+ * The dispatch used to run one parallel_for per token group, so for a prompt of
+ * three groups it swept the whole tensor three times and re-read each row from
+ * DRAM or L2 every time. One row group is blocks * 2432 bytes - 58 KB for the
+ * twenty-block tensors - which stays in L1 across the inner loop, so the groups
+ * after the first cost nothing in traffic. The outer parallel_for still hands
+ * each worker a contiguous span of row groups, so the span length that the
+ * prefetch distance and the sixteen-row kernel depend on is unchanged. */
 static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
     qwen35_x8_work *c = vctx;
-    for (uint64_t g = g0; g < g1; g++)
-        qwen35_gemm_q4_K_16x8(c->data + g * c->blocks * Q4K_X16X8_BYTES,
-                              c->blocks, c->xq, c->blocks, c->n_tok,
-                              c->out, c->out_dim, g * 16u);
+    for (uint64_t g = g0; g < g1; g++) {
+        const uint8_t *row = c->data + g * c->blocks * Q4K_X16X8_BYTES;
+        for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+            uint64_t nt8 = c->n_tok - tt;
+            if (nt8 > 8u) nt8 = 8u;
+            qwen35_gemm_q4_K_16x8(row, c->blocks, c->xq + tt * c->blocks,
+                                  c->blocks, nt8, c->out + tt * c->out_dim,
+                                  c->out_dim, g * 16u);
+        }
+    }
 }
 
 static void qwen35_gemm_q4_K_16x4(
@@ -76032,14 +76047,10 @@ static void qwen35_cpu_matvec_batch(
             w8.data = xb;
             w8.blocks = blocks;
             w8.out_dim = rows;
-            for (uint64_t tt = 0; tt < n_tok; tt += 8u) {
-                uint64_t nt8 = n_tok - tt;
-                if (nt8 > 8u) nt8 = 8u;
-                w8.xq = xq + tt * blocks;
-                w8.out = out + tt * rows;
-                w8.n_tok = nt8;
-                ds4_parallel_for(rows / 16u, qwen35_x8_worker, &w8);
-            }
+            w8.xq = xq;
+            w8.out = out;
+            w8.n_tok = n_tok;
+            ds4_parallel_for(rows / 16u, qwen35_x8_worker, &w8);
             free(xq);
             return;
         }

@@ -2461,6 +2461,25 @@ static double g_pool_spin_sec = 0.000150; /* DS4_POOL_SPIN_US, default 150 us */
 #define DS4_CPU_PAUSE() ((void)0)
 #endif
 
+static struct {
+    uint64_t calls, majority_wait, serial_calls;
+    double life_ms, wait_ms, wait_max_ms;
+    double serial_ms, serial_max_ms;
+    /* Worker-side totals: cumulative time inside fn over all workers, and how
+     * many worker slices were empty. work_ms divided by (n_threads * wall)
+     * is the real per-thread occupancy. */
+    double work_ms;
+    uint64_t work_calls, empty_calls;
+    /* Dispatch latency: the time each worker spends between the region being
+     * broadcast and reaching its own call into fn. Occupancy measured seventy
+     * percent against a theoretical hundred, the barrier accounts for a fifth
+     * of a percent and empty slices for seven, so the remainder is here. */
+    double dispatch_t;          /* stamped by the dispatching thread */
+    double dispatch_ms;
+    double dispatch_max_ms;
+    uint64_t dispatch_n;
+} g_pf;
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
@@ -2501,9 +2520,25 @@ static void *ds4_worker_main(void *arg) {
         uint64_t row1 = row0 + rows_per_thread;
         if (row1 > n_rows) row1 = n_rows;
         if (row0 < row1) {
+            const double tb0 = now_sec();
+            {
+                const double lat = (tb0 - g_pf.dispatch_t) * 1e3;
+                if (lat >= 0.0 && lat < 100.0) {
+                    g_pf.dispatch_ms += lat;
+                    if (lat > g_pf.dispatch_max_ms) g_pf.dispatch_max_ms = lat;
+                    g_pf.dispatch_n++;
+                }
+            }
             g_parallel_depth++;
             fn(ctx, row0, row1);
             g_parallel_depth--;
+            g_pf.work_ms += (now_sec() - tb0) * 1e3;
+            g_pf.work_calls++;
+        } else {
+            /* Rows ran out before this worker's slice. Common for small
+             * regions: rows_per_thread is ceil(n_rows / n_threads), so a
+             * sixty-four row region occupies twenty-two of twenty-eight. */
+            g_pf.empty_calls++;
         }
 
         __atomic_fetch_add(&g_fast_done, 1, __ATOMIC_RELEASE);
@@ -2631,7 +2666,15 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     ds4_threads_init();
 
     if (g_parallel_depth > 0 || g_pool.n_threads <= 1 || n_rows < min_parallel_rows) {
+        /* Serial path. Tracked separately because it consumes wall time while
+         * producing no worker time at all, which is invisible in the region
+         * totals and is the first thing to check when workers look idle. */
+        const double t0 = now_sec();
         fn(ctx, 0, n_rows);
+        const double dt = (now_sec() - t0) * 1e3;
+        g_pf.serial_calls++;
+        g_pf.serial_ms += dt;
+        if (dt > g_pf.serial_max_ms) g_pf.serial_max_ms = dt;
         return;
     }
 
@@ -2641,6 +2684,7 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     g_pool.n_rows = n_rows;
     g_pool.done = 0;
     g_pool.generation++;
+    g_pf.dispatch_t = now_sec();
     __atomic_store_n(&g_fast_gen, g_pool.generation, __ATOMIC_RELEASE);
     __atomic_store_n(&g_fast_done, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
@@ -2650,11 +2694,13 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     if (main_row1 > n_rows) main_row1 = n_rows;
     pthread_mutex_unlock(&g_pool.mutex);
 
+    const double t_call0 = now_sec();
     if (main_row1 > 0) {
         g_parallel_depth++;
         fn(ctx, 0, main_row1);
         g_parallel_depth--;
     }
+    const double t_main_done = now_sec();
 
     /* Fast wait: spin briefly on the atomic done count, then fall back to
      * the condvar protocol (identical to the pre-fast-path behavior). */
@@ -2670,6 +2716,27 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
     }
     pthread_mutex_unlock(&g_pool.mutex);
+
+    /* Pool accounting.
+     *
+     * DS4_PF_STATS reports what the pool costs rather than what it computes.
+     * Three numbers matter and none of them is visible from the outside: how
+     * many regions a pass is cut into, how long the whole region lives, and how
+     * long the main thread sits after finishing its own share waiting for the
+     * last worker. The last one is the barrier plus any imbalance in one
+     * number, and workers were measured busy only 42 percent of the wall, so it
+     * is where the missing time has to be.
+     */
+    {
+        const double t_end = now_sec();
+        const double wait = t_end - t_main_done;
+        const double life = t_end - t_call0;
+        g_pf.calls++;
+        g_pf.life_ms += life * 1e3;
+        g_pf.wait_ms += wait * 1e3;
+        if (wait * 1e3 > g_pf.wait_max_ms) g_pf.wait_max_ms = wait * 1e3;
+        if (wait > life * 0.5) g_pf.majority_wait++;
+    }
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
@@ -77252,6 +77319,47 @@ static void qwen35_cpu_forward_batch(
                         100.0 * (wall - acc_ms - attn_ms) / (wall > 0.0 ? wall : 1.0));
         fprintf(stderr, "[prefill] gdn serial=%.0f ms (%.0f%%)\n",
                 gdn_batch_ms, 100.0 * gdn_batch_ms / (wall > 0.0 ? wall : 1.0));
+        if (getenv("DS4_PF_STATS"))
+            fprintf(stderr, "[pool] regions=%llu  life=%.0f ms  "
+                    "barrier wait=%.0f ms (%.0f%%)  worst=%.2f ms  "
+                    "regions where wait>half=%.0f%%\n",
+                    (unsigned long long)g_pf.calls,
+                    g_pf.life_ms, g_pf.wait_ms,
+                    100.0 * g_pf.wait_ms / (wall > 0.0 ? wall : 1.0),
+                    g_pf.wait_max_ms,
+                    100.0 * (double)g_pf.majority_wait /
+                        (double)(g_pf.calls ? g_pf.calls : 1u));
+        if (getenv("DS4_PF_STATS"))
+            fprintf(stderr, "[pool] serial regions=%llu  time=%.0f ms (%.0f%%)  "
+                    "worst=%.2f ms   parallel regions=%llu time=%.0f ms\n",
+                    (unsigned long long)g_pf.serial_calls, g_pf.serial_ms,
+                    100.0 * g_pf.serial_ms / (wall > 0.0 ? wall : 1.0),
+                    g_pf.serial_max_ms,
+                    (unsigned long long)g_pf.calls, g_pf.life_ms);
+        if (getenv("DS4_PF_STATS"))
+            fprintf(stderr, "[pool] worker work=%.0f ms over %llu slices  "
+                    "empty slices=%llu (%.0f%%)  occupancy=%.0f%% of %d threads\n",
+                    g_pf.work_ms, (unsigned long long)g_pf.work_calls,
+                    (unsigned long long)g_pf.empty_calls,
+                    100.0 * (double)g_pf.empty_calls /
+                        (double)((g_pf.work_calls + g_pf.empty_calls) ?
+                                 (g_pf.work_calls + g_pf.empty_calls) : 1u),
+                    100.0 * g_pf.work_ms /
+                        (1000.0 * (wall > 0.0 ? wall : 1.0) *
+                         (double)g_pool.n_threads),
+                    (int)g_pool.n_threads);
+        g_pf.calls = 0; g_pf.majority_wait = 0; g_pf.serial_calls = 0;
+        g_pf.life_ms = 0.0; g_pf.wait_ms = 0.0; g_pf.wait_max_ms = 0.0;
+        g_pf.serial_ms = 0.0; g_pf.serial_max_ms = 0.0;
+        if (getenv("DS4_PF_STATS"))
+            fprintf(stderr, "[pool] dispatch latency avg=%.1f us  worst=%.1f us  "
+                    "total=%.0f ms (%.0f%% of the %.0f ms all threads spent in regions)\n",
+                    g_pf.dispatch_n ? g_pf.dispatch_ms / (double)g_pf.dispatch_n * 1e3 : 0.0,
+                    g_pf.dispatch_max_ms * 1e3, g_pf.dispatch_ms,
+                    100.0 * g_pf.dispatch_ms / (g_pf.work_ms > 0.0 ? g_pf.work_ms : 1.0),
+                    g_pf.work_ms);
+        g_pf.work_ms = 0.0; g_pf.work_calls = 0; g_pf.empty_calls = 0;
+        g_pf.dispatch_ms = 0.0; g_pf.dispatch_max_ms = 0.0; g_pf.dispatch_n = 0;
     }
 }
 

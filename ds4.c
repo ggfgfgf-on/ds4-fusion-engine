@@ -74677,6 +74677,12 @@ static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
      * it is correct and because the reasoning that produced it - 54 KB of
      * activations against a 48 KB L1, and weight prefetching changing nothing -
      * is worth a reader having. DS4_QWEN35_TRANS turns it on. */
+    static int tgs = 0;
+    if (tgs == 0) {
+        const char *e = getenv("DS4_QWEN35_TGS");
+        tgs = (e && e[0] >= '1' && e[0] <= '8') ? e[0] - '0' : 8;
+    }
+    const uint64_t w8_tgs = (uint64_t)tgs;
     static int want_trans = -1;
     if (want_trans < 0) want_trans = getenv("DS4_QWEN35_TRANS") != NULL;
     if (c->n_tok == 8u && want_trans) {
@@ -74690,9 +74696,9 @@ static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
                                     c->out, c->out_dim, g * 16u);
             continue;
         }
-        for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+        for (uint64_t tt = 0; tt < c->n_tok; tt += w8_tgs) {
             uint64_t nt8 = c->n_tok - tt;
-            if (nt8 > 8u) nt8 = 8u;
+            if (nt8 > w8_tgs) nt8 = w8_tgs;
             qwen35_gemm_q4_K_16x8(row, c->blocks, c->xq + tt * c->blocks,
                                   c->blocks, nt8, c->out + tt * c->out_dim,
                                   c->out_dim, g * 16u);

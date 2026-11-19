@@ -75881,6 +75881,24 @@ static void qwen35_cpu_mtp_forward_h(
         const float *h_hidden, int token, uint32_t pos, float *draft_logits,
         float *out_hidden);
 
+typedef struct {
+    const float *a;
+    float *b;
+    uint64_t n;
+} qwen35_silu_work;
+
+/* ffn_up *= gate * sigmoid(gate), in parallel chunks of 4096. The parallel_for
+ * count is derived from the length so short passes do not pay a barrier for
+ * nothing. */
+static void qwen35_silu_worker(void *vctx, uint64_t c0, uint64_t c1) {
+    qwen35_silu_work *c = vctx;
+    const uint64_t lo = c0 * 4096u;
+    uint64_t hi = c1 * 4096u;
+    if (hi > c->n) hi = c->n;
+    for (uint64_t i = lo; i < hi; i++)
+        c->b[i] *= c->a[i] / (1.0f + expf(-c->a[i]));
+}
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -76108,8 +76126,12 @@ static void qwen35_cpu_forward_batch(
         FFN_CHK("gate");
         qwen35_cpu_matvec_batch(m, l->ffn_up, blk, ff_b, NT, ffn_exact);
         FFN_CHK("up");
-        for (uint64_t i = 0; i < NT * FF; i++)
-            ff_b[i] *= ff_a[i] / (1.0f + expf(-ff_a[i]));
+        /* This ran on the main thread: NT * FF expf calls per layer, which is
+         * about 380k of them, times 65 layers. expf costs twenty-odd cycles, so
+         * it is one of the few elementwise blocks big enough to be worth a
+         * parallel region of its own. */
+        qwen35_silu_work sw = { ff_a, ff_b, NT * FF };
+        ds4_parallel_for(NT * FF / 4096u + 1u, qwen35_silu_worker, &sw);
         FFN_CHK("silu");
         qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, ffn_exact);
         FFN_CHK("down");

@@ -74317,6 +74317,18 @@ static void qwen35_gemm_q4_K_16x8_t(
     __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
 
     for (uint64_t b = 0; b < blocks; b++) {
+        /* Prefetch ahead by blocks. One row group is 48.6 KB against a 48 KB
+         * L1, so the earlier attempt to prefetch a whole group evicted what it
+         * had just fetched; a bounded distance in blocks cannot. DS4_QWEN35_PFD
+         * sets the distance, in blocks; unset or 0 disables. */
+        static int pfd = -1;
+        if (pfd < 0) {
+            const char *e = getenv("DS4_QWEN35_PFD");
+            pfd = (e && e[0] >= '0' && e[0] <= '9') ? (e[0] - '0') * 8 : 0;
+        }
+        if (pfd && b + (uint64_t)pfd < blocks)
+            _mm_prefetch((const char *)(grp + (b + (uint64_t)pfd) *
+                                          Q4K_X16X8_BYTES), _MM_HINT_T0);
         const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
                 (grp + b * Q4K_X16X8_BYTES);
         const __m512 dv = _mm512_loadu_ps(xp->d);

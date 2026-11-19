@@ -74272,6 +74272,67 @@ static void qwen35_gemm_q4_K_16x8(
     __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
     __m512 f4 = f0, f5 = f0, f6 = f0, f7 = f0;
 
+    /* Eight tokens is the shape prefill actually runs, and the generic loops
+     * below pick the accumulator with a switch inside the innermost loop and
+     * again with a ternary chain in the flush - two unpredictable branches per
+     * token per chunk. Unrolled, both disappear and the compiler can schedule
+     * the eight independent dpbusd chains against each other.
+     *
+     * This is where the kernel's cost is: dpbusd is 256 instructions per block
+     * and the flush is another 152, all of it in the shadow of branch selection
+     * that the unrolled form does not pay. */
+    if (lim == 8u) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
+                    (grp + b * Q4K_X16X8_BYTES);
+            const __m512 dv = _mm512_loadu_ps(xp->d);
+            for (int jp = 0; jp < 4; jp++) {
+                const int jlo = 2 * jp;
+                __m512i lo0 = _mm512_setzero_si512(), lo1 = lo0, lo2 = lo0, lo3 = lo0;
+                __m512i lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
+                __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
+                __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+                for (int c = 0; c < 8; c++) {
+                    const __m512i raw = _mm512_loadu_si512(
+                            (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                    const __m512i ql = _mm512_and_si512(raw, m0F);
+                    const __m512i qh = _mm512_and_si512(_mm512_srli_epi16(raw, 4), m0F);
+#define Q4K8_TK(k) do {                                                    \
+                    const block_q8_K *_y = y + (uint64_t)(k) * ystride + b; \
+                    const int32_t _al = *(const int32_t *)                  \
+                            (_y->qs + jlo * 32 + c * 4);                    \
+                    const int32_t _ah = *(const int32_t *)                  \
+                            (_y->qs + (jlo + 1) * 32 + c * 4);              \
+                    lo##k = _mm512_dpbusd_epi32(lo##k, ql,                  \
+                                                _mm512_set1_epi32(_al));    \
+                    hi##k = _mm512_dpbusd_epi32(hi##k, qh,                  \
+                                                _mm512_set1_epi32(_ah));    \
+                } while (0)
+                    Q4K8_TK(0); Q4K8_TK(1); Q4K8_TK(2); Q4K8_TK(3);
+                    Q4K8_TK(4); Q4K8_TK(5); Q4K8_TK(6); Q4K8_TK(7);
+#undef Q4K8_TK
+                }
+                const __m512 bl2 = _mm512_mul_ps(
+                        _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                _mm_loadu_si128((const __m128i *)xp->sc[jlo]))), dv);
+                const __m512 bh2 = _mm512_mul_ps(
+                        _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                _mm_loadu_si128((const __m128i *)xp->sc[jlo + 1]))), dv);
+#define Q4K8_FL(k) do {                                                    \
+                    const __m512 _yd = _mm512_set1_ps(y[(uint64_t)(k) *     \
+                                                       ystride + b].d);    \
+                    __m512 _v = _mm512_mul_ps(_mm512_cvtepi32_ps(lo##k),    \
+                                              _mm512_mul_ps(bl2, _yd));    \
+                    _v = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi##k),         \
+                                         _mm512_mul_ps(bh2, _yd), _v);     \
+                    f##k = _mm512_add_ps(f##k, _v);                        \
+                } while (0)
+                Q4K8_FL(0); Q4K8_FL(1); Q4K8_FL(2); Q4K8_FL(3);
+                Q4K8_FL(4); Q4K8_FL(5); Q4K8_FL(6); Q4K8_FL(7);
+#undef Q4K8_FL
+            }
+        }
+    } else {
     for (uint64_t b = 0; b < blocks; b++) {
         const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
                 (grp + b * Q4K_X16X8_BYTES);
@@ -74353,6 +74414,7 @@ static void qwen35_gemm_q4_K_16x8(
                 }
             }
         }
+    }
     }
 
     /* the -dmin term depends only on (row, token), never on qs */

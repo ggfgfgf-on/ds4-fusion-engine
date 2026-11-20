@@ -73708,6 +73708,18 @@ static inline float qwen35_hsum_ps(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
+/* Horizontal sum of eight floats, for the Q6_K kernel's deferred reduction. */
+static inline float qwen35_hsum_ps256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    __m128 sh = _mm_movehdup_ps(lo);
+    __m128 s = _mm_add_ps(lo, sh);
+    sh = _mm_movehl_ps(sh, s);
+    s = _mm_add_ss(s, sh);
+    return _mm_cvtss_f32(s);
+}
+
 static inline int32_t qwen35_hsum_i32(__m256i v) {
     __m256i s = _mm256_add_epi32(v, _mm256_permute2x128_si256(v, v, 1));
     __m128i lo = _mm256_castsi256_si128(s);
@@ -76378,8 +76390,16 @@ static void qwen35_gemm_q6_K_q8_K_2x4_pre(
         uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
 #if defined(__AVX2__)
     const uint64_t lim = nt < 4u ? nt : 4u;
-    float f00 = 0.f, f01 = 0.f, f02 = 0.f, f03 = 0.f;
-    float f10 = 0.f, f11 = 0.f, f12 = 0.f, f13 = 0.f;
+    /* Accumulate in vectors, not scalars.
+     *
+     * The obvious form adds one horizontal sum per block per row per token - eight
+     * of them per block, about five instructions each, against a hundred and
+     * twenty-eight madds. The reduction cost more than the multiply it was
+     * reducing. A vector per (row, token) costs one convert plus one fused
+     * multiply-add per block, and the eight horizontal sums happen once at the end
+     * instead of once per block. */
+    __m256 f0v0 = _mm256_setzero_ps(), f0v1 = f0v0, f0v2 = f0v0, f0v3 = f0v0;
+    __m256 f1v0 = f0v0, f1v1 = f0v0, f1v2 = f0v0, f1v3 = f0v0;
 
     for (uint64_t b = 0; b < blocks; b++) {
         __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a03 = a00;
@@ -76425,29 +76445,30 @@ static void qwen35_gemm_q6_K_q8_K_2x4_pre(
         const float yv[4] = { y0d(y, ystride, b, 0, nt), y0d(y, ystride, b, 1, nt),
                               y0d(y, ystride, b, 2, nt), y0d(y, ystride, b, 3, nt) };
         for (uint64_t t = 0; t < lim; t++) {
-            const float k0 = d0 * yv[t], k1 = d1 * yv[t];
+            const __m256 s0 = _mm256_set1_ps(d0 * yv[t]);
+            const __m256 s1 = _mm256_set1_ps(d1 * yv[t]);
             switch (t) {
-            case 0: f00 += k0 * (float)qwen35_hsum_i32(a00);
-                    f10 += k1 * (float)qwen35_hsum_i32(a10); break;
-            case 1: f01 += k0 * (float)qwen35_hsum_i32(a01);
-                    f11 += k1 * (float)qwen35_hsum_i32(a11); break;
-            case 2: f02 += k0 * (float)qwen35_hsum_i32(a02);
-                    f12 += k1 * (float)qwen35_hsum_i32(a12); break;
-                    default: f03 += k0 * (float)qwen35_hsum_i32(a03);
-                    f13 += k1 * (float)qwen35_hsum_i32(a13); break;
+            case 0: f0v0 = _mm256_fmadd_ps(s0, _mm256_cvtepi32_ps(a00), f0v0);
+                    f1v0 = _mm256_fmadd_ps(s1, _mm256_cvtepi32_ps(a10), f1v0); break;
+            case 1: f0v1 = _mm256_fmadd_ps(s0, _mm256_cvtepi32_ps(a01), f0v1);
+                    f1v1 = _mm256_fmadd_ps(s1, _mm256_cvtepi32_ps(a11), f1v1); break;
+            case 2: f0v2 = _mm256_fmadd_ps(s0, _mm256_cvtepi32_ps(a02), f0v2);
+                    f1v2 = _mm256_fmadd_ps(s1, _mm256_cvtepi32_ps(a12), f1v2); break;
+                    default: f0v3 = _mm256_fmadd_ps(s0, _mm256_cvtepi32_ps(a03), f0v3);
+                    f1v3 = _mm256_fmadd_ps(s1, _mm256_cvtepi32_ps(a13), f1v3); break;
             }
         }
     }
     for (uint64_t t = 0; t < lim; t++) {
-        float v0, v1;
+        __m256 v0, v1;
         switch (t) {
-        case 0: v0 = f00; v1 = f10; break;
-        case 1: v0 = f01; v1 = f11; break;
-        case 2: v0 = f02; v1 = f12; break;
-        default: v0 = f03; v1 = f13; break;
+        case 0: v0 = f0v0; v1 = f1v0; break;
+        case 1: v0 = f0v1; v1 = f1v1; break;
+        case 2: v0 = f0v2; v1 = f1v2; break;
+        default: v0 = f0v3; v1 = f1v3; break;
         }
-        out[t * out_stride + row + 0] = v0;
-        out[t * out_stride + row + 1] = v1;
+        out[t * out_stride + row + 0] = qwen35_hsum_ps256(v0);
+        out[t * out_stride + row + 1] = qwen35_hsum_ps256(v1);
     }
 #else
     (void)pre;

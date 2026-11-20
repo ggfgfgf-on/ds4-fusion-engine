@@ -2486,6 +2486,22 @@ static struct {
     uint64_t lock_n;
 } g_pf;
 
+/* Cached gate for the pool instrumentation.
+ *
+ * The counters used to be collected unconditionally and only read when
+ * DS4_PF_STATS was set, which cost four QueryPerformanceCounter reads per worker
+ * per region - sixty-eight thousand in a prefill pass. QPC is a shared page and
+ * twenty-eight threads reading it at once makes the measurement a contention
+ * point in its own right.
+ *
+ * With the gate the cost when off is one predicted branch. Where it is on, the
+ * numbers are honest about carrying their own overhead. */
+static int g_pf_on = -1;
+static int pf_on(void) {
+    if (g_pf_on < 0) g_pf_on = getenv("DS4_PF_STATS") != NULL;
+    return g_pf_on;
+}
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
@@ -2505,13 +2521,14 @@ static void *ds4_worker_main(void *arg) {
             DS4_CPU_PAUSE();
         }
 
-        const double t_lock0 = now_sec();
+        const double t_lock0 = pf_on() ? now_sec() : 0.0;
         pthread_mutex_lock(&g_pool.mutex);
-        const double t_locked = now_sec();
-        g_pf.lock_ms += (t_locked - t_lock0) * 1e3;
-        g_pf.lock_n++;
-        if ((t_locked - t_lock0) * 1e3 > g_pf.lock_max_ms)
-            g_pf.lock_max_ms = (t_locked - t_lock0) * 1e3;
+        if (t_lock0 != 0.0) {
+            const double d = (now_sec() - t_lock0) * 1e3;
+            g_pf.lock_ms += d;
+            g_pf.lock_n++;
+            if (d > g_pf.lock_max_ms) g_pf.lock_max_ms = d;
+        }
         while (seen_generation == g_pool.generation && !g_pool.shutdown) {
             pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
         }
@@ -2532,7 +2549,7 @@ static void *ds4_worker_main(void *arg) {
         uint64_t row1 = n_rows * (uint64_t)(tid + 1u) / (uint64_t)n_threads;
         if (row1 > n_rows) row1 = n_rows;
         if (row0 < row1) {
-            const double tb0 = now_sec();
+            const double tb0 = pf_on() ? now_sec() : 0.0;
             {
                 const double lat = (tb0 - g_pf.dispatch_t) * 1e3;
                 if (lat >= 0.0 && lat < 100.0) {
@@ -2544,8 +2561,10 @@ static void *ds4_worker_main(void *arg) {
             g_parallel_depth++;
             fn(ctx, row0, row1);
             g_parallel_depth--;
-            g_pf.work_ms += (now_sec() - tb0) * 1e3;
-            g_pf.work_calls++;
+            if (tb0 != 0.0) {
+                g_pf.work_ms += (now_sec() - tb0) * 1e3;
+                g_pf.work_calls++;
+            }
         } else {
             /* Rows ran out before this worker's slice. Common for small
              * regions: rows_per_thread is ceil(n_rows / n_threads), so a
@@ -2681,12 +2700,16 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         /* Serial path. Tracked separately because it consumes wall time while
          * producing no worker time at all, which is invisible in the region
          * totals and is the first thing to check when workers look idle. */
-        const double t0 = now_sec();
-        fn(ctx, 0, n_rows);
-        const double dt = (now_sec() - t0) * 1e3;
-        g_pf.serial_calls++;
-        g_pf.serial_ms += dt;
-        if (dt > g_pf.serial_max_ms) g_pf.serial_max_ms = dt;
+        if (pf_on()) {
+            const double t0 = now_sec();
+            fn(ctx, 0, n_rows);
+            const double dt = (now_sec() - t0) * 1e3;
+            g_pf.serial_calls++;
+            g_pf.serial_ms += dt;
+            if (dt > g_pf.serial_max_ms) g_pf.serial_max_ms = dt;
+        } else {
+            fn(ctx, 0, n_rows);
+        }
         return;
     }
 
@@ -2696,7 +2719,7 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     g_pool.n_rows = n_rows;
     g_pool.done = 0;
     g_pool.generation++;
-    g_pf.dispatch_t = now_sec();
+    if (pf_on()) g_pf.dispatch_t = now_sec();
     __atomic_store_n(&g_fast_gen, g_pool.generation, __ATOMIC_RELEASE);
     __atomic_store_n(&g_fast_done, 0, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_pool.work_cond);
@@ -2718,13 +2741,13 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     if (main_row1 > n_rows) main_row1 = n_rows;
     pthread_mutex_unlock(&g_pool.mutex);
 
-    const double t_call0 = now_sec();
+    const double t_call0 = pf_on() ? now_sec() : 0.0;
     if (main_row1 > 0) {
         g_parallel_depth++;
         fn(ctx, 0, main_row1);
         g_parallel_depth--;
     }
-    const double t_main_done = now_sec();
+    const double t_main_done = pf_on() ? now_sec() : 0.0;
 
     /* Fast wait: spin briefly on the atomic done count, then fall back to
      * the condvar protocol (identical to the pre-fast-path behavior). */
@@ -2751,7 +2774,7 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
      * number, and workers were measured busy only 42 percent of the wall, so it
      * is where the missing time has to be.
      */
-    {
+    if (t_call0 != 0.0) {
         const double t_end = now_sec();
         const double wait = t_end - t_main_done;
         const double life = t_end - t_call0;

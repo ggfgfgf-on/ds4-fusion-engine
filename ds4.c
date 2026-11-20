@@ -76192,24 +76192,64 @@ static void qwen35_gemm_q6_K_q8_K_2x4(
  * blocks, is ten kilobytes and stays in L1.
  */
 static void qwen35_q6_unpack_pair(const block_q6_K *x0, const block_q6_K *x1,
-                                  uint64_t blocks, int8_t *dst) {
+                                  uint64_t blocks, int16_t *dst) {
+#if defined(__AVX2__)
+    /* Sixteen values at a time. The buffer holds int16 already multiplied by the
+     * group scale - exactly what the reference kernel computes before its madd -
+     * so the kernel that reads it has nothing left but loads and multiplies. With
+     * the scale applied here instead of there, the widen-and-scale step runs once
+     * per row pair instead of once per token group as well. */
+    const __m256i m0F = _mm256_set1_epi16(0x0F);
+    const __m256i m3 = _mm256_set1_epi16(3);
+    const __m256i m32 = _mm256_set1_epi16(32);
     for (uint64_t b = 0; b < blocks; b++) {
         const block_q6_K *xs[2] = { x0 + b, x1 + b };
         for (int r = 0; r < 2; r++) {
-            int8_t *o = dst + (b * 2u + (uint64_t)r) * 256u;
+            int16_t *o = dst + (b * 2u + (uint64_t)r) * 256u;
             for (int half = 0; half < 2; half++) {
-                const uint8_t *ql = xs[r]->ql + (uint64_t)half * 64u;
-                const uint8_t *qh = xs[r]->qh + (uint64_t)half * 32u;
-                int8_t *h = o + half * 128;
-                for (int i = 0; i < 32; i++) {
-                    h[i]      = (int8_t)((int)((ql[i]      & 0x0F) | (((qh[i] >> 0) & 3) << 4)) - 32);
-                    h[32 + i] = (int8_t)((int)((ql[32 + i] & 0x0F) | (((qh[i] >> 2) & 3) << 4)) - 32);
-                    h[64 + i] = (int8_t)((int)((ql[i]      >> 4)  | (((qh[i] >> 4) & 3) << 4)) - 32);
-                    h[96 + i] = (int8_t)((int)((ql[32 + i] >> 4)  | (((qh[i] >> 6) & 3) << 4)) - 32);
+                const uint8_t *rql = xs[r]->ql + (uint64_t)half * 64u;
+                const uint8_t *rqh = xs[r]->qh + (uint64_t)half * 32u;
+                const int8_t *rsc = xs[r]->scales + (uint64_t)half * 8u;
+                for (int c = 0; c < 2; c++) {
+                    const __m256i qll = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rql + c * 16)));
+                    const __m256i qlh = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rql + 32 + c * 16)));
+                    const __m256i qhv = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(rqh + c * 16)));
+                    __m256i g0 = _mm256_or_si256(_mm256_and_si256(qll, m0F),
+                            _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4));
+                    __m256i g1 = _mm256_or_si256(_mm256_and_si256(qlh, m0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 2), m3), 4));
+                    __m256i g2 = _mm256_or_si256(_mm256_and_si256(
+                            _mm256_srli_epi16(qll, 4), m0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 4), m3), 4));
+                    __m256i g3 = _mm256_or_si256(_mm256_and_si256(
+                            _mm256_srli_epi16(qlh, 4), m0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 6), m3), 4));
+                    g0 = _mm256_sub_epi16(g0, m32);
+                    g1 = _mm256_sub_epi16(g1, m32);
+                    g2 = _mm256_sub_epi16(g2, m32);
+                    g3 = _mm256_sub_epi16(g3, m32);
+                    g0 = _mm256_mullo_epi16(g0, _mm256_set1_epi16((short)rsc[0 + c]));
+                    g1 = _mm256_mullo_epi16(g1, _mm256_set1_epi16((short)rsc[2 + c]));
+                    g2 = _mm256_mullo_epi16(g2, _mm256_set1_epi16((short)rsc[4 + c]));
+                    g3 = _mm256_mullo_epi16(g3, _mm256_set1_epi16((short)rsc[6 + c]));
+                    int16_t *h = o + half * 128 + c * 16;
+                    _mm256_storeu_si256((__m256i *)(h + 0), g0);
+                    _mm256_storeu_si256((__m256i *)(h + 32), g1);
+                    _mm256_storeu_si256((__m256i *)(h + 64), g2);
+                    _mm256_storeu_si256((__m256i *)(h + 96), g3);
                 }
             }
         }
     }
+#else
+    (void)x0; (void)x1; (void)blocks; (void)dst;
+#endif
 }
 
 /* The 2x4 kernel with the unpacking already done.
@@ -76218,7 +76258,7 @@ static void qwen35_q6_unpack_pair(const block_q6_K *x0, const block_q6_K *x1,
  * extraction happened earlier.
  */
 static void qwen35_gemm_q6_K_q8_K_2x4_pre(
-        const int8_t *pre, const block_q6_K *x0, const block_q6_K *x1,
+        const int16_t *pre, const block_q6_K *x0, const block_q6_K *x1,
         const block_q8_K *y, uint64_t ystride, uint64_t blocks,
         uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
 #if defined(__AVX2__)
@@ -76233,21 +76273,12 @@ static void qwen35_gemm_q6_K_q8_K_2x4_pre(
             for (int c = 0; c < 2; c++) {
                 __m256i q[2][4];
                 for (int r = 0; r < 2; r++) {
-                    const int8_t *h = pre + (b * 2u + (uint64_t)r) * 256u
-                                    + half * 128 + c * 16;
-                    const int8_t *rsc = ((r ? x1 : x0) + b)->scales + half * 8;
-                    q[r][0] = _mm256_mullo_epi16(
-                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 0))),
-                            _mm256_set1_epi16((short)rsc[0 + c]));
-                    q[r][1] = _mm256_mullo_epi16(
-                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 32))),
-                            _mm256_set1_epi16((short)rsc[2 + c]));
-                    q[r][2] = _mm256_mullo_epi16(
-                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 64))),
-                            _mm256_set1_epi16((short)rsc[4 + c]));
-                    q[r][3] = _mm256_mullo_epi16(
-                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 96))),
-                            _mm256_set1_epi16((short)rsc[6 + c]));
+                    const int16_t *h = pre + (b * 2u + (uint64_t)r) * 256u
+                                     + half * 128 + c * 16;
+                    q[r][0] = _mm256_loadu_si256((const __m256i *)(h + 0));
+                    q[r][1] = _mm256_loadu_si256((const __m256i *)(h + 32));
+                    q[r][2] = _mm256_loadu_si256((const __m256i *)(h + 64));
+                    q[r][3] = _mm256_loadu_si256((const __m256i *)(h + 96));
                 }
                 const uint64_t base = (uint64_t)half * 4u;
                 for (uint64_t t = 0; t < lim; t++) {
@@ -76431,7 +76462,7 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
         /* Q6_K used to fall through to the per-row, per-token tail: one
          * accumulator chain and no weight sharing across tokens. It is 22% of
          * the weight bytes. */
-        int8_t *pre = g_q6_pre ? xmalloc((size_t)(blocks * 2u * 256u)) : NULL;
+        int16_t *pre = g_q6_pre ? xmalloc((size_t)(blocks * 2u * 256u) * sizeof(int16_t)) : NULL;
         for (; row + 1u < row1; row += 2u) {
             const block_q6_K *u0 = (const block_q6_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
             const block_q6_K *u1 = (const block_q6_K *)(ctx->data + (row + 1u) * ctx->row_bytes);

@@ -77775,7 +77775,24 @@ static void qwen35_cpu_forward_batch(
                 g_ph.gdn, g_ph.head, tot);
     }
     qwen35_rms_par(blk, xb, qwen4_ref_f32(m, w->output_norm), E, n_tok, eps);
-    qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+    /* The head is a matvec the size of the whole vocabulary times E, and in a
+     * prefill only the last position's logits are ever read - the caller copies
+     * row n-1 and discards the rest. Computing all of them projected every
+     * position through three point four gigabytes of weights for nothing, and the
+     * head measured at seven percent of the pass.
+     *
+     * The debug and reference paths do read the other rows, so they still get
+     * them. */
+    if (getenv("DS4_QWEN35_BATCH_DBG") != NULL ||
+        getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
+        getenv("DS4_QWEN35_BATCH_VERIFY") != NULL) {
+        qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+    } else if (n_tok > 0u) {
+        qwen35_cpu_matvec_batch(m, w->output,
+                                blk + (uint64_t)(n_tok - 1u) * E,
+                                logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
+                                1u, false);
+    }
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts
      * for the following positions (each step is a cheap nextn-layer pass). */

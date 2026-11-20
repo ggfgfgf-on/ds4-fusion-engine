@@ -2432,6 +2432,14 @@ typedef struct {
     void *ctx;
     uint64_t n_rows;
     uint64_t main_end;         /* rows the dispatching thread takes for itself */
+    /* Dynamic scheduling. Static partitioning assumes every thread runs at the
+     * same speed, which is false here: twelve of the workers share a core with a
+     * sibling and get roughly half the execution resources, so the region always
+     * ends on one of them while the uncontended threads sit. Handing work out
+     * from a shared counter lets the fast threads take more. */
+    uint64_t steal_next;
+    uint64_t steal_units;
+    uint64_t steal_rows;
     int pin_cpu[DS4_MAX_THREADS]; /* -1 = unpinned; else logical CPU to pin to */
 } ds4_thread_pool;
 
@@ -2545,6 +2553,28 @@ static void *ds4_worker_main(void *arg) {
         const uint32_t n_threads = g_pool.n_threads;
         pthread_mutex_unlock(&g_pool.mutex);
 
+        /* Steal from the shared counter, or fall back to the static tile. */
+        if (g_pool.steal_units) {
+            for (;;) {
+                const uint64_t k = __atomic_fetch_add(&g_pool.steal_next, 1,
+                                                      __ATOMIC_RELAXED);
+                if (k >= g_pool.steal_units) break;
+                uint64_t r0 = k * g_pool.steal_rows;
+                uint64_t r1 = r0 + g_pool.steal_rows;
+                if (r1 > n_rows) r1 = n_rows;
+                if (r0 >= r1) continue;
+                g_parallel_depth++;
+                fn(ctx, r0, r1);
+                g_parallel_depth--;
+            }
+            __atomic_fetch_add(&g_fast_done, 1, __ATOMIC_RELEASE);
+            pthread_mutex_lock(&g_pool.mutex);
+            g_pool.done++;
+            if (g_pool.done == g_pool.n_workers)
+                pthread_cond_signal(&g_pool.done_cond);
+            pthread_mutex_unlock(&g_pool.mutex);
+            continue;
+        }
         /* The remainder after the main thread's slice, tiled across the workers
          * with proportional boundaries so the pieces differ by at most one row
          * and none is empty. */
@@ -2763,10 +2793,40 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     uint64_t main_row1 = (n_rows * (uint64_t)main_pm) / 1000u;
     if (main_row1 > n_rows) main_row1 = n_rows;
     g_pool.main_end = main_row1;
+    /* Dynamic scheduling on a shared counter. Four units per thread is enough to
+     * absorb a two-to-one speed difference between SMT-paired workers and the
+     * rest without letting the counter become the bottleneck. */
+    static int steal = -1;
+    if (steal < 0) steal = getenv("DS4_POOL_STEAL") != NULL;
+    if (steal && g_pool.n_threads > 1u) {
+        uint64_t u = (uint64_t)g_pool.n_threads * 4u;
+        if (u > n_rows) u = n_rows;
+        if (u < 1u) u = 1u;
+        g_pool.steal_units = u;
+        g_pool.steal_rows = (n_rows + u - 1u) / u;
+        g_pool.steal_next = 0;
+    } else {
+        g_pool.steal_units = 0;
+    }
     pthread_mutex_unlock(&g_pool.mutex);
 
     const double t_call0 = pf_on() ? now_sec() : 0.0;
-    if (main_row1 > 0) {
+    if (g_pool.steal_units) {
+        /* The dispatcher takes units from the same counter, so it stops being a
+         * thread that finishes early and waits. */
+        for (;;) {
+            const uint64_t k = __atomic_fetch_add(&g_pool.steal_next, 1,
+                                                  __ATOMIC_RELAXED);
+            if (k >= g_pool.steal_units) break;
+            uint64_t r0 = k * g_pool.steal_rows;
+            uint64_t r1 = r0 + g_pool.steal_rows;
+            if (r1 > n_rows) r1 = n_rows;
+            if (r0 >= r1) continue;
+            g_parallel_depth++;
+            fn(ctx, r0, r1);
+            g_parallel_depth--;
+        }
+    } else if (main_row1 > 0) {
         g_parallel_depth++;
         fn(ctx, 0, main_row1);
         g_parallel_depth--;

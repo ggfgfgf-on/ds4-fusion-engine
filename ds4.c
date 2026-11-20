@@ -74335,6 +74335,32 @@ static void qwen35_q6k_put(const uint8_t *d, uint8_t *v) {
     }
 }
 
+/* The wide Q6_K builder, split across the pool.
+ *
+ * The packer underneath is scalar and branchy - one qwen35_q6k_at call per
+ * value, four thousand of them per wide block and about a million wide blocks
+ * in this model, so eight seconds on one thread and all of it charged to the
+ * first prefill because this builder is lazy where the Q4_K one is eager.
+ * Row groups are independent, so the split is exact and needs no ordering. */
+typedef struct {
+    const uint8_t *src;
+    uint8_t *buf;
+    uint64_t blocks, row_bytes;
+} qwen35_q6build_ctx;
+
+static void qwen35_q6build_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    const qwen35_q6build_ctx *c = vctx;
+    const block_q6_K *rows16[Q6K_X16_ROWS];
+    for (uint64_t g = g0; g < g1; g++) {
+        for (uint64_t b = 0; b < c->blocks; b++) {
+            for (uint32_t r = 0; r < Q6K_X16_ROWS; r++)
+                rows16[r] = (const block_q6_K *)
+                        (c->src + (g * 16u + r) * c->row_bytes) + b;
+            qwen35_q6k_wide_block(rows16,
+                    c->buf + (g * c->blocks + b) * Q6K_X16_BYTES);
+        }
+    }
+}
 static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w) {
     if (!w || w->type != DS4_TENSOR_Q6_K) return NULL;
     if (w->ndim < 2 || w->dim[0] % QK_K != 0) return NULL;
@@ -74353,16 +74379,8 @@ static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w) {
     if (!src) return NULL;
     const uint64_t ng = rows / 16u;
     uint8_t *buf = xmalloc((size_t)(ng * blocks * Q6K_X16_BYTES));
-    const block_q6_K *rows16[Q6K_X16_ROWS];
-    for (uint64_t g = 0; g < ng; g++) {
-        for (uint64_t b = 0; b < blocks; b++) {
-            for (uint32_t r = 0; r < Q6K_X16_ROWS; r++)
-                rows16[r] = (const block_q6_K *)
-                        (src + (g * 16u + r) * row_bytes) + b;
-            qwen35_q6k_wide_block(rows16,
-                    buf + (g * blocks + b) * Q6K_X16_BYTES);
-        }
-    }
+    qwen35_q6build_ctx bc = { src, buf, blocks, row_bytes };
+    ds4_parallel_for(ng, qwen35_q6build_worker, &bc);
     qwen35_q6k_put(src, buf);
     return buf;
 }
@@ -76121,6 +76139,138 @@ static void qwen35_gemm_q6_K_q8_K_2x4(
         out[t * out_stride + row + 0] = v0;
         out[t * out_stride + row + 1] = v1;
     }
+}
+
+
+/* Sixteen-lane vpdpbusd over the packed Q6_K layout.
+ *
+ * The 2x4 kernel above unpacks six-bit weights to int16 and multiplies with
+ * madd_epi16, because vpdpbusd wants an unsigned operand and Q6_K's values are
+ * signed. The unsigned trick is exact: keep the six-bit 0..63 the values were
+ * packed as and subtract thirty-two times the activation sum afterwards, which
+ * is what Q4_K's min array does.
+ *
+ * Two things have to be got right or the instruction loses more than it gains.
+ *
+ * First, the correction. Computing the activation sums with a second dpbusd and
+ * then storing them cost more than the multiply it replaced: an earlier version
+ * of this ran at twenty-five tokens a second against forty-two. Folding the
+ * correction into the accumulator with a packed subtract removes the store
+ * entirely.
+ *
+ * Second, the scale. Q6_K carries one scale per sixteen values, and a 512-bit
+ * dpbusd leaves four partial sums in each group of four lanes, so the four
+ * groups inside a (half, c) pair are lanes 0-3, 4-7, 8-11 and 12-15. Multiplying
+ * by a vector that repeats each scale across its four lanes lets all four groups
+ * accumulate in sixteen lanes, so the reduction happens once per block instead
+ * of once per group.
+ *
+ * Numerically identical to the 2x4 kernel: sum((w-32)*s*a) computed as
+ * (sum(w*a) - 32*sum(a))*s, the same integer by associativity, and the block
+ * scale applied afterwards in float as before.
+ */
+static void qwen35_gemm_q6_K_q8_K_2x4_dp(
+        const block_q6_K *x0, const block_q6_K *x1,
+        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
+        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const uint64_t lim = nt < 4u ? nt : 4u;
+    const __m512i ones8 = _mm512_set1_epi8(1);
+    __m512i acc[2][4];
+    for (int r = 0; r < 2; r++)
+        for (int t = 0; t < 4; t++) acc[r][t] = _mm512_setzero_si512();
+    float f[2][4] = { {0.f} };
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        for (int half = 0; half < 2; half++) {
+            for (int c = 0; c < 2; c++) {
+                __m512i wv[2], scv[2];
+                for (int r = 0; r < 2; r++) {
+                    const block_q6_K *xr = (r ? x1 : x0) + b;
+                    const uint8_t *rql = xr->ql + (uint64_t)half * 64u;
+                    const uint8_t *rqh = xr->qh + (uint64_t)half * 32u;
+                    const __m256i qll = _mm256_cvtepu8_epi16(
+                            _mm_loadu_si128((const __m128i *)(rql + c * 16)));
+                    const __m256i qlh = _mm256_cvtepu8_epi16(
+                            _mm_loadu_si128((const __m128i *)(rql + 32 + c * 16)));
+                    const __m256i qhv = _mm256_cvtepu8_epi16(
+                            _mm_loadu_si128((const __m128i *)(rqh + c * 16)));
+                    const __m256i mm0F = _mm256_set1_epi16(0x0F);
+                    const __m256i mm3 = _mm256_set1_epi16(3);
+                    /* kept unsigned: the subtract of thirty-two is the packed
+                     * correction below, not a per-value operation */
+                    const __m256i g0 = _mm256_or_si256(
+                            _mm256_and_si256(qll, mm0F),
+                            _mm256_slli_epi16(_mm256_and_si256(qhv, mm3), 4));
+                    const __m256i g1 = _mm256_or_si256(
+                            _mm256_and_si256(qlh, mm0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 2), mm3), 4));
+                    const __m256i g2 = _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16(qll, 4), mm0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 4), mm3), 4));
+                    const __m256i g3 = _mm256_or_si256(
+                            _mm256_and_si256(_mm256_srli_epi16(qlh, 4), mm0F),
+                            _mm256_slli_epi16(_mm256_and_si256(
+                                    _mm256_srli_epi16(qhv, 6), mm3), 4));
+                    const __m256i b01 = _mm512_cvtepi16_epi8(_mm512_inserti64x4(
+                            _mm512_castsi256_si512(g0), g1, 1));
+                    const __m256i b23 = _mm512_cvtepi16_epi8(_mm512_inserti64x4(
+                            _mm512_castsi256_si512(g2), g3, 1));
+                    wv[r] = _mm512_inserti64x4(_mm512_castsi256_si512(b01), b23, 1);
+                    /* each group's scale across its four lanes */
+                    const int8_t *rs = xr->scales + (uint64_t)half * 8u;
+                    scv[r] = _mm512_setr_epi32(
+                            rs[0 + c], rs[0 + c], rs[0 + c], rs[0 + c],
+                            rs[2 + c], rs[2 + c], rs[2 + c], rs[2 + c],
+                            rs[4 + c], rs[4 + c], rs[4 + c], rs[4 + c],
+                            rs[6 + c], rs[6 + c], rs[6 + c], rs[6 + c]);
+                }
+
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    const int base = half * 4;
+                    __m512i av = _mm512_castsi128_si512(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (uint64_t)(base + 0) * 32u + c * 16)));
+                    av = _mm512_inserti64x2(av, _mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (uint64_t)(base + 1) * 32u + c * 16)), 1);
+                    av = _mm512_inserti64x2(av, _mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (uint64_t)(base + 2) * 32u + c * 16)), 2);
+                    av = _mm512_inserti64x2(av, _mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (uint64_t)(base + 3) * 32u + c * 16)), 3);
+                    /* thirty-two times the activation sum, per lane, shared by
+                     * both rows and folded in below rather than stored */
+                    const __m512i bias = _mm512_slli_epi32(
+                            _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones8, av), 5);
+                    for (int r = 0; r < 2; r++) {
+                        const __m512i d = _mm512_sub_epi32(
+                                _mm512_dpbusd_epi32(_mm512_setzero_si512(), wv[r], av),
+                                bias);
+                        acc[r][t] = _mm512_add_epi32(acc[r][t],
+                                _mm512_mullo_epi32(d, scv[r]));
+                    }
+                }
+            }
+        }
+        const float d0 = f16_to_f32(x0[b].d), d1 = f16_to_f32(x1[b].d);
+        const float yv[4] = { y0d(y, ystride, b, 0, nt), y0d(y, ystride, b, 1, nt),
+                              y0d(y, ystride, b, 2, nt), y0d(y, ystride, b, 3, nt) };
+        for (int r = 0; r < 2; r++) {
+            for (uint64_t t = 0; t < lim; t++) {
+                f[r][t] += (float)_mm512_reduce_add_epi32(acc[r][t]) * (r ? d1 : d0) * yv[t];
+                acc[r][t] = _mm512_setzero_si512();
+            }
+        }
+    }
+
+    for (uint64_t t = 0; t < lim; t++) {
+        out[t * out_stride + row + 0u] = f[0][t];
+        out[t * out_stride + row + 1u] = f[1][t];
+    }
+#else
+    qwen35_gemm_q6_K_q8_K_2x4(x0, x1, y, ystride, blocks, nt, out, out_stride, row);
+#endif
 }
 
 static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t row1) {

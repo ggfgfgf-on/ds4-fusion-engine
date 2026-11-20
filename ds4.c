@@ -76179,6 +76179,136 @@ static void qwen35_gemm_q6_K_q8_K_2x4(
  * (sum(w*a) - 32*sum(a))*s, the same integer by associativity, and the block
  * scale applied afterwards in float as before.
  */
+/* Unpack one row pair once, for every token group to read.
+ *
+ * The 2x4 kernel unpacks six-bit weights inside itself, and it is called once per
+ * token group - so for a hundred and seventeen tokens the same twenty blocks are
+ * unpacked thirty times. A microbenchmark put unpacking somewhere between a third
+ * and nine tenths of the cost, which is too wide to act on, so the way to find out
+ * is to stop paying it more than once.
+ *
+ * Layout is [block][row][half * 128 + position], values already biased by minus
+ * thirty-two, which is what the kernel's int16 stage wants. Two rows, twenty
+ * blocks, is ten kilobytes and stays in L1.
+ */
+static void qwen35_q6_unpack_pair(const block_q6_K *x0, const block_q6_K *x1,
+                                  uint64_t blocks, int8_t *dst) {
+    for (uint64_t b = 0; b < blocks; b++) {
+        const block_q6_K *xs[2] = { x0 + b, x1 + b };
+        for (int r = 0; r < 2; r++) {
+            int8_t *o = dst + (b * 2u + (uint64_t)r) * 256u;
+            for (int half = 0; half < 2; half++) {
+                const uint8_t *ql = xs[r]->ql + (uint64_t)half * 64u;
+                const uint8_t *qh = xs[r]->qh + (uint64_t)half * 32u;
+                int8_t *h = o + half * 128;
+                for (int i = 0; i < 32; i++) {
+                    h[i]      = (int8_t)((int)((ql[i]      & 0x0F) | (((qh[i] >> 0) & 3) << 4)) - 32);
+                    h[32 + i] = (int8_t)((int)((ql[32 + i] & 0x0F) | (((qh[i] >> 2) & 3) << 4)) - 32);
+                    h[64 + i] = (int8_t)((int)((ql[i]      >> 4)  | (((qh[i] >> 4) & 3) << 4)) - 32);
+                    h[96 + i] = (int8_t)((int)((ql[32 + i] >> 4)  | (((qh[i] >> 6) & 3) << 4)) - 32);
+                }
+            }
+        }
+    }
+}
+
+/* The 2x4 kernel with the unpacking already done.
+ *
+ * Numerically identical: the same integers in the same order, only the six-bit
+ * extraction happened earlier.
+ */
+static void qwen35_gemm_q6_K_q8_K_2x4_pre(
+        const int8_t *pre, const block_q6_K *x0, const block_q6_K *x1,
+        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
+        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
+#if defined(__AVX2__)
+    const uint64_t lim = nt < 4u ? nt : 4u;
+    float f00 = 0.f, f01 = 0.f, f02 = 0.f, f03 = 0.f;
+    float f10 = 0.f, f11 = 0.f, f12 = 0.f, f13 = 0.f;
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a03 = a00;
+        __m256i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+        for (int half = 0; half < 2; half++) {
+            for (int c = 0; c < 2; c++) {
+                __m256i q[2][4];
+                for (int r = 0; r < 2; r++) {
+                    const int8_t *h = pre + (b * 2u + (uint64_t)r) * 256u
+                                    + half * 128 + c * 16;
+                    const int8_t *rsc = ((r ? x1 : x0) + b)->scales + half * 8;
+                    q[r][0] = _mm256_mullo_epi16(
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 0))),
+                            _mm256_set1_epi16((short)rsc[0 + c]));
+                    q[r][1] = _mm256_mullo_epi16(
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 32))),
+                            _mm256_set1_epi16((short)rsc[2 + c]));
+                    q[r][2] = _mm256_mullo_epi16(
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 64))),
+                            _mm256_set1_epi16((short)rsc[4 + c]));
+                    q[r][3] = _mm256_mullo_epi16(
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(h + 96))),
+                            _mm256_set1_epi16((short)rsc[6 + c]));
+                }
+                const uint64_t base = (uint64_t)half * 4u;
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 0u) * 32u + c * 16)));
+                    const __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 1u) * 32u + c * 16)));
+                    const __m256i w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 2u) * 32u + c * 16)));
+                    const __m256i w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 3u) * 32u + c * 16)));
+#define Q6P_ACC(acc, r)                                                       \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][0], w0)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][1], w1)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][2], w2)); \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q[r][3], w3))
+                    switch (t) {
+                    case 0: Q6P_ACC(a00, 0); Q6P_ACC(a10, 1); break;
+                    case 1: Q6P_ACC(a01, 0); Q6P_ACC(a11, 1); break;
+                    case 2: Q6P_ACC(a02, 0); Q6P_ACC(a12, 1); break;
+                    default: Q6P_ACC(a03, 0); Q6P_ACC(a13, 1); break;
+                    }
+#undef Q6P_ACC
+                }
+            }
+        }
+        const float d0 = f16_to_f32(x0[b].d), d1 = f16_to_f32(x1[b].d);
+        const float yv[4] = { y0d(y, ystride, b, 0, nt), y0d(y, ystride, b, 1, nt),
+                              y0d(y, ystride, b, 2, nt), y0d(y, ystride, b, 3, nt) };
+        for (uint64_t t = 0; t < lim; t++) {
+            const float k0 = d0 * yv[t], k1 = d1 * yv[t];
+            switch (t) {
+            case 0: f00 += k0 * (float)qwen35_hsum_i32(a00);
+                    f10 += k1 * (float)qwen35_hsum_i32(a10); break;
+            case 1: f01 += k0 * (float)qwen35_hsum_i32(a01);
+                    f11 += k1 * (float)qwen35_hsum_i32(a11); break;
+            case 2: f02 += k0 * (float)qwen35_hsum_i32(a02);
+                    f12 += k1 * (float)qwen35_hsum_i32(a12); break;
+                    default: f03 += k0 * (float)qwen35_hsum_i32(a03);
+                    f13 += k1 * (float)qwen35_hsum_i32(a13); break;
+            }
+        }
+    }
+    for (uint64_t t = 0; t < lim; t++) {
+        float v0, v1;
+        switch (t) {
+        case 0: v0 = f00; v1 = f10; break;
+        case 1: v0 = f01; v1 = f11; break;
+        case 2: v0 = f02; v1 = f12; break;
+        default: v0 = f03; v1 = f13; break;
+        }
+        out[t * out_stride + row + 0] = v0;
+        out[t * out_stride + row + 1] = v1;
+    }
+#else
+    (void)pre;
+    qwen35_gemm_q6_K_q8_K_2x4(x0, x1, y, ystride, blocks, nt, out, out_stride, row);
+#endif
+}
+
 static void qwen35_gemm_q6_K_q8_K_2x4_dp(
         const block_q6_K *x0, const block_q6_K *x1,
         const block_q8_K *y, uint64_t ystride, uint64_t blocks,
@@ -76283,8 +76413,16 @@ static void qwen35_gemm_q6_K_q8_K_2x4_dp(
 #endif
 }
 
+static int g_q6_dp = -1;
+static int g_q6_pre = -1;
+
 static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t row1) {
     qwen35_cpu_matvec_batch_ctx *ctx = vctx;
+    if (g_q6_dp < 0) g_q6_dp = getenv("DS4_QWEN35_Q6DP") != NULL;
+    /* On by default: unpacking once per row pair instead of once per token group
+     * measured 47.80 against 45.32 over three interleaved rounds, and the output
+     * is unchanged. DS4_QWEN35_NO_Q6PRE turns it off. */
+    if (g_q6_pre < 0) g_q6_pre = getenv("DS4_QWEN35_NO_Q6PRE") == NULL;
     const uint64_t blocks = ctx->in_dim / QK_K;
 #if defined(__AVX2__)
     uint64_t row = row0;
@@ -76293,18 +76431,36 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
         /* Q6_K used to fall through to the per-row, per-token tail: one
          * accumulator chain and no weight sharing across tokens. It is 22% of
          * the weight bytes. */
+        int8_t *pre = g_q6_pre ? xmalloc((size_t)(blocks * 2u * 256u)) : NULL;
         for (; row + 1u < row1; row += 2u) {
             const block_q6_K *u0 = (const block_q6_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
             const block_q6_K *u1 = (const block_q6_K *)(ctx->data + (row + 1u) * ctx->row_bytes);
             _mm_prefetch((const char *)(ctx->data + (row + 16u) * ctx->row_bytes), _MM_HINT_T0);
+            /* Unpack once for every token group. The kernel used to do it inside
+             * itself, once per group, so a hundred and seventeen tokens unpacked
+             * the same twenty blocks thirty times. */
+            if (pre) qwen35_q6_unpack_pair(u0, u1, blocks, pre);
             for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u) {
                 uint64_t nt = ctx->n_tok - tt;
                 if (nt > 4u) nt = 4u;
-                qwen35_gemm_q6_K_q8_K_2x4(u0, u1, ctx->xq + tt * blocks, blocks,
-                                          blocks, nt, ctx->out + tt * ctx->out_dim,
-                                          ctx->out_dim, row);
+                if (pre)
+                    qwen35_gemm_q6_K_q8_K_2x4_pre(pre, u0, u1,
+                                                 ctx->xq + tt * blocks,
+                                                 blocks, blocks, nt,
+                                                 ctx->out + tt * ctx->out_dim,
+                                                 ctx->out_dim, row);
+                else if (g_q6_dp)
+                    qwen35_gemm_q6_K_q8_K_2x4_dp(u0, u1, ctx->xq + tt * blocks,
+                                                 blocks, blocks, nt,
+                                                 ctx->out + tt * ctx->out_dim,
+                                                 ctx->out_dim, row);
+                else
+                    qwen35_gemm_q6_K_q8_K_2x4(u0, u1, ctx->xq + tt * blocks, blocks,
+                                              blocks, nt, ctx->out + tt * ctx->out_dim,
+                                              ctx->out_dim, row);
             }
         }
+        free(pre);
     }
     if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
         getenv("DS4_QWEN35_NO_X4") == NULL) {

@@ -133,6 +133,68 @@ static float run_dpbusd(void)
     return total;
 }
 
+
+/* Unpacking with the multiply removed: the gap to run_madd is the MAC share. */
+static float run_unpack_only(void)
+{
+    float total = 0.0f;
+    for (int b = 0; b < BLOCKS; b++) {
+        for (int g = 0; g < 16; g++) {
+            uint8_t v[16];
+            const int n128 = (g >= 8) ? 1 : 0;
+            for (int i = 0; i < 16; i++) {
+                const int p = g * 16 + i;
+                const int r = p - n128 * 128;
+                const uint8_t *ql = g_ql[b] + (n128 ? 64 : 0);
+                const uint8_t *qh = g_qh[b] + (n128 ? 32 : 0);
+                int l;
+                if (r < 32)      { l = r;      v[i] = (uint8_t)((ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)); }
+                else if (r < 64) { l = r - 32; v[i] = (uint8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)); }
+                else if (r < 96) { l = r - 64; v[i] = (uint8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)); }
+                else             { l = r - 96; v[i] = (uint8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)); }
+            }
+            for (int i = 0; i < 16; i++) total += (float)v[i] * (float)g_sc[b][g];
+        }
+    }
+    return total;
+}
+
+
+/* Vectorised unpacking with the dpbusd removed, so the split inside the shape
+ * the engine actually uses can be read directly. */
+static float run_unpack_vec(void)
+{
+    float total = 0.0f;
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+    const __m512i m03 = _mm512_set1_epi8(0x03);
+    const __mmask64 upper = 0xFFFFFFFF00000000ull;
+    for (int b = 0; b < BLOCKS; b++) {
+        for (int half = 0; half < 2; half++) {
+            for (int q = 0; q < 4; q++) {
+                const int base = q * 64;
+                const uint8_t *qlp = g_ql[b] + (half ? 64 : 0);
+                const uint8_t *qhp = g_qh[b] + (half ? 32 : 0);
+                const int shift = ((base >> 5) & 1) * 2;
+                const __m512i ql = _mm512_loadu_si512((const void *)qlp);
+                const __m256i qh = _mm256_loadu_si256((const __m256i *)qhp);
+                __m512i qd = _mm512_castsi256_si512(qh);
+                qd = _mm512_inserti64x4(qd, qh, 1);
+                const __m512i lo = _mm512_and_si512(ql, m0F);
+                const __m512i ha = _mm512_and_si512(qd, m03);
+                const __m512i hb = _mm512_and_si512(_mm512_srli_epi16(qd, 2), m03);
+                const __m512i hi = (shift == 0)
+                        ? _mm512_mask_blend_epi8(upper, ha, hb)
+                        : _mm512_mask_blend_epi8(upper, hb, ha);
+                const __m512i v = _mm512_or_si512(lo, _mm512_slli_epi16(hi, 4));
+                int8_t lane[64];
+                _mm512_storeu_si512(lane, v);
+                for (int i = 0; i < 64; i++) total += (float)lane[i];
+            }
+        }
+    }
+    return total;
+}
+
 int main(void)
 {
     for (int b = 0; b < BLOCKS; b++) {
@@ -166,6 +228,24 @@ int main(void)
            t_m / ITER * 1e9, macs / t_m / 1e9);
     printf("byte unpack + vpdpbusd    %8.1f   %7.2f   %.2fx\n",
            t_d / ITER * 1e9, macs / t_d / 1e9, t_m / t_d);
+    double t4 = 0.0;
+    for (int round = 0; round < 3; round++) {
+        double t0 = now_s();
+        for (int i = 0; i < ITER; i++) sink += run_unpack_only();
+        double t1 = now_s();
+        t4 = t1 - t0;
+    }
+    printf("unpack only (no MAC)      %8.1f                    %.0f%% of madd path\n",
+           t4 / ITER * 1e9, 100.0 * t4 / t_m);
+    double t5 = 0.0;
+    for (int round = 0; round < 3; round++) {
+        double t0 = now_s();
+        for (int i = 0; i < ITER; i++) sink += run_unpack_vec();
+        double t1 = now_s();
+        t5 = t1 - t0;
+    }
+    printf("vector unpack only        %8.1f                    %.0f%% of dpbusd path\n",
+           t5 / ITER * 1e9, 100.0 * t5 / t_d);
     printf("(sink %f)\n", (double)sink);
     return 0;
 }

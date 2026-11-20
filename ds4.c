@@ -76845,11 +76845,66 @@ static void qwen35_gdn_scan_worker(void *vctx, uint64_t t0, uint64_t t1) {
         c->lin_o[(uint64_t)h * D + dv] = o;
     }
 }
+/* The causal convolution across a whole layer's tokens, one channel at a time.
+ *
+ * The per-token form ran this loop inside qwen35_gdn_token, which the batch
+ * forward called once per token from a plain sequential for loop - so eight
+ * thousand channels times a hundred and seventeen tokens ran on one thread, three
+ * milliseconds a layer and a hundred and forty milliseconds a pass.
+ *
+ * The history is per channel: hist[i][c] belongs to channel c alone, and the token
+ * recurrence is inside it. So the parallel axis is the channel and the token loop
+ * runs within, the same shape as the SSM scan, which keeps the recurrence exact
+ * while using every thread. */
+typedef struct {
+    float *hist;
+    const float *conv_w;
+    float *qk;
+    uint64_t n_tok, stride;
+    uint32_t C;
+    /* When non-NULL the history after every token but the last is written here,
+     * at [token][i * C + c] - the per-position snapshot a partial speculative
+     * accept needs, which can no longer be taken from the per-token loop now that
+     * the roll happens for all tokens at once. */
+    float *snap;
+    uint64_t snap_stride;
+} qwen35_gdn_conv_arg;
+
+static void qwen35_gdn_conv_worker(void *vctx, uint64_t c0, uint64_t c1) {
+    qwen35_gdn_conv_arg *a = vctx;
+    const uint32_t C = a->C;
+    for (uint64_t c = c0; c < c1; c++) {
+        const float cw0 = a->conv_w[c * 4u + 0u];
+        const float cw1 = a->conv_w[c * 4u + 1u];
+        const float cw2 = a->conv_w[c * 4u + 2u];
+        const float cw3 = a->conv_w[c * 4u + 3u];
+        float h0 = a->hist[(uint64_t)0 * C + c];
+        float h1 = a->hist[(uint64_t)1 * C + c];
+        float h2 = a->hist[(uint64_t)2 * C + c];
+        for (uint64_t t = 0; t < a->n_tok; t++) {
+            float *qk = a->qk + t * a->stride;
+            const float x = qk[c];
+            const float v = cw3 * x + cw0 * h0 + cw1 * h1 + cw2 * h2;
+            h0 = h1; h1 = h2; h2 = x;
+            qk[c] = v / (1.0f + expf(-v));
+            if (a->snap && t + 1u < a->n_tok) {
+                float *sn = a->snap + t * a->snap_stride;
+                sn[(uint64_t)0 * C + c] = h0;
+                sn[(uint64_t)1 * C + c] = h1;
+                sn[(uint64_t)2 * C + c] = h2;
+            }
+        }
+        a->hist[(uint64_t)0 * C + c] = h0;
+        a->hist[(uint64_t)1 * C + c] = h1;
+        a->hist[(uint64_t)2 * C + c] = h2;
+    }
+}
+
 static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
         float *qk, const float *blk, const float *zz,
         float *tmp_row, uint32_t tmp_dim, float *lin_o, float *ga, float *gb,
-        int skip_scan, int ga_gb_pre) {
+        int skip_scan, int ga_gb_pre, int skip_conv) {
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t OW = Hv * D;
@@ -76858,14 +76913,16 @@ static void qwen35_gdn_token(
     float *hist = s->qwen35_cpu_conv_hist[il];
     float *state = s->qwen35_cpu_ssm_state[il];
 
-    for (uint32_t c = 0; c < C; c++) {
-        float v = conv_w[c * 4u + 3u] * qk[c];
-        for (uint32_t i = 0; i < 3; i++)
-            v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
-        hist[(uint64_t)0 * C + c] = hist[(uint64_t)1 * C + c];
-        hist[(uint64_t)1 * C + c] = hist[(uint64_t)2 * C + c];
-        hist[(uint64_t)2 * C + c] = qk[c];
-        qk[c] = v / (1.0f + expf(-v));
+    if (!skip_conv) {
+        for (uint32_t c = 0; c < C; c++) {
+            float v = conv_w[c * 4u + 3u] * qk[c];
+            for (uint32_t i = 0; i < 3; i++)
+                v += conv_w[c * 4u + i] * hist[(uint64_t)i * C + c];
+            hist[(uint64_t)0 * C + c] = hist[(uint64_t)1 * C + c];
+            hist[(uint64_t)1 * C + c] = hist[(uint64_t)2 * C + c];
+            hist[(uint64_t)2 * C + c] = qk[c];
+            qk[c] = v / (1.0f + expf(-v));
+        }
     }
     /* These are small (48 outputs) but were on the scalar double-precision
      * reference path: it dequantizes each row into a float buffer and then
@@ -77742,6 +77799,22 @@ static void qwen35_cpu_forward_batch(
                 spec_base = g_spec_snap +
                             (uint64_t)il * spec_per;
             }
+            /* One region for the whole layer's causal convolution, instead of one
+             * sequential pass per token. The history is per channel and the token
+             * recurrence lives inside it, so the channel is the parallel axis. */
+            {
+                qwen35_gdn_conv_arg cv;
+                cv.hist = s->qwen35_cpu_conv_hist[il];
+                cv.conv_w = qwen4_ref_f32(m, l->lin_conv);
+                cv.qk = qkv;
+                cv.n_tok = n_tok;
+                cv.stride = QKV_STRIDE;
+                cv.C = C;
+                cv.snap = (spec_base && n_tok > 1u)
+                              ? spec_base + spec_ssm_f : NULL;
+                cv.snap_stride = (uint64_t)DS4_MAX_LAYER * spec_per;
+                ds4_parallel_for((uint64_t)C, qwen35_gdn_conv_worker, &cv);
+            }
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
                 qwen35_gdn_token(m, l, s, il, qk,
@@ -77752,15 +77825,10 @@ static void qwen35_cpu_forward_batch(
                                  ga + (uint64_t)t * Hv,
                                  gb + (uint64_t)t * Hv,
                                  getenv("DS4_QWEN35_NO_WHOLE_SCAN") ? 0 : 1,
-                                 gdn_ga_gb_pre);
-                /* The conv history is updated here, once per token, so this is
-                 * where its per-position snapshot is taken. */
-                if (spec_base && t + 1u < n_tok)
-                    memcpy(g_spec_snap +
-                               (uint64_t)t * (uint64_t)DS4_MAX_LAYER * spec_per +
-                               (uint64_t)il * spec_per + spec_ssm_f,
-                           s->qwen35_cpu_conv_hist[il],
-                           (size_t)spec_conv_f * sizeof(float));
+                                 gdn_ga_gb_pre, 1);
+                /* The conv history is now rolled for the whole layer before this
+                 * loop, and its per-position snapshot is written by the conv
+                 * worker, so there is nothing to capture here. */
             }
             clock_gettime(CLOCK_MONOTONIC, &g2b);
             gdn2_ms += (double)(g2b.tv_sec - g2a.tv_sec) * 1e3 +
@@ -78496,7 +78564,7 @@ static void qwen35_cpu_forward_token(
             PROF_TICK();
             /* the same shared per-token block the batched path uses */
             qwen35_gdn_token(m, l, s, il, qkv, blk, z, tmp,
-                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb, 0, 0);
+                             (uint32_t)l->lin_out->dim[0], lin_o, ga, gb, 0, 0, 0);
             qwen35_cpu_matvec(m, l->lin_out, tmp, blk, s->qwen35_cpu_q8, gdn_f32);
             PROF_TOCK(t_mv);
             if (il == 0u && getenv("DS4_QWEN35_TRACE0")) {

@@ -2626,10 +2626,26 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
+    /* Derived from the machine, not defaulted to a constant.
+     *
+     * This used to be a dozen threads whatever the hardware was, which on the
+     * sixteen core machine this was tuned on costs forty-five percent: twelve
+     * threads measure 38.94 tokens a second against 54.97 at twenty-eight.
+     *
+     * Seven eighths of the logical count is the rule that reproduces that: thirty
+     * two logical gives twenty-eight, which is the measured optimum. Going all the
+     * way to thirty-two - full SMT pairing, every core with a sibling - drops to
+     * 51.33, so leaving a few cores unpaired is better than filling them. The
+     * ratio was swept at 12, 20, 24, 28 and 32 on this hardware, and 28 is the peak
+     * with 32 clearly below it.
+     *
+     * DS4_THREADS still overrides. */
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
+        long derived = online_cpus - online_cpus / 8;
+        if (derived < 1) derived = 1;
+        n_threads = (uint32_t)derived;
     }
 
     const char *env = getenv("DS4_THREADS");
@@ -88933,7 +88949,23 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * (verified max|diff|=0 for n=1..59), so batch the prompt by
              * default: 2.9 -> 7.2 t/s prefill on the dense 27B. */
             if (getenv("DS4_QWEN35_REPACK_TEST")) qwen35_repack_selftest();
-            uint32_t pbatch = 128;
+            /* Derived rather than defaulted. The optimum is one chunk covering the
+             * prompt: a second chunk re-runs the whole layer stack for its own
+             * tokens and re-projects its last position through the head, then
+             * overwrites the logits the first chunk copied out, so it is pure
+             * loss. Measured, 117 tokens gives 51.34 at sixty-four and 54.41 at
+             * a hundred and twenty-eight; a 292 token prompt is flat from a
+             * hundred and twenty-eight to a hundred and ninety-two and falls off
+             * above. So: cover the prompt, floor at 128 for the amortisation,
+             * ceiling at 512 to bound the logits buffer.
+             *
+             * This was a static sixty-four with a silent cap, which meant a
+             * tuner sweeping it measured the cap in one arm and reported the cap
+             * as the parameter's behaviour. DS4_PREFILL_BATCH still overrides. */
+            uint64_t want = (prompt->len > 0) ? (uint64_t)prompt->len : 1u;
+            if (want < 128u) want = 128u;
+            if (want > 512u) want = 512u;
+            uint32_t pbatch = (uint32_t)want;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);
@@ -88945,8 +88977,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  * extra chunk is pure loss. Raised to five hundred and twelve,
                  * which bounds the logits buffer at a hundred and fifty
                  * megabytes. */
-                if (pv > 0 && pv <= 512) pbatch = (uint32_t)pv;
+                if (pv > 0 && pv <= 512) {
+                    pbatch = (uint32_t)pv;
+                } else if (getenv("DS4_QWEN35_KNOBS")) {
+                    /* Print rather than clamp in silence. A clamped knob is worse
+                     * than no knob: the autotuner that sweeps these measured the
+                     * clamp in one arm and reported it as the parameter's
+                     * behaviour, so it could never find an optimum above the cap. */
+                    fprintf(stderr, "[knob] DS4_PREFILL_BATCH=%d rejected "
+                            "(range 1..512), keeping %u\n", pv, pbatch);
+                }
             }
+            if (getenv("DS4_QWEN35_KNOBS"))
+                fprintf(stderr, "[knob] pbatch=%u threads=%d\n",
+                        pbatch, (int)DS4_MAX_THREADS);
             float *lb = xmalloc((size_t)pbatch * (size_t)DS4_N_VOCAB * sizeof(float));
             int *buf = xmalloc((size_t)pbatch * sizeof(int));
             for (int base = 0; base < prompt->len; base += (int)pbatch) {

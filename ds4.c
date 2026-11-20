@@ -74681,10 +74681,16 @@ static void qwen35_gemm_q4_K_16x8_t(
 
 static int g_nibs1 = -1;   /* DS4_QWEN35_NIBS=1 selects the one-pass form */
 
+/* add!=0 accumulates into out instead of overwriting it, which is what lets the
+ * caller walk the weight stream in K tiles: a tile's partial sums land in out, the
+ * next tile adds to them, and the output buffer becomes the accumulator that the
+ * registers cannot be. The tile exists so the weight block for one row group fits
+ * L1 - twenty blocks is sixty-seven kilobytes against a forty-eight kilobyte L1,
+ * so without it every token group re-reads the weights from L2. */
 static void qwen35_gemm_q4_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
-        uint64_t row0) {
+        uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
     const uint64_t lim = nt < 8u ? nt : 8u;
@@ -74969,12 +74975,14 @@ static void qwen35_gemm_q4_K_16x8(
                          : (t == 6) ? f6 : f7;
         float lane[Q4K_X16_ROWS];
         _mm512_storeu_ps(lane, fv);
-        for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
-            out[t * out_stride + row0 + r] = lane[r] + minv[r][t];
+        for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+            if (add) out[t * out_stride + row0 + r] += lane[r] + minv[r][t];
+            else      out[t * out_stride + row0 + r]  = lane[r] + minv[r][t];
+        }
     }
 #else
     (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
-    (void)out; (void)out_stride; (void)row0;
+    (void)out; (void)out_stride; (void)row0; (void)add;
     ds4_die("16x8 Q4_K kernel needs AVX-512");
 #endif
 }
@@ -75021,7 +75029,7 @@ static void qwen35_x8_worker(void *vctx, uint64_t g0, uint64_t g1) {
             if (nt8 > w8_tgs) nt8 = w8_tgs;
             qwen35_gemm_q4_K_16x8(row, c->blocks, c->xq + tt * c->blocks,
                                   c->blocks, nt8, c->out + tt * c->out_dim,
-                                  c->out_dim, g * 16u);
+                                  c->out_dim, g * 16u, 0);
         }
     }
     free(xt);
@@ -76015,7 +76023,7 @@ static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const flo
             for (uint64_t g = 0; g < rows / 16u; g++)
                 qwen35_gemm_q4_K_16x8(
                         xb + g * blocks * Q4K_X16X8_BYTES, blocks,
-                        q8_scratch, blocks, 1u, out, rows, g * 16u);
+                        q8_scratch, blocks, 1u, out, rows, g * 16u, 0);
             return;
         }
     }
@@ -77505,13 +77513,37 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
         const uint8_t *tb = (const uint8_t *)tensor_data(c->m, jb->w);
         const uint8_t *xb = qwen35_x8_get(tb);
         if (!xb) continue;
-        for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
-            uint64_t nt8 = c->n_tok - tt;
-            if (nt8 > 8u) nt8 = 8u;
-            qwen35_gemm_q4_K_16x8(
-                    xb + k * jb->blocks * Q4K_X16X8_BYTES, jb->blocks,
-                    c->xq + tt * jb->blocks, jb->blocks, nt8,
-                    jb->out + tt * jb->rows, jb->rows, k * 16u);
+        /* Walk the weight stream in K tiles.
+         *
+         * The whole row group is sixty-seven kilobytes of packed weights and L1 is
+         * forty-eight, so when the token loop re-reads it once per group of eight
+         * tokens - fifteen times for a hundred and seventeen - those re-reads come
+         * from L2. Tiling K so a tile fits L1 should turn them into L1 hits. The
+         * tile is applied OUTSIDE the token loop, which is the whole point: one
+         * tile stays resident while every token group walks it, and the partial
+         * sums for the tiles ride in the output buffer, seven kilobytes against a
+         * weight stream measured in gigabytes.
+         *
+         * DS4_QWEN35_KTILE sets the tile in blocks; 20 is one tile, i.e. no split. */
+        static int ktile = -1;
+        if (ktile < 0) {
+            const char *te = getenv("DS4_QWEN35_KTILE");
+            ktile = (te && te[0]) ? atoi(te) : 20;
+            if (ktile < 1) ktile = 1;
+            if (ktile > 64) ktile = 64;
+        }
+        for (uint64_t b0 = 0; b0 < jb->blocks; b0 += (uint64_t)ktile) {
+            uint64_t nb = jb->blocks - b0;
+            if (nb > (uint64_t)ktile) nb = (uint64_t)ktile;
+            const int add = (b0 == 0) ? 0 : 1;
+            for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+                uint64_t nt8 = c->n_tok - tt;
+                if (nt8 > 8u) nt8 = 8u;
+                qwen35_gemm_q4_K_16x8(
+                        xb + (k * jb->blocks + b0) * Q4K_X16X8_BYTES, nb,
+                        c->xq + tt * jb->blocks + b0, jb->blocks, nt8,
+                        jb->out + tt * jb->rows, jb->rows, k * 16u, add);
+            }
         }
     }
 }

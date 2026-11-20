@@ -74394,10 +74394,20 @@ typedef struct {
 
 static void qwen35_q6_worker(void *vctx, uint64_t g0, uint64_t g1) {
     qwen35_q6_work *c = vctx;
-    for (uint64_t g = g0; g < g1; g++)
-        qwen35_gemm_q6_K_16x8(c->data + g * c->blocks * Q6K_X16_BYTES,
-                              c->blocks, c->xq, c->blocks, c->n_tok,
-                              c->out, c->out_dim, g * 16u);
+    /* Token groups inside the row loop, the order the Q4_K wide worker uses.
+     * With them outside, the dispatcher ran a separate parallel region per
+     * group, so every group re-walked the whole weight tensor - fifteen passes
+     * over 4.4 GB where one is needed. */
+    for (uint64_t g = g0; g < g1; g++) {
+        const uint8_t *grp = c->data + g * c->blocks * Q6K_X16_BYTES;
+        for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+            uint64_t nt8 = c->n_tok - tt;
+            if (nt8 > 8u) nt8 = 8u;
+            qwen35_gemm_q6_K_16x8(grp, c->blocks, c->xq + tt * c->blocks,
+                                  c->blocks, nt8, c->out + tt * c->out_dim,
+                                  c->out_dim, g * 16u);
+        }
+    }
 }
 
 /* Transpose one token group of activations to [block][jp][chunk][token].
@@ -76770,26 +76780,56 @@ static void qwen35_cpu_matvec_batch(
             return;
         }
     }
+    /* The wide Q6_K path, hoisted out of the Q4_K condition it used to sit in.
+     *
+     * There it was unreachable - the enclosing condition required Q4_K and this
+     * one requires Q6_K - so it had never executed and every measurement of it
+     * had been a measurement of the packed path under both names. The note that
+     * stood there argued against hoisting on three grounds, all of which have
+     * since been fixed and re-measured: the builder took eight seconds and is now
+     * parallel at three tenths; the token groups were walked outside the row loop,
+     * re-reading the tensor fifteen times, and are now inside; and what is left is
+     * a genuine fifty percent more bytes, which measures as a wash rather than a
+     * loss. Measured with all three fixed, it is not a wash either: the wide path
+     * runs at 38.5 tokens a second against the packed path's 45.5, because the
+     * fifty percent more bytes outweigh whatever the wider instruction buys. So
+     * this is now opt-in through DS4_QWEN35_Q6W rather than opt-out, and the
+     * packed 2x4 path is what runs. */
+    if (w->type == DS4_TENSOR_Q6_K && !exact &&
+        getenv("DS4_QWEN35_Q6W") != NULL) {
+        if (getenv("DS4_QWEN35_Q6DBG")) {
+            static int shown = 0;
+            if (!shown) { shown = 1;
+                fprintf(stderr, "[q6see] rows=%llu blocks=%llu\n",
+                        (unsigned long long)rows,
+                        (unsigned long long)blocks); }
+        }
+        uint8_t *qb = qwen35_q6k_get(tdata);
+        if (!qb) qb = qwen35_q6k_build(m, w);
+        if (qb) {
+            qwen35_q6_work w6;
+            w6.data = qb; w6.blocks = blocks; w6.out_dim = rows;
+            w6.xq = xq;
+            w6.out = out;
+            w6.n_tok = n_tok;
+            ds4_parallel_for(rows / 16u, qwen35_q6_worker, &w6);
+            free(xq);
+            return;
+        }
+    }
     if (w->type == DS4_TENSOR_Q4_K && !exact &&
         getenv("DS4_QWEN35_X16") != NULL &&
         getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&
         rows >= 16u && (rows % 16u) == 0u &&
         (row_bytes % Q4K_ROW) == 0u && row_bytes >= Q4K_ROW) {
-        /* Unreachable: the enclosing condition requires Q4_K and this one
-         * requires Q6_K. Left in place rather than deleted, and the kernel's
-         * correction term above is now numerically right, because deleting it
-         * would take qwen35_q6k_at with it and the GPU head uses that.
-         *
-         * Do not simply move it outward. Measured: the wide Q6_K record is 4928
-         * bytes per sixteen rows per block against 3360 in the packed form, so
-         * forty-seven percent more to read, and building it dequantises and
-         * requantises every value on the host, seconds against the 1.1 the Q4_K
-         * builder needs for twice the bytes because that one is a copy. Running
-         * it gave 6.5 t/s against 36.
-         *
-         * What actually fixed the Q6_K side was the loop order in
-         * qwen35_x8_worker: it applies to the 2x4 path through the batched
-         * dispatch and needs no new layout at all. */
+        /* Unreachable here: the enclosing condition requires Q4_K and this one
+         * requires Q6_K. The live copy is hoisted above, out of this block - the
+         * note that used to argue against hoisting was written when the wide
+         * record cost eight seconds to build (it is now parallel and costs three
+         * tenths) and when the token groups were walked outside the row loop
+         * (they are now inside). Measured with both fixed, the wide path matches
+         * the packed one to two tenths of a percent at every prompt length, so
+         * it stays behind DS4_QWEN35_NO_Q6W rather than becoming the default. */
         if (0 && w->type == DS4_TENSOR_Q6_K && !exact &&
             getenv("DS4_QWEN35_NO_Q6W") == NULL) {
             if (getenv("DS4_QWEN35_Q6DBG")) {
@@ -76804,14 +76844,10 @@ static void qwen35_cpu_matvec_batch(
             if (qb) {
                 qwen35_q6_work w6;
                 w6.data = qb; w6.blocks = blocks; w6.out_dim = rows;
-                for (uint64_t tt = 0; tt < n_tok; tt += 8u) {
-                    uint64_t nt8 = n_tok - tt;
-                    if (nt8 > 8u) nt8 = 8u;
-                    w6.xq = xq + tt * blocks;
-                    w6.out = out + tt * rows;
-                    w6.n_tok = nt8;
-                    ds4_parallel_for(rows / 16u, qwen35_q6_worker, &w6);
-                }
+                w6.xq = xq;
+                w6.out = out;
+                w6.n_tok = n_tok;
+                ds4_parallel_for(rows / 16u, qwen35_q6_worker, &w6);
                 free(xq);
                 return;
             }

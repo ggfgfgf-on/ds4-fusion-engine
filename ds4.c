@@ -77481,7 +77481,9 @@ static void qwen35_cpu_forward_batch(
 
     for (uint32_t il = 0; il < n_trunk; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        QPH_T0(ph_rms);
         qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->attn_norm), E, n_tok, eps);
+        QPH_ACC(rms, ph_rms);
         if (getenv("DS4_QWEN35_BDBG") && il < 3) {
             for (uint32_t t = 0; t < n_tok; t++) {
                 double s = 0.0, sx = 0.0;
@@ -77586,7 +77588,9 @@ static void qwen35_cpu_forward_batch(
                             qwen35_dbg_l2(blk + (uint64_t)t * E, E),
                             (double)tmp[(uint64_t)t * C]);
             }
-            qwen35_add_par(xb, blk, NT * E);
+            QPH_T0(ph_add);
+        qwen35_add_par(xb, blk, NT * E);
+        QPH_ACC(add, ph_add);
             if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
                 for (uint32_t t = 0; t < n_tok; t++)
                     fprintf(stderr, "[gdnb] t=%u POST-resid xb_l2=%.6f xb0=%.6f\n",
@@ -77623,10 +77627,14 @@ static void qwen35_cpu_forward_batch(
             attn_ms += (double)(at1.tv_sec - at0.tv_sec) * 1e3 +
                        (double)(at1.tv_nsec - at0.tv_nsec) / 1e6;
             qwen35_cpu_matvec_batch(m, l->attn_output, attn_o, blk, NT, false);
-            qwen35_add_par(xb, blk, NT * E);
+            QPH_T0(ph_add);
+        qwen35_add_par(xb, blk, NT * E);
+        QPH_ACC(add, ph_add);
         }
         /* the dense FFN: the batched post norm, gate/up/down. */
+        QPH_T0(ph_rms2);
         qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->post_attn_norm), E, n_tok, eps);
+        QPH_ACC(rms, ph_rms2);
         const int ffn_dbg = getenv("DS4_QWEN35_GDN_DBG") != NULL && il == 0;
 #define FFN_CHK(tag) do { if (ffn_dbg) { \
             fprintf(stderr, "[ffn] " tag " xb_l2=%.6f blk_l2=%.6f fa=%.6f fb=%.6f\n", \
@@ -77651,7 +77659,9 @@ static void qwen35_cpu_forward_batch(
          * it is one of the few elementwise blocks big enough to be worth a
          * parallel region of its own. */
         qwen35_silu_work sw = { ff_a, ff_b, NT * FF };
+        QPH_T0(ph_silu);
         ds4_parallel_for(NT * FF / 4096u + 1u, qwen35_silu_worker, &sw);
+        QPH_ACC(silu, ph_silu);
         FFN_CHK("silu");
         qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, ffn_exact);
         FFN_CHK("down");
@@ -77671,6 +77681,15 @@ static void qwen35_cpu_forward_batch(
      * 218 GB of traffic for a sixty-four token prompt. Every position needs its
      * own logits, but they all multiply the same head, so it is one batched
      * matvec: normalise each position first, then read the head once. */
+    if (g_ph_on) {
+        const double tot = g_ph.rms + g_ph.matvec + g_ph.attn + g_ph.add
+                         + g_ph.silu + g_ph.gdn + g_ph.head;
+        fprintf(stderr,
+                "[phase] rms=%.0f matvec=%.0f attn=%.0f add=%.0f silu=%.0f "
+                "gdn=%.0f head=%.0f  measured=%.0f ms\n",
+                g_ph.rms, g_ph.matvec, g_ph.attn, g_ph.add, g_ph.silu,
+                g_ph.gdn, g_ph.head, tot);
+    }
     qwen35_rms_par(blk, xb, qwen4_ref_f32(m, w->output_norm), E, n_tok, eps);
     qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
     /* the MTP draft for the position after the batch's last token (blk holds

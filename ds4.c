@@ -74930,8 +74930,13 @@ static void qwen35_gemm_q4_K_16x8(
     }
     }
 
-    /* the -dmin term depends only on (row, token), never on qs */
-    float minv[Q4K_X16_ROWS][8];
+    /* The -dmin term depends only on (row, token), never on qs. Stored token-major
+     * so the sixteen row values for one token are contiguous: both the accumulate
+     * below and the flush at the end then move a whole 512-bit vector instead of
+     * walking sixteen scalars. That walk was most of the kernel's cost outside the
+     * multiply - the comment above counts the multiply at 256 instructions per
+     * block and the flush at another 152, and this is where those 152 came from. */
+    float minv[8][Q4K_X16_ROWS];
     memset(minv, 0, sizeof minv);
     for (uint64_t b = 0; b < blocks; b++) {
         const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
@@ -74962,10 +74967,10 @@ static void qwen35_gemm_q4_K_16x8(
                         (int32_t)(((uint32_t)q1 << 16) | ((uint32_t)q0 & 0xFFFFu)));
                 acc = _mm512_add_epi32(acc, _mm512_madd_epi16(mn16[m], bs));
             }
-            float lane[Q4K_X16_ROWS];
-            _mm512_storeu_ps(lane, _mm512_cvtepi32_ps(acc));
-            for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
-                minv[r][t] -= yt->d * dmv[r] * lane[r];
+            const __m512 wv = _mm512_mul_ps(
+                    _mm512_mul_ps(dmv, _mm512_set1_ps(yt->d)),
+                    _mm512_cvtepi32_ps(acc));
+            _mm512_storeu_ps(minv[t], _mm512_sub_ps(_mm512_loadu_ps(minv[t]), wv));
         }
     }
 
@@ -74973,12 +74978,10 @@ static void qwen35_gemm_q4_K_16x8(
         const __m512 fv = (t == 0) ? f0 : (t == 1) ? f1 : (t == 2) ? f2
                          : (t == 3) ? f3 : (t == 4) ? f4 : (t == 5) ? f5
                          : (t == 6) ? f6 : f7;
-        float lane[Q4K_X16_ROWS];
-        _mm512_storeu_ps(lane, fv);
-        for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
-            if (add) out[t * out_stride + row0 + r] += lane[r] + minv[r][t];
-            else      out[t * out_stride + row0 + r]  = lane[r] + minv[r][t];
-        }
+        __m512 rv = _mm512_add_ps(fv, _mm512_loadu_ps(minv[t]));
+        float *dst = out + t * out_stride + row0;
+        if (add) rv = _mm512_add_ps(_mm512_loadu_ps(dst), rv);
+        _mm512_storeu_ps(dst, rv);
     }
 #else
     (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;

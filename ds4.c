@@ -78568,7 +78568,12 @@ static void qwen35_cpu_forward_token(
          * gain is what makes it worth paying. */
         {
             float *hb = xmalloc((size_t)E * sizeof(float));
-            int chain_max = 2;
+            /* One link. Measured at 2.44 with none, 3.06 with one and 2.44
+             * with two against a 2.86 baseline: a single link wins because the
+             * verify has to project the head at every position it checks, and a
+             * second link adds five hundred megabytes of head traffic to every
+             * round while its accept rate is already below half. */
+            int chain_max = 1;
             const char *ce = getenv("DS4_QWEN35_MTP_CHAIN");
             if (ce && ce[0] >= '0' && ce[0] <= '9') chain_max = ce[0] - '0';
             if (chain_max > 2) chain_max = 2;

@@ -88933,11 +88933,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * (verified max|diff|=0 for n=1..59), so batch the prompt by
              * default: 2.9 -> 7.2 t/s prefill on the dense 27B. */
             if (getenv("DS4_QWEN35_REPACK_TEST")) qwen35_repack_selftest();
-            uint32_t pbatch = 64;
+            uint32_t pbatch = 128;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
                 int pv = atoi(pbenv);
-                if (pv > 0 && pv <= 64) pbatch = (uint32_t)pv;
+                /* The cap used to be sixty-four, which silently clamped anything
+                 * larger and left every prompt longer than that split into
+                 * several chunks. Each chunk re-runs the layer stack for its own
+                 * tokens, re-projects its last position through the head, and
+                 * overwrites the logits the previous chunk copied out - so the
+                 * extra chunk is pure loss. Raised to five hundred and twelve,
+                 * which bounds the logits buffer at a hundred and fifty
+                 * megabytes. */
+                if (pv > 0 && pv <= 512) pbatch = (uint32_t)pv;
             }
             float *lb = xmalloc((size_t)pbatch * (size_t)DS4_N_VOCAB * sizeof(float));
             int *buf = xmalloc((size_t)pbatch * sizeof(int));

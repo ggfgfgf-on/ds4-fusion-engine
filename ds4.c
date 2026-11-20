@@ -2431,6 +2431,7 @@ typedef struct {
     ds4_parallel_fn fn;
     void *ctx;
     uint64_t n_rows;
+    uint64_t main_end;         /* rows the dispatching thread takes for itself */
     int pin_cpu[DS4_MAX_THREADS]; /* -1 = unpinned; else logical CPU to pin to */
 } ds4_thread_pool;
 
@@ -2544,9 +2545,15 @@ static void *ds4_worker_main(void *arg) {
         const uint32_t n_threads = g_pool.n_threads;
         pthread_mutex_unlock(&g_pool.mutex);
 
-        /* Same proportional boundaries as the dispatcher above. */
-        const uint64_t row0 = n_rows * (uint64_t)tid / (uint64_t)n_threads;
-        uint64_t row1 = n_rows * (uint64_t)(tid + 1u) / (uint64_t)n_threads;
+        /* The remainder after the main thread's slice, tiled across the workers
+         * with proportional boundaries so the pieces differ by at most one row
+         * and none is empty. */
+        const uint64_t wbase = g_pool.main_end;
+        const uint64_t wrest = n_rows > wbase ? n_rows - wbase : 0u;
+        const uint64_t wnum = n_threads > 1u ? (uint64_t)n_threads - 1u : 1u;
+        const uint64_t widx = tid > 0u ? (uint64_t)tid - 1u : 0u;
+        const uint64_t row0 = wbase + wrest * widx / wnum;
+        uint64_t row1 = wbase + wrest * (widx + 1u) / wnum;
         if (row1 > n_rows) row1 = n_rows;
         if (row0 < row1) {
             const double tb0 = pf_on() ? now_sec() : 0.0;
@@ -2737,8 +2744,25 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
      * work done per pass rose from 49638 ms to 51439; the wall time did not move,
      * because a region ends when its slowest slice finishes and that slice was
      * already the full length. */
-    uint64_t main_row1 = n_rows / g_pool.n_threads;
+    /* The main thread runs on a core of its own while twelve of the workers share
+     * cores with a sibling, so giving them identical shares leaves the main
+     * thread waiting at the barrier: measured at eleven to fourteen percent of the
+     * wall, and in a fifth to a third of regions the wait exceeded half the
+     * region's life.
+     *
+     * DS4_POOL_MAIN_PM sets the main thread's slice in per-mille of the rows; the
+     * default is one twenty-eighth, which is parity. The workers tile the
+     * remainder exactly. */
+    static int main_pm = -1;
+    if (main_pm < 0) {
+        const char *e = getenv("DS4_POOL_MAIN_PM");
+        main_pm = (e && e[0]) ? atoi(e) : (int)(1000u / g_pool.n_threads);
+        if (main_pm < 1) main_pm = 1;
+        if (main_pm > 1000) main_pm = 1000;
+    }
+    uint64_t main_row1 = (n_rows * (uint64_t)main_pm) / 1000u;
     if (main_row1 > n_rows) main_row1 = n_rows;
+    g_pool.main_end = main_row1;
     pthread_mutex_unlock(&g_pool.mutex);
 
     const double t_call0 = pf_on() ? now_sec() : 0.0;

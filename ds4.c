@@ -66371,6 +66371,9 @@ struct ds4_session {
     int qwen35_mtp_chain[2];
     int qwen35_mtp_chain_n;
     bool qwen35_mtp_draft_valid;
+    /* Set while a speculative verify runs: its accept check reads the logits
+     * of position 0, and the head normally only projects the last position. */
+    bool qwen35_want_all_logits;
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
@@ -77801,7 +77804,8 @@ static void qwen35_cpu_forward_batch(
      * them. */
     if (getenv("DS4_QWEN35_BATCH_DBG") != NULL ||
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
-        getenv("DS4_QWEN35_BATCH_VERIFY") != NULL) {
+        getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
+        s->qwen35_want_all_logits) {
         qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
     } else if (n_tok > 0u) {
         qwen35_cpu_matvec_batch(m, w->output,
@@ -78548,6 +78552,40 @@ static void qwen35_cpu_forward_token(
         }
         s->qwen35_mtp_draft = dmx;
         s->qwen35_mtp_draft_valid = true;
+        /* Build the chain fresh on every step.
+         *
+         * Prefill computes one and it is stale by the time decode runs: verifying
+         * against it made every round a partial accept at one out of three, and a
+         * partial accept restores the recurrent state and re-runs a full forward,
+         * which measured at 1.14 tokens a second against 2.78 without speculation.
+         * A stale chain turned a four percent draft cost into a hundred percent
+         * loss.
+         *
+         * A single-token round gains nothing either - the batched verify costs
+         * more than the dedicated single-token forward and can only return one
+         * token - so the chain has to exist for the verify to have something to
+         * win. Each step is one nextn layer plus one head pass; the acceptance
+         * gain is what makes it worth paying. */
+        {
+            float *hb = xmalloc((size_t)E * sizeof(float));
+            int chain_max = 2;
+            const char *ce = getenv("DS4_QWEN35_MTP_CHAIN");
+            if (ce && ce[0] >= '0' && ce[0] <= '9') chain_max = ce[0] - '0';
+            if (chain_max > 2) chain_max = 2;
+            s->qwen35_mtp_chain_n = 0;
+            int prev = dmx;
+            const float *hsrc = h_in;
+            for (int k = 0; k < chain_max; k++) {
+                qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev,
+                                         pos + 1u + (uint32_t)k, draft, hb);
+                int cmx = 0;
+                for (int i = 1; i < (int)DS4_N_VOCAB; i++)
+                    if (draft[i] > draft[cmx]) cmx = i;
+                s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
+                prev = cmx;
+            }
+            free(hb);
+        }
         if (!getenv("DS4_QWEN35_MTP_TEST")) {
             prev_draft = dmx;
             free(draft);
@@ -99527,9 +99565,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                     nl++;
                 }
                 float *lg = xmalloc((size_t)nt * (size_t)V * sizeof(float));
+                /* The accept check below reads lg[0], the logits of the first
+                 * position. The head normally projects only the last position, so
+                 * without this the check compared against whatever was in the
+                 * buffer and every round looked like a miss. */
+                s->qwen35_want_all_logits = true;
                 qwen35_cpu_forward_batch(lg, &e2->model, &e2->weights, s,
                                          toks, (uint32_t)nt,
                                          (uint32_t)s->checkpoint.len);
+                s->qwen35_want_all_logits = false;
                 /* verify: the first position's argmax must match toks[1], etc. */
                 int n_ok = 1;
                 int a_prev = 0;
@@ -99544,8 +99588,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                     n_ok++;
                 }
                 if (n_ok == nt) {
-                    for (int k = 0; k < n_ok; k++)
+                    for (int k = 0; k < n_ok; k++) {
                         token_vec_push(&s->checkpoint, toks[k]);
+                        /* The caller reads the accepted tokens out of this array,
+                         * not out of the checkpoint. It was never written here, so
+                         * the function returned a count of two while the slots held
+                         * whatever was there before and the decode loop emitted
+                         * stale ids. */
+                        if (k < accepted_cap) accepted[k] = toks[k];
+                    }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     memcpy(s->logits, lg + (size_t)(nt - 1) * V, (size_t)V * sizeof(float));
@@ -99587,15 +99638,32 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 }
                 free(snap);
                 free(lg);
-                accepted[0] = t1;
-                if (n_ok > 1 && accepted_cap > 1) {
-                    accepted[1] = toks[1];
-                    if (ds4_session_eval(s, t1, err, errlen) != 0) return -1;
-                    if (ds4_session_eval(s, toks[1], err, errlen) != 0) return -1;
-                    return 2;
+                /* Replay the accepted prefix as ONE batch, not one forward per
+                 * token. The state was just restored, so the replay re-establishes
+                 * it for exactly n_ok tokens, and batching costs one weight pass
+                 * where the per-token loop cost n_ok of them - the difference
+                 * between a partial accept costing twice a plain token and costing
+                 * the same as one. */
+                {
+                    int na = n_ok < accepted_cap ? n_ok : accepted_cap;
+                    if (na < 1) na = 1;
+                    for (int k = 0; k < na; k++) accepted[k] = toks[k];
+                    if (na == 1) {
+                        if (ds4_session_eval(s, toks[0], err, errlen) != 0) return -1;
+                        return 1;
+                    }
+                    float *rl = xmalloc((size_t)na * (size_t)V * sizeof(float));
+                    qwen35_cpu_forward_batch(rl, &e2->model, &e2->weights, s, toks,
+                                             (uint32_t)na,
+                                             (uint32_t)s->checkpoint.len);
+                    for (int k = 0; k < na; k++)
+                        token_vec_push(&s->checkpoint, toks[k]);
+                    s->checkpoint_valid = true;
+                    s->mtp_draft_valid = false;
+                    memcpy(s->logits, rl + (size_t)(na - 1) * V, (size_t)V * sizeof(float));
+                    free(rl);
+                    return na;
                 }
-                if (ds4_session_eval(s, t1, err, errlen) != 0) return -1;
-                return 1;
             }
         }
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;

@@ -77738,17 +77738,12 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
          * sums for the tiles ride in the output buffer, seven kilobytes against a
          * weight stream measured in gigabytes.
          *
-         * DS4_QWEN35_KTILE sets the tile in blocks; 20 is one tile, i.e. no split. */
-        static int ktile = -1;
-        if (ktile < 0) {
-            const char *te = getenv("DS4_QWEN35_KTILE");
-            ktile = (te && te[0]) ? atoi(te) : 20;
-            if (ktile < 1) ktile = 1;
-            if (ktile > 64) ktile = 64;
-        }
-        for (uint64_t b0 = 0; b0 < jb->blocks; b0 += (uint64_t)ktile) {
+         * Measured flat: a tile of twenty blocks (one tile, no split) performed the
+         * same as every smaller tile tried, so the re-reads were not coming from L2
+         * after all. The plumbing stays because the code is correct either way. */
+        for (uint64_t b0 = 0; b0 < jb->blocks; b0 += 20u) {
             uint64_t nb = jb->blocks - b0;
-            if (nb > (uint64_t)ktile) nb = (uint64_t)ktile;
+            if (nb > 20u) nb = 20u;
             const int add = (b0 == 0) ? 0 : 1;
             for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
                 uint64_t nt8 = c->n_tok - tt;
@@ -77826,13 +77821,6 @@ static bool qwen35_compact_head_ready(const ds4_weights *w);
 static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
                                        float *logits, ds4_session *s);
 
-
-/* The plain decode forward keeps its own tally: it prints no [prefill] line, so a
- * round that falls back to it disappears from the breakdown entirely. */
-static double g_tok_fwd_ms = 0.0;
-static long g_tok_fwd_n = 0;
-/* Everything the speculative round spends outside the batched verify. */
-static double g_spec_outside_ms = 0.0;
 
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
@@ -78119,7 +78107,10 @@ static void qwen35_cpu_forward_batch(
      * 218 GB of traffic for a sixty-four token prompt. Every position needs its
      * own logits, but they all multiply the same head, so it is one batched
      * matvec: normalise each position first, then read the head once. */
-    if (g_ph_on) {
+    /* g_ph_on starts at -1 to mean "not yet read the environment", and -1 is
+     * truthy: this printed a phase line on the first batch of every run even with
+     * the counters off. */
+    if (g_ph_on == 1) {
         const double tot = g_ph.rms + g_ph.matvec + g_ph.attn + g_ph.add
                          + g_ph.silu + g_ph.gdn + g_ph.head;
         fprintf(stderr,
@@ -78264,8 +78255,9 @@ static void qwen35_cpu_forward_batch(
                         attn_ms, 100.0 * attn_ms / (wall > 0.0 ? wall : 1.0),
                         wall - acc_ms - attn_ms,
                         100.0 * (wall - acc_ms - attn_ms) / (wall > 0.0 ? wall : 1.0));
-        fprintf(stderr, "[prefill] gdn serial=%.0f ms (%.0f%%)\n",
-                gdn_batch_ms, 100.0 * gdn_batch_ms / (wall > 0.0 ? wall : 1.0));
+        if (getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr, "[prefill] gdn serial=%.0f ms (%.0f%%)\n",
+                    gdn_batch_ms, 100.0 * gdn_batch_ms / (wall > 0.0 ? wall : 1.0));
         if (getenv("DS4_PF_STATS"))
             fprintf(stderr, "[pool] regions=%llu  life=%.0f ms  "
                     "barrier wait=%.0f ms (%.0f%%)  worst=%.2f ms  "
@@ -78714,26 +78706,7 @@ static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
 
 #endif /* !DS4_NO_GPU */
 
-static void qwen35_cpu_forward_token_body(
-        float *logits, const ds4_model *m, const ds4_weights *w,
-        ds4_session *s, int token, uint32_t pos);
-
 static void qwen35_cpu_forward_token(
-        float *logits, const ds4_model *m, const ds4_weights *w,
-        ds4_session *s, int token, uint32_t pos) {
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    qwen35_cpu_forward_token_body(logits, m, w, s, token, pos);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    g_tok_fwd_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
-                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-    g_tok_fwd_n++;
-    if (getenv("DS4_QWEN35_BYTE_DBG") && g_tok_fwd_n % 8 == 0)
-        fprintf(stderr, "[fwd] plain forwards: %ld, %.0f ms total, %.0f ms each\n",
-                g_tok_fwd_n, g_tok_fwd_ms, g_tok_fwd_ms / (double)g_tok_fwd_n);
-}
-
-static void qwen35_cpu_forward_token_body(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
     const bool prof = getenv("DS4_QWEN35_PROFILE") != NULL;
@@ -79031,11 +79004,8 @@ static void qwen35_cpu_forward_token_body(
              * a third. Chaining the hidden asks the question the nextn layer is
              * trained for. Two buffers because the callee writes one while reading
              * the other. */
-            /* DS4_QWEN35_MTP_HCHAIN=0 keeps the original fixed-hidden form, so the
-             * two can be compared on the same machine rather than against numbers
-             * taken at different times. */
-            static int hchain = -1;
-            if (hchain < 0) hchain = getenv("DS4_QWEN35_MTP_HCHAIN") == NULL;
+            /* Each link consumes the previous link's hidden, not the trunk's. Two
+             * buffers because the callee writes one while reading the other. */
             const float *hcur = h_in;
             float *hnext = xmalloc((size_t)E * sizeof(float));
             for (int k = 0; k < chain_max; k++) {
@@ -79047,7 +79017,7 @@ static void qwen35_cpu_forward_token_body(
                     if (draft[i] > draft[cmx]) cmx = i;
                 s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
                 prev = cmx;
-                if (hchain) hcur = hout;
+                hcur = hout;
             }
             free(hnext);
             free(hb);
@@ -86419,10 +86389,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             qwen35_x8_eager_t ev = { &e->model, 0, 0 };
             ds4_parallel_for(e->model.n_tensors, qwen35_x8_eager_worker, &ev);
             clock_gettime(CLOCK_MONOTONIC, &xt1);
-            fprintf(stderr, "[x8] eager built %d tensors, %.1f GB in %.0f ms\n",
-                    (int)ev.built, (double)ev.bytes / 1e9,
-                    (double)(xt1.tv_sec - xt0.tv_sec) * 1e3 +
-                    (double)(xt1.tv_nsec - xt0.tv_nsec) / 1e6);
+            if (getenv("DS4_QWEN35_BYTE_DBG"))
+                fprintf(stderr, "[x8] eager built %d tensors, %.1f GB in %.0f ms\n",
+                        (int)ev.built, (double)ev.bytes / 1e9,
+                        (double)(xt1.tv_sec - xt0.tv_sec) * 1e3 +
+                        (double)(xt1.tv_nsec - xt0.tv_nsec) / 1e6);
         }
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,

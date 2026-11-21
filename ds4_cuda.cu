@@ -5470,6 +5470,16 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * cleanup's cudaEventDestroy / cudaStreamDestroy / cublasDestroy
          * calls hit the right context. */
         g_n_gpus = i + 1;
+        /* Blocking sync, not the default spin.
+         *
+         * An idle context created with the default schedule spins a driver worker
+         * waiting for work. Measured on this laptop: merely initialising CUDA and
+         * never using it for anything drops CPU generation from 3.14 to 2.20 tokens
+         * a second, because the spinning worker competes with the twenty-eight
+         * threads doing the matvec. Blocking sync parks that worker instead. It has
+         * to be set before the context is created, which is why it is here and not
+         * after the first allocation. */
+        (void)cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cuda_scratch_retention_init(i);
         cudaDeviceProp prop;

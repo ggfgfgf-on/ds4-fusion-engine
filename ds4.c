@@ -1815,8 +1815,6 @@ static int g_mtp_depth = 1;
  * chain of three; if they are delivering two, ask for one. */
 static double g_tok_per_round = 2.0;
 static long g_spec_rounds = 0, g_spec_tokens = 0, g_spec_full = 0, g_spec_partial = 0;
-/* How much of a speculative round is the draft's vocabulary projection. */
-static double g_mtp_head_ms = 0.0;
 
 /* Can the head itself say which rows a draft needs?
  *
@@ -1857,20 +1855,6 @@ static void qwen35_draft_mv_worker(void *vctx, uint64_t r0, uint64_t r1) {
         a->scores[r] = acc;
     }
 }
-static int g_prior_n = 0;
-static long g_prior_hits = 0, g_prior_total = 0;
-
-static void qwen35_prior_note(int tok) {
-    if (!g_prior_mask || tok < 0) return;
-    g_prior_total++;
-    if (g_prior_mask[tok]) g_prior_hits++;
-    if (g_prior_total % 16 == 0)
-        fprintf(stderr, "[prior] coverage %ld/%ld = %.1f%% (top %d, miss tok=%d)\n",
-                g_prior_hits, g_prior_total,
-                100.0 * (double)g_prior_hits / (double)g_prior_total, g_prior_n,
-                g_prior_mask[tok] ? -1 : tok);
-}
-static long g_mtp_calls = 0;
 
 static void *xmalloc(size_t size) {
     ds4_alloc_guard_check("malloc", size);
@@ -65361,14 +65345,6 @@ static int generate_qwen4_metal_argmax(
     if (done) done(emit_ud);
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    if (g_spec_rounds > 0)
-        fprintf(stderr, "[spec] rounds=%ld full=%ld partial=%ld tokens=%ld "
-                "tokens/round=%.2f depth=%d\n",
-                g_spec_rounds, g_spec_full, g_spec_partial, g_spec_tokens,
-                (double)g_spec_tokens / (double)g_spec_rounds, g_mtp_depth);
-    if (g_mtp_calls > 0)
-        fprintf(stderr, "[mtp] draft head: %.0f ms over %ld calls, %.1f ms each\n",
-                g_mtp_head_ms, g_mtp_calls, g_mtp_head_ms / (double)g_mtp_calls);
     ds4_log(stderr, DS4_LOG_TIMING, "ds4: Qwen3.8 prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
@@ -76557,96 +76533,6 @@ static void qwen35_gemm_q6_K_q8_K_2x4_pre(
 }
 
 
-/* One row, eight tokens, from the pre-unpacked weights.
- *
- * The two-by-four form serves four tokens per pass over the unpacked row, and that
- * row is twenty kilobytes - bigger than what L1 has left once the four tokens'
- * activations are in it. So the row is re-fetched for every four tokens: at a
- * hundred and seventeen tokens that is thirty passes, and the whole of Q6_K ends up
- * costing more wall time than Q4_K's three times larger byte count.
- *
- * Eight tokens halves the passes and still fits the register budget: eight integer
- * accumulators and eight float accumulators are exactly the sixteen ymm there are.
- */
-static void qwen35_gemm_q6_K_q8_K_1x8_pre(
-        const int16_t *pre, const block_q6_K *x0,
-        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
-        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
-#if defined(__AVX2__)
-    const uint64_t lim = nt < 8u ? nt : 8u;
-    __m256 fv[8];
-    for (uint64_t t = 0; t < 8u; t++) fv[t] = _mm256_setzero_ps();
-    for (uint64_t b = 0; b < blocks; b++) {
-        __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
-        __m256i a4 = a0, a5 = a0, a6 = a0, a7 = a0;
-        for (int half = 0; half < 2; half++) {
-            for (int c = 0; c < 2; c++) {
-                /* Row r of block b lives at (b*2 + r)*256 in the unpacked buffer. */
-                const int16_t *h = pre + b * 512u
-                                 + (uint64_t)half * 128u + (uint64_t)c * 16u;
-                const __m256i q0 = _mm256_loadu_si256((const __m256i *)(h + 0));
-                const __m256i q1 = _mm256_loadu_si256((const __m256i *)(h + 32));
-                const __m256i q2 = _mm256_loadu_si256((const __m256i *)(h + 64));
-                const __m256i q3 = _mm256_loadu_si256((const __m256i *)(h + 96));
-                const uint64_t base = (uint64_t)half * 4u;
-                for (uint64_t t = 0; t < lim; t++) {
-                    const block_q8_K *yt = y + t * ystride + b;
-                    const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                            (const __m128i *)(yt->qs + (base + 0u) * 32u + c * 16)));
-                    const __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                            (const __m128i *)(yt->qs + (base + 1u) * 32u + c * 16)));
-                    const __m256i w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                            (const __m128i *)(yt->qs + (base + 2u) * 32u + c * 16)));
-                    const __m256i w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
-                            (const __m128i *)(yt->qs + (base + 3u) * 32u + c * 16)));
-#define Q6P8(acc)                                                             \
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q0, w0));    \
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q1, w1));    \
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q2, w2));    \
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q3, w3))
-                    switch (t) {
-                    case 0: Q6P8(a0); break;
-                    case 1: Q6P8(a1); break;
-                    case 2: Q6P8(a2); break;
-                    case 3: Q6P8(a3); break;
-                    case 4: Q6P8(a4); break;
-                    case 5: Q6P8(a5); break;
-                    case 6: Q6P8(a6); break;
-                    default: Q6P8(a7); break;
-                    }
-#undef Q6P8
-                }
-            }
-        }
-        const float d0 = f16_to_f32(x0[b].d);
-        /* A switch, not an array of pointers: taking the accumulators' address is
-         * what pushes them out of registers and into the stack. */
-#define Q6P8_FLUSH(T, A)                                                      \
-        fv[T] = _mm256_fmadd_ps(                                              \
-                _mm256_set1_ps(d0 * y0d(y, ystride, b, (int)(T), nt)),         \
-                _mm256_cvtepi32_ps(A), fv[T])
-        for (uint64_t t = 0; t < lim; t++) {
-            switch (t) {
-            case 0: Q6P8_FLUSH(0, a0); break;
-            case 1: Q6P8_FLUSH(1, a1); break;
-            case 2: Q6P8_FLUSH(2, a2); break;
-            case 3: Q6P8_FLUSH(3, a3); break;
-            case 4: Q6P8_FLUSH(4, a4); break;
-            case 5: Q6P8_FLUSH(5, a5); break;
-            case 6: Q6P8_FLUSH(6, a6); break;
-            default: Q6P8_FLUSH(7, a7); break;
-            }
-        }
-#undef Q6P8_FLUSH
-    }
-    for (uint64_t t = 0; t < lim; t++)
-        out[t * out_stride + row] = qwen35_hsum_ps256(fv[t]);
-#else
-    (void)pre; (void)x0; (void)y; (void)ystride; (void)blocks;
-    (void)nt; (void)out; (void)out_stride; (void)row;
-#endif
-}
-
 static void qwen35_gemm_q6_K_q8_K_2x4_dp(
         const block_q6_K *x0, const block_q6_K *x1,
         const block_q8_K *y, uint64_t ystride, uint64_t blocks,
@@ -76806,32 +76692,6 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
              * itself, once per group, so a hundred and seventeen tokens unpacked
              * the same twenty blocks thirty times. */
             if (pre) qwen35_q6_unpack_pair(u0, u1, blocks, pre);
-            /* The pre-unpacked rows are too big to survive a four-token pass, so
-             * eight tokens a pass halves how often they are re-fetched. Each row of
-             * the pair goes through on its own; two rows would not fit registers. */
-            /* Off by default: measured slower than two-by-four despite reading the
-             * unpacked rows a quarter as often, because one row a pass doubles the
-             * block loop and the weight-register loads. Kept because the reasoning
-             * is only wrong by a constant, and a wider row block would change it. */
-            static int x8 = -1;
-            if (x8 < 0) x8 = getenv("DS4_QWEN35_Q6X8") != NULL;
-            if (pre && x8) {
-                for (uint64_t tt = 0; tt < ctx->n_tok; tt += 8u) {
-                    uint64_t nt = ctx->n_tok - tt;
-                    if (nt > 8u) nt = 8u;
-                    qwen35_gemm_q6_K_q8_K_1x8_pre(pre, u0,
-                                                  ctx->xq + tt * blocks,
-                                                  blocks, blocks, nt,
-                                                  ctx->out + tt * ctx->out_dim,
-                                                  ctx->out_dim, row);
-                    qwen35_gemm_q6_K_q8_K_1x8_pre(pre + 256u, u1,
-                                                  ctx->xq + tt * blocks,
-                                                  blocks, blocks, nt,
-                                                  ctx->out + tt * ctx->out_dim,
-                                                  ctx->out_dim, row + 1u);
-                }
-                continue;
-            }
             for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u) {
                 uint64_t nt = ctx->n_tok - tt;
                 if (nt > 4u) nt = 4u;
@@ -77404,11 +77264,6 @@ static void qwen35_cpu_matvec_batch(
         static int shown = 0;
         if (!shown) {
             shown = 1;
-            fprintf(stderr, "[x8] dispatch tdata=%p lookup=%p rows=%llu "
-                    "blocks=%llu n_tok=%llu\n", (const void *)tdata,
-                    (const void *)xb, (unsigned long long)rows,
-                    (unsigned long long)blocks,
-                    (unsigned long long)n_tok);
         }
         /* Build on first use instead of from an explicit tensor list: the list
          * missed a 10240-row projection the forward pass does reach, and
@@ -78404,14 +78259,6 @@ static void qwen35_cpu_forward_batch(
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
     
             if (getenv("DS4_QWEN35_BYTE_DBG"))
-                fprintf(stderr, "[prefill] head=%.0f ms, draft=%.0f ms, "
-                "rest=%.0f ms\n", acc_ms_head, acc_ms_draft,
-                wall - acc_ms - acc_ms_head - acc_ms_draft);
-        fprintf(stderr, "[prefill] by format: q4=%.0f ms (%.0f%% of matvec), "
-                        "q6=%.0f ms (%.0f%%), other=%.0f ms\n",
-                        acc_ms_q4, 100.0 * acc_ms_q4 / (acc_ms > 0.0 ? acc_ms : 1.0),
-                        acc_ms_q6, 100.0 * acc_ms_q6 / (acc_ms > 0.0 ? acc_ms : 1.0),
-                        acc_ms_other);
                 fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "
                         "everything-else=%.0f ms (%.0f%%)\n",
                         attn_ms, 100.0 * attn_ms / (wall > 0.0 ? wall : 1.0),
@@ -78608,34 +78455,15 @@ static void qwen35_cpu_mtp_forward_h(
     /* h_nextn is the POST-output-norm hidden (llama's t_h_nextn); the chain
      * feeds this back as the next step's input. */
     if (out_hidden) memcpy(out_hidden, xn, (size_t)E * sizeof(float));
-    /* DS4_QWEN35_NODRAFTHEAD prices the draft's vocabulary projection, which is
-     * the same 545 MB head the trunk uses and is run once per chain link. The
-     * result is wrong when this is set; it exists only to measure. */
-    static int nodh = -1;
-    if (nodh < 0) nodh = getenv("DS4_QWEN35_NODRAFTHEAD") != NULL;
-    struct timespec dh0, dh1;
-    clock_gettime(CLOCK_MONOTONIC, &dh0);
     /* With a compact head, score only those rows and leave the rest at -inf, so
      * the caller's argmax over the full array still works and can only ever pick
      * a row that was actually scored. The -inf fill happens once. */
     static int use_compact = -1;
     if (use_compact < 0) use_compact = getenv("DS4_QWEN35_NO_COMPACT_HEAD") == NULL;
-    if (!nodh && use_compact && qwen35_compact_head_ready(w)) {
+    if (use_compact && qwen35_compact_head_ready(w))
         qwen35_compact_head_logits(w, xn, draft_logits, s);
-    } else if (!nodh) {
+    else
         qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &dh1);
-    g_mtp_head_ms += (double)(dh1.tv_sec - dh0.tv_sec) * 1e3 +
-                    (double)(dh1.tv_nsec - dh0.tv_nsec) / 1e6;
-    g_mtp_calls++;
-    if (g_prior_total > 0 && g_prior_total % 16 == 0)
-        fprintf(stderr, "[prior] coverage %ld/%ld = %.1f%% (top %d)\n",
-                g_prior_hits, g_prior_total,
-                100.0 * (double)g_prior_hits / (double)g_prior_total, g_prior_n);
-    if (g_mtp_calls % 16 == 0)
-        fprintf(stderr, "[mtp] draft head: %.1f ms each over %ld calls\n",
-                g_mtp_head_ms / (double)g_mtp_calls, g_mtp_calls);
 }
 
 static void qwen35_cpu_mtp_forward(
@@ -90807,7 +90635,7 @@ static void qwen35_prior_build(const ds4_model *m, const ds4_weights *w,
     g_prior_mask = xmalloc((size_t)DS4_N_VOCAB);
     memset(g_prior_mask, 0, (size_t)DS4_N_VOCAB);
     for (long i = 0; i < k; i++) g_prior_mask[ent[i].id] = 1;
-    g_prior_n = (int)k;
+
     /* Gather those rows out of the head, packed as they already are. */
     if (w->output && w->output->type == DS4_TENSOR_Q6_K) {
         const uint64_t blocks = w->output->dim[0] / QK_K;
@@ -90821,24 +90649,19 @@ static void qwen35_prior_build(const ds4_model *m, const ds4_weights *w,
             g_draft_ids[i] = ent[i].id;
         }
         g_draft_rows = (int)k;
-        fprintf(stderr, "[prior] gathered %d rows, %.1f MB, %llu blocks each\n",
-                g_draft_rows, (double)((uint64_t)k * rb) / 1048576.0,
-                (unsigned long long)blocks);
     }
-    fprintf(stderr, "[prior] top %ld of %u built "
-            "(score at cut %.3f, best %.3f)\n",
-            k, (unsigned)DS4_N_VOCAB, (double)ent[k-1].v, (double)ent[0].v);
     free(ent); free(lg); free(mean);
 }
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     const int best = sample_argmax(s->logits, DS4_N_VOCAB);
+    /* Speculation needs the head's rows gathered into a compact copy before the
+     * first draft; this is the first point where the engine and a decoded token
+     * both exist. */
     if (s->engine && !getenv("DS4_QWEN35_NO_COMPACT_HEAD") &&
-        getenv("DS4_QWEN35_MTP_SPEC")) {
+        getenv("DS4_QWEN35_MTP_SPEC"))
         qwen35_prior_build(&s->engine->model, &s->engine->weights, s);
-        qwen35_prior_note(best);
-    }
     return best;
 }
 

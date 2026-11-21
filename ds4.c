@@ -1804,6 +1804,16 @@ static void *xcalloc(size_t n, size_t size) {
  * the mechanism be judged on tokens per round instead of on a throughput number
  * that mixes it with everything else. */
 static int g_mtp_depth = 1;
+/* Tokens per round, smoothed.
+ *
+ * Stepping the depth by one on a full accept and cutting it to the accepted count
+ * on a miss makes it oscillate: the log shows two, three, four, five, back to
+ * three, four - each single miss undoes several rounds of growth even though the
+ * acceptance that produced the growth has not changed. An exponential average of
+ * the tokens a round actually returns is the same signal without the reaction, and
+ * the depth tracks it directly: if rounds are delivering three tokens, ask for a
+ * chain of three; if they are delivering two, ask for one. */
+static double g_tok_per_round = 2.0;
 static long g_spec_rounds = 0, g_spec_tokens = 0, g_spec_full = 0, g_spec_partial = 0;
 /* How much of a speculative round is the draft's vocabulary projection. */
 static double g_mtp_head_ms = 0.0;
@@ -78149,11 +78159,20 @@ static void qwen35_cpu_forward_batch(
          * verify gate at ds4.c:98249 requires the first draft to match the
          * target exactly before any of the chain is used. Configurable so the
          * trade can be measured rather than assumed. */
-        int chain_max = 2;
+        /* The adaptive depth, not a constant.
+         *
+         * This was hardcoded to two, which meant the verify batch - the path that
+         * rebuilds the chain after every accepted round - ignored the depth the
+         * counters were tracking. The depth then grew in the other path only, and
+         * the log showed a depth of five alongside a chain of two: the counter was
+         * decorative because this line never read it. */
+        int chain_max = g_mtp_depth;
         {
             const char *ce = getenv("DS4_QWEN35_MTP_CHAIN");
             if (ce && ce[0] >= '0' && ce[0] <= '9') chain_max = ce[0] - '0';
         }
+        if (chain_max > DS4_MTP_DEPTH_MAX) chain_max = DS4_MTP_DEPTH_MAX;
+        if (chain_max < 1) chain_max = 1;
         for (int k = 0; k < chain_max; k++) {
             qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
                                      draft, hb);
@@ -100052,13 +100071,18 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                     s->mtp_draft_valid = false;
                     memcpy(s->logits, lg + (size_t)(nt - 1) * V, (size_t)V * sizeof(float));
                     g_spec_rounds++; g_spec_full++; g_spec_tokens += n_ok;
+                    g_tok_per_round = 0.75 * g_tok_per_round + 0.25 * (double)n_ok;
+                    /* Explore: a full accept means the chain was not long enough.
+                     * Settling on the observed average deadlocks instead - at a
+                     * depth of one the most a round can return is two, so the
+                     * average can never argue for trying three. */
+                    if (g_mtp_depth < DS4_MTP_DEPTH_MAX) g_mtp_depth++;
                     if (getenv("DS4_QWEN35_SPEC_DBG") && g_spec_rounds % 8 == 0)
                         fprintf(stderr, "[spec] r=%ld full=%ld part=%ld tok=%ld "
                                 "tok/r=%.2f depth=%d\n", g_spec_rounds, g_spec_full,
                                 g_spec_partial, g_spec_tokens,
                                 (double)g_spec_tokens / (double)g_spec_rounds,
                                 g_mtp_depth);
-                    if (g_mtp_depth < DS4_MTP_DEPTH_MAX) g_mtp_depth++;
                     if (getenv("DS4_QWEN35_SPEC_DBG"))
                         fprintf(stderr, "[spec] nt=%d n_ok=%d FULL depth->%d\n",
                                 nt, n_ok, g_mtp_depth);
@@ -100113,13 +100137,22 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                         memcpy(s->logits, lg + (size_t)(na - 1) * V,
                                (size_t)V * sizeof(float));
                         g_spec_rounds++; g_spec_partial++; g_spec_tokens += na;
+                        g_tok_per_round = 0.75 * g_tok_per_round + 0.25 * (double)na;
+                        /* Settle just under what was accepted rather than cutting
+                         * to one: a miss at depth five that still accepted four
+                         * says nothing against four. */
+                        {
+                            int d = na - 1;
+                            if (d < 1) d = 1;
+                            if (d > DS4_MTP_DEPTH_MAX) d = DS4_MTP_DEPTH_MAX;
+                            g_mtp_depth = d;
+                        }
                         if (getenv("DS4_QWEN35_SPEC_DBG") && g_spec_rounds % 8 == 0)
                             fprintf(stderr, "[spec] r=%ld full=%ld part=%ld tok=%ld "
                                     "tok/r=%.2f depth=%d\n", g_spec_rounds, g_spec_full,
                                     g_spec_partial, g_spec_tokens,
                                     (double)g_spec_tokens / (double)g_spec_rounds,
                                     g_mtp_depth);
-                        if (na > 1) g_mtp_depth = na; else g_mtp_depth = 1;
                         free(snap);
                         free(lg);
                         if (getenv("DS4_QWEN35_SPEC_DBG"))

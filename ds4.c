@@ -78823,16 +78823,34 @@ static void qwen35_cpu_forward_token(
             if (chain_max < 1) chain_max = 1;
             s->qwen35_mtp_chain_n = 0;
             int prev = dmx;
-            const float *hsrc = h_in;
+            /* Each link consumes the previous link's hidden, not the trunk's.
+             *
+             * The first form handed every step the same h_in and only advanced the
+             * token, so the second link was asked "given the trunk's features at
+             * this position, what comes two places later" - a question it has no
+             * reason to answer well, and the measured accept rate for it was about
+             * a third. Chaining the hidden asks the question the nextn layer is
+             * trained for. Two buffers because the callee writes one while reading
+             * the other. */
+            /* DS4_QWEN35_MTP_HCHAIN=0 keeps the original fixed-hidden form, so the
+             * two can be compared on the same machine rather than against numbers
+             * taken at different times. */
+            static int hchain = -1;
+            if (hchain < 0) hchain = getenv("DS4_QWEN35_MTP_HCHAIN") == NULL;
+            const float *hcur = h_in;
+            float *hnext = xmalloc((size_t)E * sizeof(float));
             for (int k = 0; k < chain_max; k++) {
-                qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev,
-                                         pos + 1u + (uint32_t)k, draft, hb);
+                float *hout = (k & 1) ? hb : hnext;
+                qwen35_cpu_mtp_forward_h(m, w, s, hcur, prev,
+                                         pos + 1u + (uint32_t)k, draft, hout);
                 int cmx = 0;
                 for (int i = 1; i < (int)DS4_N_VOCAB; i++)
                     if (draft[i] > draft[cmx]) cmx = i;
                 s->qwen35_mtp_chain[s->qwen35_mtp_chain_n++] = cmx;
                 prev = cmx;
+                if (hchain) hcur = hout;
             }
+            free(hnext);
             free(hb);
         }
         if (!getenv("DS4_QWEN35_MTP_TEST")) {

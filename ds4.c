@@ -78197,7 +78197,12 @@ static void qwen35_cpu_forward_batch(
     clock_gettime(CLOCK_MONOTONIC, &dr0);
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts
-     * for the following positions (each step is a cheap nextn-layer pass). */
+     * for the following positions (each step is a cheap nextn-layer pass).
+     *
+     * Paid on the prompt's last chunk too, and that is the point: it is what lets
+     * the first decoded token speculate. A prompt of a hundred and seventeen
+     * tokens is one chunk, so its draft is used immediately - the two percent of
+     * prefill this costs buys forty percent off the first step. */
     if (n_tok > 0 && qwen35_mtp_spec_on()) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));

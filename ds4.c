@@ -77811,6 +77811,12 @@ static bool qwen35_cpu_matvec_multi(
     return true;
 }
 
+/* Defined below; the verify path above the definitions needs them. */
+static bool qwen35_compact_head_ready(const ds4_weights *w);
+static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
+                                       float *logits, ds4_session *s);
+
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -78127,7 +78133,23 @@ static void qwen35_cpu_forward_batch(
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
         s->qwen35_want_all_logits) {
-        qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+        /* A verify only needs the argmax at every position but the last; the last
+         * one needs the whole distribution for the next round's sampling. The head
+         * is 545 MB a position, so scoring nine of them against the full
+         * vocabulary is four gigabytes of reads that a quarter of the rows can
+         * answer. */
+        if (n_tok > 1u && qwen35_compact_head_ready(w) &&
+            getenv("DS4_QWEN35_VERIFY_FULL_HEAD") == NULL) {
+            for (uint32_t t = 0; t + 1u < n_tok; t++)
+                qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
+                                           logits_all + (uint64_t)t * DS4_N_VOCAB, s);
+            qwen35_cpu_matvec_batch(m, w->output,
+                                    blk + (uint64_t)(n_tok - 1u) * E,
+                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
+                                    1u, false);
+        } else {
+            qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+        }
     } else if (n_tok > 0u) {
         qwen35_cpu_matvec_batch(m, w->output,
                                 blk + (uint64_t)(n_tok - 1u) * E,
@@ -78270,6 +78292,34 @@ static void qwen35_cpu_forward_batch(
  *   KV) -> +residual -> post_norm -> dense FFN -> +residual -> head_norm ->
  *   shared head. The draft's K/V lands at pos+1 in the MTP layer's cache; the
  *   verify's main forward overwrites it before anything reads it back. */
+/* Is the compact head usable, and can a given activation be scored with it? */
+static bool qwen35_compact_head_ready(const ds4_weights *w) {
+    return g_draft_rows > 0 && w->output && w->output->type == DS4_TENSOR_Q6_K;
+}
+
+/* Score the gathered rows into a full-vocabulary array, leaving everything else at
+ * -inf. Any argmax over the result can only pick a row that was scored. */
+static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
+                                       float *logits, ds4_session *s) {
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t blocks = w->output->dim[0] / QK_K;
+    const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
+    static int init_done = 0;
+    if (!init_done) {
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) logits[i] = -INFINITY;
+        init_done = 1;
+    }
+    ds4_quantize_row_q8_K(x, s->qwen35_cpu_q8, (int64_t)E);
+    float *scores = xmalloc((size_t)g_draft_rows * sizeof(float));
+    qwen35_draft_mv_arg da;
+    da.rows = g_draft_head; da.xq = s->qwen35_cpu_q8;
+    da.scores = scores; da.blocks = blocks; da.row_bytes = rb;
+    ds4_parallel_for((uint64_t)g_draft_rows, qwen35_draft_mv_worker, &da);
+    for (int r = 0; r < g_draft_rows; r++)
+        logits[g_draft_ids[r]] = scores[r];
+    free(scores);
+}
+
 static void qwen35_cpu_mtp_forward_h(
         const ds4_model *m, const ds4_weights *w, ds4_session *s,
         const float *h_hidden, int token, uint32_t pos, float *draft_logits,
@@ -78382,24 +78432,8 @@ static void qwen35_cpu_mtp_forward_h(
      * a row that was actually scored. The -inf fill happens once. */
     static int use_compact = -1;
     if (use_compact < 0) use_compact = getenv("DS4_QWEN35_NO_COMPACT_HEAD") == NULL;
-    if (!nodh && use_compact && g_draft_rows > 0 &&
-        w->output->type == DS4_TENSOR_Q6_K) {
-        static int init_done = 0;
-        if (!init_done) {
-            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) draft_logits[i] = -INFINITY;
-            init_done = 1;
-        }
-        const uint64_t blocks = w->output->dim[0] / QK_K;
-        const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
-        ds4_quantize_row_q8_K(xn, s->qwen35_cpu_q8, (int64_t)E);
-        float *scores = xmalloc((size_t)g_draft_rows * sizeof(float));
-        qwen35_draft_mv_arg da;
-        da.rows = g_draft_head; da.xq = s->qwen35_cpu_q8;
-        da.scores = scores; da.blocks = blocks; da.row_bytes = rb;
-        ds4_parallel_for((uint64_t)g_draft_rows, qwen35_draft_mv_worker, &da);
-        for (int r = 0; r < g_draft_rows; r++)
-            draft_logits[g_draft_ids[r]] = scores[r];
-        free(scores);
+    if (!nodh && use_compact && qwen35_compact_head_ready(w)) {
+        qwen35_compact_head_logits(w, xn, draft_logits, s);
     } else if (!nodh) {
         qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
     }

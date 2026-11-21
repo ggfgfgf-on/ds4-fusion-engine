@@ -78168,25 +78168,17 @@ static void qwen35_cpu_forward_batch(
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
         s->qwen35_want_all_logits) {
-        /* Every position against the full head by default. The positions before the
-         * last can be answered by the compact rows, and that is what
-         * DS4_QWEN35_VERIFY_COMPACT enables; the last position always takes the full
-         * head because its logits become s->logits, which the sampler and the
-         * speculation gate both read against the whole vocabulary. */
-        const bool verify_compact =
-                n_tok > 0u && getenv("DS4_QWEN35_VERIFY_COMPACT") != NULL &&
-                qwen35_compact_head_ready(w);
-        if (verify_compact) {
-            for (uint32_t t = 0; t + 1u < n_tok; t++)
-                qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
-                                           logits_all + (uint64_t)t * DS4_N_VOCAB, s);
-            qwen35_cpu_matvec_batch(m, w->output,
-                                    blk + (uint64_t)(n_tok - 1u) * E,
-                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
-                                    1u, false);
-        } else {
-            qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
-        }
+        /* Every position, in one batched call. The weights are read once for all of
+         * them - the row loop is outside the token loop - so three positions cost
+         * what one does. Scoring the earlier positions with the compact rows was
+         * tried and is slower, not faster: those calls are one position each, so two
+         * of them read half the head twice and the last still reads all of it,
+         * which is twice the traffic of this single call. Measured -2.7 percent,
+         * exactly the twelve milliseconds that doubling predicts.
+         *
+         * The draft's head is the opposite case and does use the compact rows: it is
+         * a single position per call, so there the halving is real. */
+        qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
         /* The last position just ran the full head, so the trunk's actual pick is
          * known here. If the compact set does not contain it, that row is missing
          * from the draft's vocabulary - gather it now. */

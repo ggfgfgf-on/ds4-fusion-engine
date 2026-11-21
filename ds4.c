@@ -1805,6 +1805,62 @@ static void *xcalloc(size_t n, size_t size) {
  * that mixes it with everything else. */
 static int g_mtp_depth = 1;
 static long g_spec_rounds = 0, g_spec_tokens = 0, g_spec_full = 0, g_spec_partial = 0;
+/* How much of a speculative round is the draft's vocabulary projection. */
+static double g_mtp_head_ms = 0.0;
+
+/* Can the head itself say which rows a draft needs?
+ *
+ * The unconditional next-token distribution is one matvec of the head against the
+ * average hidden state, so the most likely rows can be found without any external
+ * frequency table. Whether that set covers the CONDITIONAL argmax - the one that
+ * actually matters - is an empirical question, and this measures it: build the top
+ * N once, then count how often the trunk's own argmax lands inside. */
+static double g_prior_acc[8192];
+static long g_prior_cnt = 0;
+static uint8_t *g_prior_mask = NULL;
+/* The compact copy of the selected head rows, gathered once. Q6_K stays packed -
+ * the rows are contiguous blocks, so a gather is a plain memcpy per row and the
+ * existing row dot consumes them unchanged. */
+static uint8_t *g_draft_head = NULL;
+static int *g_draft_ids = NULL;
+static int g_draft_rows = 0;
+
+/* Defined with the Q6_K kernels far below; the compact-head worker needs it
+ * here. */
+static float qwen35_dot_q6_K_q8_K_avx2(const block_q6_K *x, const block_q8_K *y);
+
+typedef struct {
+    const uint8_t *rows;
+    const block_q8_K *xq;
+    float *scores;
+    uint64_t blocks, row_bytes;
+} qwen35_draft_mv_arg;
+
+static void qwen35_draft_mv_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    qwen35_draft_mv_arg *a = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const block_q6_K *row =
+                (const block_q6_K *)(a->rows + r * a->row_bytes);
+        float acc = 0.0f;
+        for (uint64_t b = 0; b < a->blocks; b++)
+            acc += qwen35_dot_q6_K_q8_K_avx2(row + b, a->xq + b);
+        a->scores[r] = acc;
+    }
+}
+static int g_prior_n = 0;
+static long g_prior_hits = 0, g_prior_total = 0;
+
+static void qwen35_prior_note(int tok) {
+    if (!g_prior_mask || tok < 0) return;
+    g_prior_total++;
+    if (g_prior_mask[tok]) g_prior_hits++;
+    if (g_prior_total % 16 == 0)
+        fprintf(stderr, "[prior] coverage %ld/%ld = %.1f%% (top %d, miss tok=%d)\n",
+                g_prior_hits, g_prior_total,
+                100.0 * (double)g_prior_hits / (double)g_prior_total, g_prior_n,
+                g_prior_mask[tok] ? -1 : tok);
+}
+static long g_mtp_calls = 0;
 
 static void *xmalloc(size_t size) {
     ds4_alloc_guard_check("malloc", size);
@@ -65300,6 +65356,9 @@ static int generate_qwen4_metal_argmax(
                 "tokens/round=%.2f depth=%d\n",
                 g_spec_rounds, g_spec_full, g_spec_partial, g_spec_tokens,
                 (double)g_spec_tokens / (double)g_spec_rounds, g_mtp_depth);
+    if (g_mtp_calls > 0)
+        fprintf(stderr, "[mtp] draft head: %.0f ms over %ld calls, %.1f ms each\n",
+                g_mtp_head_ms, g_mtp_calls, g_mtp_head_ms / (double)g_mtp_calls);
     ds4_log(stderr, DS4_LOG_TIMING, "ds4: Qwen3.8 prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
@@ -78037,6 +78096,15 @@ static void qwen35_cpu_forward_batch(
                 g_ph.gdn, g_ph.head, tot);
     }
     qwen35_rms_par(blk, xb, qwen4_ref_f32(m, w->output_norm), E, n_tok, eps);
+    /* Accumulate the output-normed hidden, for the prior measurement below. */
+    if (g_prior_mask == NULL && n_tok > 0 &&
+        getenv("DS4_QWEN35_NO_COMPACT_HEAD") == NULL &&
+        getenv("DS4_QWEN35_MTP_SPEC")) {
+        for (uint32_t t = 0; t < n_tok; t++)
+            for (uint32_t i = 0; i < E; i++)
+                g_prior_acc[i] += (double)blk[(uint64_t)t * E + i];
+        g_prior_cnt += (long)n_tok;
+    }
     /* The head is a matvec the size of the whole vocabulary times E, and in a
      * prefill only the last position's logits are ever read - the caller copies
      * row n-1 and discards the rest. Computing all of them projected every
@@ -78283,7 +78351,50 @@ static void qwen35_cpu_mtp_forward_h(
     /* h_nextn is the POST-output-norm hidden (llama's t_h_nextn); the chain
      * feeds this back as the next step's input. */
     if (out_hidden) memcpy(out_hidden, xn, (size_t)E * sizeof(float));
-    qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
+    /* DS4_QWEN35_NODRAFTHEAD prices the draft's vocabulary projection, which is
+     * the same 545 MB head the trunk uses and is run once per chain link. The
+     * result is wrong when this is set; it exists only to measure. */
+    static int nodh = -1;
+    if (nodh < 0) nodh = getenv("DS4_QWEN35_NODRAFTHEAD") != NULL;
+    struct timespec dh0, dh1;
+    clock_gettime(CLOCK_MONOTONIC, &dh0);
+    /* With a compact head, score only those rows and leave the rest at -inf, so
+     * the caller's argmax over the full array still works and can only ever pick
+     * a row that was actually scored. The -inf fill happens once. */
+    static int use_compact = -1;
+    if (use_compact < 0) use_compact = getenv("DS4_QWEN35_NO_COMPACT_HEAD") == NULL;
+    if (!nodh && use_compact && g_draft_rows > 0 &&
+        w->output->type == DS4_TENSOR_Q6_K) {
+        static int init_done = 0;
+        if (!init_done) {
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) draft_logits[i] = -INFINITY;
+            init_done = 1;
+        }
+        const uint64_t blocks = w->output->dim[0] / QK_K;
+        const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
+        ds4_quantize_row_q8_K(xn, s->qwen35_cpu_q8, (int64_t)E);
+        float *scores = xmalloc((size_t)g_draft_rows * sizeof(float));
+        qwen35_draft_mv_arg da;
+        da.rows = g_draft_head; da.xq = s->qwen35_cpu_q8;
+        da.scores = scores; da.blocks = blocks; da.row_bytes = rb;
+        ds4_parallel_for((uint64_t)g_draft_rows, qwen35_draft_mv_worker, &da);
+        for (int r = 0; r < g_draft_rows; r++)
+            draft_logits[g_draft_ids[r]] = scores[r];
+        free(scores);
+    } else if (!nodh) {
+        qwen35_cpu_matvec(m, w->output, xn, draft_logits, s->qwen35_cpu_q8, mtp_exact);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &dh1);
+    g_mtp_head_ms += (double)(dh1.tv_sec - dh0.tv_sec) * 1e3 +
+                    (double)(dh1.tv_nsec - dh0.tv_nsec) / 1e6;
+    g_mtp_calls++;
+    if (g_prior_total > 0 && g_prior_total % 16 == 0)
+        fprintf(stderr, "[prior] coverage %ld/%ld = %.1f%% (top %d)\n",
+                g_prior_hits, g_prior_total,
+                100.0 * (double)g_prior_hits / (double)g_prior_total, g_prior_n);
+    if (g_mtp_calls % 16 == 0)
+        fprintf(stderr, "[mtp] draft head: %.1f ms each over %ld calls\n",
+                g_mtp_head_ms / (double)g_mtp_calls, g_mtp_calls);
 }
 
 static void qwen35_cpu_mtp_forward(
@@ -90409,9 +90520,66 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+typedef struct { float v; int id; } qwen35_prior_ent;
+static int qwen35_prior_cmp(const void *a, const void *b) {
+    const qwen35_prior_ent *x = a, *y = b;
+    if (x->v < y->v) return 1;
+    if (x->v > y->v) return -1;
+    return 0;
+}
+
+/* One matvec of the head against the mean hidden, then the top N rows. */
+static void qwen35_prior_build(const ds4_model *m, const ds4_weights *w,
+                               ds4_session *s) {
+    if (g_prior_mask || g_prior_cnt == 0) return;
+    const uint32_t E = DS4_N_EMBD;
+    long k = getenv("DS4_QWEN35_PRIOR") ? strtol(getenv("DS4_QWEN35_PRIOR"), NULL, 10) : 0;
+    if (k <= 0) k = 65536;
+    if (k > (long)DS4_N_VOCAB) k = (long)DS4_N_VOCAB;
+    float *mean = xmalloc((size_t)E * sizeof(float));
+    for (uint32_t i = 0; i < E; i++)
+        mean[i] = (float)(g_prior_acc[i] / (double)g_prior_cnt);
+    float *lg = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    qwen35_cpu_matvec(m, w->output, mean, lg, s->qwen35_cpu_q8, false);
+    qwen35_prior_ent *ent = xmalloc((size_t)DS4_N_VOCAB * sizeof(*ent));
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) { ent[i].v = lg[i]; ent[i].id = (int)i; }
+    qsort(ent, DS4_N_VOCAB, sizeof(*ent), qwen35_prior_cmp);
+    g_prior_mask = xmalloc((size_t)DS4_N_VOCAB);
+    memset(g_prior_mask, 0, (size_t)DS4_N_VOCAB);
+    for (long i = 0; i < k; i++) g_prior_mask[ent[i].id] = 1;
+    g_prior_n = (int)k;
+    /* Gather those rows out of the head, packed as they already are. */
+    if (w->output && w->output->type == DS4_TENSOR_Q6_K) {
+        const uint64_t blocks = w->output->dim[0] / QK_K;
+        const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
+        const uint8_t *src = (const uint8_t *)tensor_data(m, w->output);
+        g_draft_head = xmalloc((size_t)k * rb);
+        g_draft_ids = xmalloc((size_t)k * sizeof(int));
+        for (long i = 0; i < k; i++) {
+            memcpy(g_draft_head + (uint64_t)i * rb,
+                   src + (uint64_t)ent[i].id * rb, (size_t)rb);
+            g_draft_ids[i] = ent[i].id;
+        }
+        g_draft_rows = (int)k;
+        fprintf(stderr, "[prior] gathered %d rows, %.1f MB, %llu blocks each\n",
+                g_draft_rows, (double)((uint64_t)k * rb) / 1048576.0,
+                (unsigned long long)blocks);
+    }
+    fprintf(stderr, "[prior] top %ld of %u built "
+            "(score at cut %.3f, best %.3f)\n",
+            k, (unsigned)DS4_N_VOCAB, (double)ent[k-1].v, (double)ent[0].v);
+    free(ent); free(lg); free(mean);
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+    const int best = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (s->engine && !getenv("DS4_QWEN35_NO_COMPACT_HEAD") &&
+        getenv("DS4_QWEN35_MTP_SPEC")) {
+        qwen35_prior_build(&s->engine->model, &s->engine->weights, s);
+        qwen35_prior_note(best);
+    }
+    return best;
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {

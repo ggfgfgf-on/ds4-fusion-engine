@@ -77258,6 +77258,12 @@ static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
  * different register blocking, so their byte shares say nothing about their time
  * shares. */
 static double acc_ms_q4 = 0.0, acc_ms_q6 = 0.0, acc_ms_other = 0.0;
+/* The two things a verify batch does besides the weight matvec, timed apart: the
+ * per-position head passes and the draft chain that feeds the next round. */
+static double acc_ms_head = 0.0, acc_ms_draft = 0.0;
+/* Sampling temperature for the round being verified, so the forward knows whether
+ * the last position needs a whole distribution or only an argmax. */
+static float g_round_temperature = 0.0f;
 static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
 
@@ -78285,6 +78291,8 @@ static void qwen35_cpu_forward_batch(
      *
      * The debug and reference paths do read the other rows, so they still get
      * them. */
+    struct timespec hd0, hd1;
+    clock_gettime(CLOCK_MONOTONIC, &hd0);
     if (getenv("DS4_QWEN35_BATCH_DBG") != NULL ||
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
@@ -78294,15 +78302,23 @@ static void qwen35_cpu_forward_batch(
          * is 545 MB a position, so scoring nine of them against the full
          * vocabulary is four gigabytes of reads that a quarter of the rows can
          * answer. */
-        if (n_tok > 1u && qwen35_compact_head_ready(w) &&
+        /* The last position is the only one whose whole distribution is needed - it
+         * becomes the next round's sampling input. Under greedy decoding nothing
+         * samples from it: the next token is its argmax, which the compact rows
+         * already answer. So the full head runs only when a temperature asks for a
+         * distribution. */
+        const bool last_needs_all = g_round_temperature > 0.0f;
+        if (n_tok > 0u && qwen35_compact_head_ready(w) &&
             getenv("DS4_QWEN35_VERIFY_FULL_HEAD") == NULL) {
-            for (uint32_t t = 0; t + 1u < n_tok; t++)
+            const uint32_t ncompact = last_needs_all ? n_tok - 1u : n_tok;
+            for (uint32_t t = 0; t < ncompact; t++)
                 qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
                                            logits_all + (uint64_t)t * DS4_N_VOCAB, s);
-            qwen35_cpu_matvec_batch(m, w->output,
-                                    blk + (uint64_t)(n_tok - 1u) * E,
-                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
-                                    1u, false);
+            if (last_needs_all)
+                qwen35_cpu_matvec_batch(m, w->output,
+                                        blk + (uint64_t)(n_tok - 1u) * E,
+                                        logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
+                                        1u, false);
         } else {
             qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
         }
@@ -78312,6 +78328,11 @@ static void qwen35_cpu_forward_batch(
                                 logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
                                 1u, false);
     }
+    clock_gettime(CLOCK_MONOTONIC, &hd1);
+    acc_ms_head += (double)(hd1.tv_sec - hd0.tv_sec) * 1e3 +
+                   (double)(hd1.tv_nsec - hd0.tv_nsec) / 1e6;
+    struct timespec dr0, dr1;
+    clock_gettime(CLOCK_MONOTONIC, &dr0);
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts
      * for the following positions (each step is a cheap nextn-layer pass). */
@@ -78363,6 +78384,9 @@ static void qwen35_cpu_forward_batch(
         free(hb);
         free(draft);
     }
+    clock_gettime(CLOCK_MONOTONIC, &dr1);
+    acc_ms_draft += (double)(dr1.tv_sec - dr0.tv_sec) * 1e3 +
+                    (double)(dr1.tv_nsec - dr0.tv_nsec) / 1e6;
     free(score); free(gb); free(ga); free(v2); free(k2); free(q2); free(attn_o);
     free(tmp); free(ff_b); free(ff_a); free(lin_o); free(z); free(qkv);
     free(blk); free(xb);
@@ -78380,7 +78404,10 @@ static void qwen35_cpu_forward_batch(
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
     
             if (getenv("DS4_QWEN35_BYTE_DBG"))
-                fprintf(stderr, "[prefill] by format: q4=%.0f ms (%.0f%% of matvec), "
+                fprintf(stderr, "[prefill] head=%.0f ms, draft=%.0f ms, "
+                "rest=%.0f ms\n", acc_ms_head, acc_ms_draft,
+                wall - acc_ms - acc_ms_head - acc_ms_draft);
+        fprintf(stderr, "[prefill] by format: q4=%.0f ms (%.0f%% of matvec), "
                         "q6=%.0f ms (%.0f%%), other=%.0f ms\n",
                         acc_ms_q4, 100.0 * acc_ms_q4 / (acc_ms > 0.0 ? acc_ms : 1.0),
                         acc_ms_q6, 100.0 * acc_ms_q6 / (acc_ms > 0.0 ? acc_ms : 1.0),
@@ -100232,6 +100259,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                            (size_t)conv_f * sizeof(float));
                     nl++;
                 }
+                g_round_temperature = temperature;
                 float *lg = xmalloc((size_t)nt * (size_t)V * sizeof(float));
                 /* The accept check below reads lg[0], the logits of the first
                  * position. The head normally projects only the last position, so

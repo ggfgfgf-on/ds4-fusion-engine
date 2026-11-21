@@ -76856,6 +76856,31 @@ typedef struct {
  * results are bit-identical to running one token at a time - but a 512-byte
  * state row now stays in L1 across the whole token run instead of being
  * streamed out and back once per token. */
+/* Copy that leaves the cache alone.
+ *
+ * The speculative snapshot writes a layer's recurrent state for every position but
+ * the last - twenty-two megabytes a position over the linear layers. Ordinary
+ * stores pull each line in first, so the traffic is double what is written, and the
+ * lines they evict are the weight pages the next round has to stream back out of
+ * DRAM. Streaming stores write straight through: half the traffic, and L3 keeps
+ * whatever it had. */
+static void qwen35_copy_nt(float *restrict dst, const float *restrict src,
+                           uint64_t n) {
+    /* Streaming stores are the point, but the two forms have to be comparable. */
+    static int plain = -1;
+    if (plain < 0) plain = getenv("DS4_QWEN35_NO_NT_SNAP") != NULL;
+    if (plain) { memcpy(dst, src, (size_t)n * sizeof(float)); return; }
+    uint64_t i = 0;
+    const uint64_t aligned = (((uintptr_t)dst + 31u) & ~(uintptr_t)31u) -
+                             (uintptr_t)dst;
+    const uint64_t head = aligned / sizeof(float);
+    for (; i < head && i < n; i++) dst[i] = src[i];
+    for (; i + 8u <= n; i += 8u)
+        _mm256_stream_ps(dst + i, _mm256_loadu_ps(src + i));
+    for (; i < n; i++) dst[i] = src[i];
+    _mm_sfence();
+}
+
 static void qwen35_gdn_scanb_worker(void *vctx, uint64_t i0, uint64_t i1) {
     qwen35_gdn_scanb_arg *a = vctx;
     const uint32_t D = a->D;
@@ -76878,8 +76903,7 @@ static void qwen35_gdn_scanb_worker(void *vctx, uint64_t i0, uint64_t i1) {
             for (uint32_t i = 0; i < D; i++) { srow[i] += k[i] * delta; o += srow[i] * q[i]; }
             a->lin_o[t * a->o_stride + (uint64_t)h * D + dv] = o;
             if (a->snap && t + 1u < a->n_tok)
-                memcpy(a->snap + t * a->snap_stride + idx * D, srow,
-                       (size_t)D * sizeof(float));
+                qwen35_copy_nt(a->snap + t * a->snap_stride + idx * D, srow, D);
         }
     }
 }

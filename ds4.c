@@ -77522,8 +77522,17 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         const uint64_t kstride = (uint64_t)nKV * nHD;
         for (uint32_t x = 0; x < visible; x++) {
             const float *restrict kvr = w->kv + (uint64_t)(x % w->kv_cap) * kstride + krow;
-            float dd = 0.0f;
-            for (uint32_t i = 0; i < (uint32_t)nHD; i++) dd += qh[i] * kvr[i];
+            /* Eight lanes at a time. The scalar form here is a hundred and
+             * fifty-six thousand multiply-adds per token per head - two hundred
+             * and fifty-six per key, and qh does not change across the keys, so
+             * the whole inner loop is a contiguous dot against a fixed vector. */
+            __m256 acc = _mm256_setzero_ps();
+            uint32_t i = 0;
+            for (; i + 8u <= nHD; i += 8u)
+                acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
+                                      _mm256_loadu_ps(kvr + i), acc);
+            float dd = qwen35_hsum_ps256(acc);
+            for (; i < nHD; i++) dd += qh[i] * kvr[i];
             sc[x] = dd * scale;
         }
         float mx = sc[0];
@@ -77534,12 +77543,29 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             ss += sc[x];
         }
         float *restrict outh = w->attn_o + t * nH * nHD + (uint64_t)h * nHD;
+        /* Accumulate over the key axis outermost, so the output vector is fixed
+         * and the keys are streamed past it. The original had the two loops the
+         * other way round, which put an integer modulo inside the innermost body -
+         * a divide per element, four million of them a pass. */
+        float oacc[512];
+        const uint32_t nacc = nHD < 512u ? (uint32_t)nHD : 512u;
+        for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
+        for (uint32_t x = 0; x < visible; x++) {
+            const float *restrict vr =
+                    w->kv + (uint64_t)(x % w->kv_cap) * kstride + vbase + krow;
+            const float sx = sc[x];
+            const __m256 sv = _mm256_set1_ps(sx);
+            uint32_t i = 0;
+            for (; i + 8u <= nacc; i += 8u)
+                _mm256_storeu_ps(oacc + i,
+                                 _mm256_fmadd_ps(sv, _mm256_loadu_ps(vr + i),
+                                                 _mm256_loadu_ps(oacc + i)));
+            for (; i < nacc; i++) oacc[i] += sx * vr[i];
+        }
         for (uint32_t i = 0; i < (uint32_t)nHD; i++) {
-            float o = 0.0f;
-            for (uint32_t x = 0; x < visible; x++)
-                o += sc[x] * w->kv[(uint64_t)(x % w->kv_cap) * kstride + vbase + krow + i];
             /* Keep the division: the reciprocal form moved max abs diff from
              * 2.147 to 2.875 at n=33 against a 3.0 tolerance. */
+            const float o = (i < nacc) ? oacc[i] : 0.0f;
             outh[i] = o / (float)ss * (1.0f / (1.0f + expf(-gt[i])));
         }
     }

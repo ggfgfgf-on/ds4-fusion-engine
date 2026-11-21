@@ -78249,6 +78249,14 @@ static void qwen35_cpu_forward_batch(
         }
         if (chain_max > DS4_MTP_DEPTH_MAX) chain_max = DS4_MTP_DEPTH_MAX;
         if (chain_max < 1) chain_max = 1;
+        /* A prompt chunk gets one link, not a chain.
+         *
+         * Of the chain this builds, only the first entry is ever read: it is the
+         * draft for the position after the prompt, which is the first decoded token.
+         * The rest are drafts for positions that do not exist until the verify puts
+         * them there, and the verify rebuilds the chain from its own hidden anyway.
+         * Measured five percent of prefill throughput spent on links nothing reads. */
+        if (n_tok > 8u && chain_max > 1) chain_max = 1;
         for (int k = 0; k < chain_max; k++) {
             qwen35_cpu_mtp_forward_h(m, w, s, hsrc, prev, last_pos + 1u + (uint32_t)k,
                                      draft, hb);

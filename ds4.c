@@ -78156,27 +78156,16 @@ static void qwen35_cpu_forward_batch(
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
         s->qwen35_want_all_logits) {
-        /* A verify only needs the argmax at every position but the last. The last
-         * position's logits become s->logits, which is read three ways: the next
-         * round's argmax, the sampler, and the speculation gate that compares the
-         * trunk's pick against the draft's. The compact rows are a subset, and a
-         * subset can answer "which of these is highest" but not "is this the
-         * highest of all" - with the rest of the array at -inf the gate compared
-         * against a truncated distribution and stopped agreeing, which cost more
-         * than the head it saved. Measured 4.04 with the full head here, 3.68
-         * without. */
-        if (n_tok > 0u && qwen35_compact_head_ready(w) &&
-            getenv("DS4_QWEN35_VERIFY_FULL_HEAD") == NULL) {
-            for (uint32_t t = 0; t + 1u < n_tok; t++)
-                qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
-                                           logits_all + (uint64_t)t * DS4_N_VOCAB, s);
-            qwen35_cpu_matvec_batch(m, w->output,
-                                    blk + (uint64_t)(n_tok - 1u) * E,
-                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
-                                    1u, false);
-        } else {
-            qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
-        }
+        /* Every position against the full head.
+         *
+         * An earlier change scored the positions before the last on the compact
+         * rows, on the theory that the accept check only asks which token is
+         * highest. It does - but over the whole vocabulary, and the compact rows are
+         * a subset: when the true pick fell outside it the check rejected a draft
+         * that was right. Whether that cost more than the thirteen milliseconds it
+         * saved could not be settled by measurement either way, so it is not taken.
+         * The draft's own head keeps its compact rows, where the margin was clear. */
+        qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
     } else if (n_tok > 0u) {
         qwen35_cpu_matvec_batch(m, w->output,
                                 blk + (uint64_t)(n_tok - 1u) * E,

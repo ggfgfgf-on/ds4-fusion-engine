@@ -77137,9 +77137,6 @@ static double acc_ms_q4 = 0.0, acc_ms_q6 = 0.0, acc_ms_other = 0.0;
 /* The two things a verify batch does besides the weight matvec, timed apart: the
  * per-position head passes and the draft chain that feeds the next round. */
 static double acc_ms_head = 0.0, acc_ms_draft = 0.0;
-/* Sampling temperature for the round being verified, so the forward knows whether
- * the last position needs a whole distribution or only an argmax. */
-static float g_round_temperature = 0.0f;
 static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
 
@@ -78159,28 +78156,24 @@ static void qwen35_cpu_forward_batch(
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
         s->qwen35_want_all_logits) {
-        /* A verify only needs the argmax at every position but the last; the last
-         * one needs the whole distribution for the next round's sampling. The head
-         * is 545 MB a position, so scoring nine of them against the full
-         * vocabulary is four gigabytes of reads that a quarter of the rows can
-         * answer. */
-        /* The last position is the only one whose whole distribution is needed - it
-         * becomes the next round's sampling input. Under greedy decoding nothing
-         * samples from it: the next token is its argmax, which the compact rows
-         * already answer. So the full head runs only when a temperature asks for a
-         * distribution. */
-        const bool last_needs_all = g_round_temperature > 0.0f;
+        /* A verify only needs the argmax at every position but the last. The last
+         * position's logits become s->logits, which is read three ways: the next
+         * round's argmax, the sampler, and the speculation gate that compares the
+         * trunk's pick against the draft's. The compact rows are a subset, and a
+         * subset can answer "which of these is highest" but not "is this the
+         * highest of all" - with the rest of the array at -inf the gate compared
+         * against a truncated distribution and stopped agreeing, which cost more
+         * than the head it saved. Measured 4.04 with the full head here, 3.68
+         * without. */
         if (n_tok > 0u && qwen35_compact_head_ready(w) &&
             getenv("DS4_QWEN35_VERIFY_FULL_HEAD") == NULL) {
-            const uint32_t ncompact = last_needs_all ? n_tok - 1u : n_tok;
-            for (uint32_t t = 0; t < ncompact; t++)
+            for (uint32_t t = 0; t + 1u < n_tok; t++)
                 qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
                                            logits_all + (uint64_t)t * DS4_N_VOCAB, s);
-            if (last_needs_all)
-                qwen35_cpu_matvec_batch(m, w->output,
-                                        blk + (uint64_t)(n_tok - 1u) * E,
-                                        logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
-                                        1u, false);
+            qwen35_cpu_matvec_batch(m, w->output,
+                                    blk + (uint64_t)(n_tok - 1u) * E,
+                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
+                                    1u, false);
         } else {
             qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
         }
@@ -100074,7 +100067,6 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                            (size_t)conv_f * sizeof(float));
                     nl++;
                 }
-                g_round_temperature = temperature;
                 float *lg = xmalloc((size_t)nt * (size_t)V * sizeof(float));
                 /* The accept check below reads lg[0], the logits of the first
                  * position. The head normally projects only the last position, so

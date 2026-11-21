@@ -1839,8 +1839,8 @@ static int g_draft_rows = 0;
  * here. */
 static float qwen35_dot_q6_K_q8_K_avx2(const block_q6_K *x, const block_q8_K *y);
 
-typedef struct {
-    const uint8_t *rows;
+typedef struct {
+    const uint8_t *rows;
     const block_q8_K *xq;
     float *scores;
     uint64_t blocks, row_bytes;
@@ -77817,6 +77817,13 @@ static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
                                        float *logits, ds4_session *s);
 
 
+/* The plain decode forward keeps its own tally: it prints no [prefill] line, so a
+ * round that falls back to it disappears from the breakdown entirely. */
+static double g_tok_fwd_ms = 0.0;
+static long g_tok_fwd_n = 0;
+/* Everything the speculative round spends outside the batched verify. */
+static double g_spec_outside_ms = 0.0;
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -78698,7 +78705,26 @@ static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
 
 #endif /* !DS4_NO_GPU */
 
+static void qwen35_cpu_forward_token_body(
+        float *logits, const ds4_model *m, const ds4_weights *w,
+        ds4_session *s, int token, uint32_t pos);
+
 static void qwen35_cpu_forward_token(
+        float *logits, const ds4_model *m, const ds4_weights *w,
+        ds4_session *s, int token, uint32_t pos) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    qwen35_cpu_forward_token_body(logits, m, w, s, token, pos);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_tok_fwd_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    g_tok_fwd_n++;
+    if (getenv("DS4_QWEN35_BYTE_DBG") && g_tok_fwd_n % 8 == 0)
+        fprintf(stderr, "[fwd] plain forwards: %ld, %.0f ms total, %.0f ms each\n",
+                g_tok_fwd_n, g_tok_fwd_ms, g_tok_fwd_ms / (double)g_tok_fwd_n);
+}
+
+static void qwen35_cpu_forward_token_body(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
     const bool prof = getenv("DS4_QWEN35_PROFILE") != NULL;
@@ -100057,6 +100083,12 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                  * position. The head normally projects only the last position, so
                  * without this the check compared against whatever was in the
                  * buffer and every round looked like a miss. */
+                struct timespec v0, v1, v2, v3;
+                double d_setup = 0.0, d_verify = 0.0, d_accept = 0.0;
+                clock_gettime(CLOCK_MONOTONIC, &v0);
+                clock_gettime(CLOCK_MONOTONIC, &v2);
+                d_setup = (double)(v2.tv_sec - v0.tv_sec) * 1e3 +
+                          (double)(v2.tv_nsec - v0.tv_nsec) / 1e6;
                 s->qwen35_want_all_logits = true;
                 /* Ask the forward to save the recurrent state after each token
                  * but the last. A partial accept then becomes a copy instead of
@@ -100076,7 +100108,16 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 qwen35_cpu_forward_batch(lg, &e2->model, &e2->weights, s,
                                          toks, (uint32_t)nt,
                                          (uint32_t)s->checkpoint.len);
+                clock_gettime(CLOCK_MONOTONIC, &v1);
+                d_verify = (double)(v1.tv_sec - v2.tv_sec) * 1e3 +
+                           (double)(v1.tv_nsec - v2.tv_nsec) / 1e6;
                 s->qwen35_want_all_logits = false;
+                clock_gettime(CLOCK_MONOTONIC, &v3);
+                d_accept = (double)(v3.tv_sec - v1.tv_sec) * 1e3 +
+                           (double)(v3.tv_nsec - v1.tv_nsec) / 1e6;
+                if (getenv("DS4_QWEN35_ROUND_DBG"))
+                    fprintf(stderr, "[round] nt=%d setup=%.0f verify=%.0f "
+                            "accept=%.0f ms\n", nt, d_setup, d_verify, d_accept);
                 g_spec_snap_nt = 0;
                 /* verify: the first position's argmax must match toks[1], etc. */
                 int n_ok = 1;
@@ -100122,6 +100163,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                 nt, n_ok, g_mtp_depth);
                     free(snap);
                     free(lg);
+                    if (getenv("DS4_QWEN35_ROUND_DBG")) {
+                        struct timespec vt;
+                        clock_gettime(CLOCK_MONOTONIC, &vt);
+                        fprintf(stderr, "[round]   total=%.0f tail=%.0f ms\n",
+                                (double)(vt.tv_sec - v0.tv_sec) * 1e3 +
+                                (double)(vt.tv_nsec - v0.tv_nsec) / 1e6,
+                                (double)(vt.tv_sec - v1.tv_sec) * 1e3 +
+                                (double)(vt.tv_nsec - v1.tv_nsec) / 1e6);
+                    }
                     return n_ok;
                 }
                 if (getenv("DS4_QWEN35_SPEC_DBG"))
@@ -100189,6 +100239,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                     g_mtp_depth);
                         free(snap);
                         free(lg);
+                        if (getenv("DS4_QWEN35_ROUND_DBG")) {
+                            struct timespec vt;
+                            clock_gettime(CLOCK_MONOTONIC, &vt);
+                            fprintf(stderr, "[round]   total=%.0f tail=%.0f ms (part)\n",
+                                    (double)(vt.tv_sec - v0.tv_sec) * 1e3 +
+                                    (double)(vt.tv_nsec - v0.tv_nsec) / 1e6,
+                                    (double)(vt.tv_sec - v1.tv_sec) * 1e3 +
+                                    (double)(vt.tv_nsec - v1.tv_nsec) / 1e6);
+                        }
                         if (getenv("DS4_QWEN35_SPEC_DBG"))
                             fprintf(stderr, "[spec] SNAPRESTORE %d\n", na);
                         return na;

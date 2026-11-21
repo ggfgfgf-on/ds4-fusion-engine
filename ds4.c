@@ -1800,6 +1800,12 @@ static void *xcalloc(size_t n, size_t size) {
     return p;
 }
 
+/* Speculative decode: the adaptive draft depth, and the round counters that let
+ * the mechanism be judged on tokens per round instead of on a throughput number
+ * that mixes it with everything else. */
+static int g_mtp_depth = 1;
+static long g_spec_rounds = 0, g_spec_tokens = 0, g_spec_full = 0, g_spec_partial = 0;
+
 static void *xmalloc(size_t size) {
     ds4_alloc_guard_check("malloc", size);
     void *p = malloc(size);
@@ -65289,6 +65295,11 @@ static int generate_qwen4_metal_argmax(
     if (done) done(emit_ud);
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
+    if (g_spec_rounds > 0)
+        fprintf(stderr, "[spec] rounds=%ld full=%ld partial=%ld tokens=%ld "
+                "tokens/round=%.2f depth=%d\n",
+                g_spec_rounds, g_spec_full, g_spec_partial, g_spec_tokens,
+                (double)g_spec_tokens / (double)g_spec_rounds, g_mtp_depth);
     ds4_log(stderr, DS4_LOG_TIMING, "ds4: Qwen3.8 prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
@@ -76602,7 +76613,6 @@ static void qwen35_gemm_q6_K_q8_K_2x4_dp(
  * carries, up to the kernel's eight per pass. A link costs one nextn pass, about
  * fifteen milliseconds, against three hundred and eighty for a verify pass.
  */
-static int g_mtp_depth = 1;
 #define DS4_MTP_DEPTH_MAX 15
 
 static float *g_spec_snap;
@@ -99855,6 +99865,13 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     memcpy(s->logits, lg + (size_t)(nt - 1) * V, (size_t)V * sizeof(float));
+                    g_spec_rounds++; g_spec_full++; g_spec_tokens += n_ok;
+                    if (getenv("DS4_QWEN35_SPEC_DBG") && g_spec_rounds % 8 == 0)
+                        fprintf(stderr, "[spec] r=%ld full=%ld part=%ld tok=%ld "
+                                "tok/r=%.2f depth=%d\n", g_spec_rounds, g_spec_full,
+                                g_spec_partial, g_spec_tokens,
+                                (double)g_spec_tokens / (double)g_spec_rounds,
+                                g_mtp_depth);
                     if (g_mtp_depth < DS4_MTP_DEPTH_MAX) g_mtp_depth++;
                     if (getenv("DS4_QWEN35_SPEC_DBG"))
                         fprintf(stderr, "[spec] nt=%d n_ok=%d FULL depth->%d\n",
@@ -99909,6 +99926,13 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                         s->mtp_draft_valid = false;
                         memcpy(s->logits, lg + (size_t)(na - 1) * V,
                                (size_t)V * sizeof(float));
+                        g_spec_rounds++; g_spec_partial++; g_spec_tokens += na;
+                        if (getenv("DS4_QWEN35_SPEC_DBG") && g_spec_rounds % 8 == 0)
+                            fprintf(stderr, "[spec] r=%ld full=%ld part=%ld tok=%ld "
+                                    "tok/r=%.2f depth=%d\n", g_spec_rounds, g_spec_full,
+                                    g_spec_partial, g_spec_tokens,
+                                    (double)g_spec_tokens / (double)g_spec_rounds,
+                                    g_mtp_depth);
                         if (na > 1) g_mtp_depth = na; else g_mtp_depth = 1;
                         free(snap);
                         free(lg);

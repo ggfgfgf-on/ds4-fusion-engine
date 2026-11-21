@@ -76699,11 +76699,16 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
     const uint64_t blocks = ctx->in_dim / QK_K;
 #if defined(__AVX2__)
     uint64_t row = row0;
-    if (ctx->type == DS4_TENSOR_Q6_K && !ctx->exact &&
+    /* Q6_K used to fall through to the per-row, per-token tail: one accumulator
+     * chain and no weight sharing across tokens. It is 22% of the weight bytes.
+     *
+     * That sharing is what makes this path win on a prompt - eight tokens per pass
+     * over a row pair - and it is also why it loses on a verify, which carries two
+     * to four. Measured on the same build: prefill 63.3 t/s here against 57.9 on the
+     * per-row dot, generation 3.71 against 4.02. Below eight tokens the row dot is
+     * the faster of the two, so the dispatch follows the batch size. */
+    if (ctx->type == DS4_TENSOR_Q6_K && !ctx->exact && ctx->n_tok > 8u &&
         getenv("DS4_QWEN35_NO_X4") == NULL) {
-        /* Q6_K used to fall through to the per-row, per-token tail: one
-         * accumulator chain and no weight sharing across tokens. It is 22% of
-         * the weight bytes. */
         int16_t *pre = g_q6_pre ? xmalloc((size_t)(blocks * 2u * 256u) * sizeof(int16_t)) : NULL;
         for (; row + 1u < row1; row += 2u) {
             const block_q6_K *u0 = (const block_q6_K *)(ctx->data + (row + 0u) * ctx->row_bytes);

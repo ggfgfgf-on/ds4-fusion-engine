@@ -76754,9 +76754,9 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
 #endif
 }
 
-static void qwen35_gdn_post(const ds4_model *m, const ds4_layer_weights *l,
-                            uint32_t il, const float *lin_o, const float *zz,
-                            float *tmp_row, uint32_t tmp_dim);
+static void qwen35_gdn_post_t(const ds4_model *m, const ds4_layer_weights *l,
+                              uint32_t il, const float *lin_o, const float *zz,
+                              float *tmp_row, uint32_t tmp_dim);
 
 typedef struct {
     float *state;
@@ -76970,12 +76970,30 @@ static void qwen35_gdn_token(
                 qwen35_dbg_l2(qk, C), qwen35_dbg_l2(zz, C),
                 (double)zz[0], (double)zz[1], (double)zz[2],
                 (double)zz[C - 1], qwen35_dbg_l2(lin_o, OW));
-    qwen35_gdn_post(m, l, il, lin_o, zz, tmp_row, tmp_dim);
+    qwen35_gdn_post_t(m, l, il, lin_o, zz, tmp_row, tmp_dim);
 }
 /* rms + silu gate over the scan output, then zero the pass-through lanes. */
-static void qwen35_gdn_post(const ds4_model *m, const ds4_layer_weights *l,
-                            uint32_t il, const float *lin_o, const float *zz,
-                            float *tmp_row, uint32_t tmp_dim) {
+typedef struct {
+    const ds4_model *m;
+    const ds4_layer_weights *l;
+    uint32_t il;
+    const float *lin_o;
+    const float *zz;
+    float *tmp;
+    uint32_t OW, ZW, TW;
+} qwen35_gdn_post_batch_arg;
+
+static void qwen35_gdn_post_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_gdn_post_batch_arg *a = vctx;
+    for (uint64_t t = t0; t < t1; t++)
+        qwen35_gdn_post_t(a->m, a->l, a->il,
+                          a->lin_o + t * a->OW, a->zz + t * a->ZW,
+                          a->tmp + t * a->TW, a->TW);
+}
+
+static void qwen35_gdn_post_t(const ds4_model *m, const ds4_layer_weights *l,
+                              uint32_t il, const float *lin_o, const float *zz,
+                              float *tmp_row, uint32_t tmp_dim) {
     const uint32_t Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t OW = Hv * D;
     const float eps = DS4_RMS_EPS;
@@ -77885,10 +77903,13 @@ static void qwen35_cpu_forward_batch(
                 }
                 ds4_parallel_for((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM,
                                  qwen35_gdn_scanb_worker, &sb);
-                for (uint32_t t = 0; t < n_tok; t++)
-                    qwen35_gdn_post(m, l, il, lin_o + (uint64_t)t * OW,
-                                    z + (uint64_t)t * ZW,
-                                    tmp + (uint64_t)t * TW, TW);
+                {
+                    qwen35_gdn_post_batch_arg pa;
+                    pa.m = m; pa.l = l; pa.il = il;
+                    pa.lin_o = lin_o; pa.zz = z; pa.tmp = tmp;
+                    pa.OW = OW; pa.ZW = ZW; pa.TW = TW;
+                    ds4_parallel_for(n_tok, qwen35_gdn_post_batch_worker, &pa);
+                }
             }
             /* the batched out projection + the residual. */
             qwen35_cpu_matvec_batch(m, l->lin_out, tmp, blk, NT, gdn_exact);

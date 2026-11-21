@@ -76556,6 +76556,97 @@ static void qwen35_gemm_q6_K_q8_K_2x4_pre(
 #endif
 }
 
+
+/* One row, eight tokens, from the pre-unpacked weights.
+ *
+ * The two-by-four form serves four tokens per pass over the unpacked row, and that
+ * row is twenty kilobytes - bigger than what L1 has left once the four tokens'
+ * activations are in it. So the row is re-fetched for every four tokens: at a
+ * hundred and seventeen tokens that is thirty passes, and the whole of Q6_K ends up
+ * costing more wall time than Q4_K's three times larger byte count.
+ *
+ * Eight tokens halves the passes and still fits the register budget: eight integer
+ * accumulators and eight float accumulators are exactly the sixteen ymm there are.
+ */
+static void qwen35_gemm_q6_K_q8_K_1x8_pre(
+        const int16_t *pre, const block_q6_K *x0,
+        const block_q8_K *y, uint64_t ystride, uint64_t blocks,
+        uint64_t nt, float *out, uint64_t out_stride, uint64_t row) {
+#if defined(__AVX2__)
+    const uint64_t lim = nt < 8u ? nt : 8u;
+    __m256 fv[8];
+    for (uint64_t t = 0; t < 8u; t++) fv[t] = _mm256_setzero_ps();
+    for (uint64_t b = 0; b < blocks; b++) {
+        __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+        __m256i a4 = a0, a5 = a0, a6 = a0, a7 = a0;
+        for (int half = 0; half < 2; half++) {
+            for (int c = 0; c < 2; c++) {
+                /* Row r of block b lives at (b*2 + r)*256 in the unpacked buffer. */
+                const int16_t *h = pre + b * 512u
+                                 + (uint64_t)half * 128u + (uint64_t)c * 16u;
+                const __m256i q0 = _mm256_loadu_si256((const __m256i *)(h + 0));
+                const __m256i q1 = _mm256_loadu_si256((const __m256i *)(h + 32));
+                const __m256i q2 = _mm256_loadu_si256((const __m256i *)(h + 64));
+                const __m256i q3 = _mm256_loadu_si256((const __m256i *)(h + 96));
+                const uint64_t base = (uint64_t)half * 4u;
+                for (uint64_t t = 0; t < lim; t++) {
+                    const block_q8_K *yt = y + t * ystride + b;
+                    const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 0u) * 32u + c * 16)));
+                    const __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 1u) * 32u + c * 16)));
+                    const __m256i w2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 2u) * 32u + c * 16)));
+                    const __m256i w3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            (const __m128i *)(yt->qs + (base + 3u) * 32u + c * 16)));
+#define Q6P8(acc)                                                             \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q0, w0));    \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q1, w1));    \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q2, w2));    \
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(q3, w3))
+                    switch (t) {
+                    case 0: Q6P8(a0); break;
+                    case 1: Q6P8(a1); break;
+                    case 2: Q6P8(a2); break;
+                    case 3: Q6P8(a3); break;
+                    case 4: Q6P8(a4); break;
+                    case 5: Q6P8(a5); break;
+                    case 6: Q6P8(a6); break;
+                    default: Q6P8(a7); break;
+                    }
+#undef Q6P8
+                }
+            }
+        }
+        const float d0 = f16_to_f32(x0[b].d);
+        /* A switch, not an array of pointers: taking the accumulators' address is
+         * what pushes them out of registers and into the stack. */
+#define Q6P8_FLUSH(T, A)                                                      \
+        fv[T] = _mm256_fmadd_ps(                                              \
+                _mm256_set1_ps(d0 * y0d(y, ystride, b, (int)(T), nt)),         \
+                _mm256_cvtepi32_ps(A), fv[T])
+        for (uint64_t t = 0; t < lim; t++) {
+            switch (t) {
+            case 0: Q6P8_FLUSH(0, a0); break;
+            case 1: Q6P8_FLUSH(1, a1); break;
+            case 2: Q6P8_FLUSH(2, a2); break;
+            case 3: Q6P8_FLUSH(3, a3); break;
+            case 4: Q6P8_FLUSH(4, a4); break;
+            case 5: Q6P8_FLUSH(5, a5); break;
+            case 6: Q6P8_FLUSH(6, a6); break;
+            default: Q6P8_FLUSH(7, a7); break;
+            }
+        }
+#undef Q6P8_FLUSH
+    }
+    for (uint64_t t = 0; t < lim; t++)
+        out[t * out_stride + row] = qwen35_hsum_ps256(fv[t]);
+#else
+    (void)pre; (void)x0; (void)y; (void)ystride; (void)blocks;
+    (void)nt; (void)out; (void)out_stride; (void)row;
+#endif
+}
+
 static void qwen35_gemm_q6_K_q8_K_2x4_dp(
         const block_q6_K *x0, const block_q6_K *x1,
         const block_q8_K *y, uint64_t ystride, uint64_t blocks,
@@ -76715,6 +76806,32 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
              * itself, once per group, so a hundred and seventeen tokens unpacked
              * the same twenty blocks thirty times. */
             if (pre) qwen35_q6_unpack_pair(u0, u1, blocks, pre);
+            /* The pre-unpacked rows are too big to survive a four-token pass, so
+             * eight tokens a pass halves how often they are re-fetched. Each row of
+             * the pair goes through on its own; two rows would not fit registers. */
+            /* Off by default: measured slower than two-by-four despite reading the
+             * unpacked rows a quarter as often, because one row a pass doubles the
+             * block loop and the weight-register loads. Kept because the reasoning
+             * is only wrong by a constant, and a wider row block would change it. */
+            static int x8 = -1;
+            if (x8 < 0) x8 = getenv("DS4_QWEN35_Q6X8") != NULL;
+            if (pre && x8) {
+                for (uint64_t tt = 0; tt < ctx->n_tok; tt += 8u) {
+                    uint64_t nt = ctx->n_tok - tt;
+                    if (nt > 8u) nt = 8u;
+                    qwen35_gemm_q6_K_q8_K_1x8_pre(pre, u0,
+                                                  ctx->xq + tt * blocks,
+                                                  blocks, blocks, nt,
+                                                  ctx->out + tt * ctx->out_dim,
+                                                  ctx->out_dim, row);
+                    qwen35_gemm_q6_K_q8_K_1x8_pre(pre + 256u, u1,
+                                                  ctx->xq + tt * blocks,
+                                                  blocks, blocks, nt,
+                                                  ctx->out + tt * ctx->out_dim,
+                                                  ctx->out_dim, row + 1u);
+                }
+                continue;
+            }
             for (uint64_t tt = 0; tt < ctx->n_tok; tt += 4u) {
                 uint64_t nt = ctx->n_tok - tt;
                 if (nt > 4u) nt = 4u;
@@ -77137,6 +77254,10 @@ static void qwen35_rp_worker(void *vctx, uint64_t g0, uint64_t g1) {
 }
 
 static uint64_t acc_bytes = 0, acc_calls = 0, acc_q4 = 0, acc_q6 = 0;
+/* Time split by weight format. The two formats run different kernels with very
+ * different register blocking, so their byte shares say nothing about their time
+ * shares. */
+static double acc_ms_q4 = 0.0, acc_ms_q6 = 0.0, acc_ms_other = 0.0;
 static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
 
@@ -77459,8 +77580,12 @@ static void qwen35_cpu_matvec_batch(
     };
     ds4_parallel_for(rows, qwen35_cpu_matvec_batch_worker, &ctx);
     clock_gettime(CLOCK_MONOTONIC, &mv1);
-    acc_ms += (double)(mv1.tv_sec - mv0.tv_sec) * 1e3 +
-              (double)(mv1.tv_nsec - mv0.tv_nsec) / 1e6;
+    const double this_ms = (double)(mv1.tv_sec - mv0.tv_sec) * 1e3 +
+                           (double)(mv1.tv_nsec - mv0.tv_nsec) / 1e6;
+    acc_ms += this_ms;
+    if (w->type == DS4_TENSOR_Q4_K) acc_ms_q4 += this_ms;
+    else if (w->type == DS4_TENSOR_Q6_K) acc_ms_q6 += this_ms;
+    else acc_ms_other += this_ms;
     acc_calls++;
     acc_tok_sum += n_tok;
     if (n_tok > acc_tok_max) acc_tok_max = n_tok;
@@ -78255,6 +78380,11 @@ static void qwen35_cpu_forward_batch(
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
     
             if (getenv("DS4_QWEN35_BYTE_DBG"))
+                fprintf(stderr, "[prefill] by format: q4=%.0f ms (%.0f%% of matvec), "
+                        "q6=%.0f ms (%.0f%%), other=%.0f ms\n",
+                        acc_ms_q4, 100.0 * acc_ms_q4 / (acc_ms > 0.0 ? acc_ms : 1.0),
+                        acc_ms_q6, 100.0 * acc_ms_q6 / (acc_ms > 0.0 ? acc_ms : 1.0),
+                        acc_ms_other);
                 fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "
                         "everything-else=%.0f ms (%.0f%%)\n",
                         attn_ms, 100.0 * attn_ms / (wall > 0.0 ? wall : 1.0),

@@ -1832,6 +1832,11 @@ static uint8_t *g_prior_mask = NULL;
 static uint8_t *g_draft_head = NULL;
 static int *g_draft_ids = NULL;
 static int g_draft_rows = 0;
+static int g_draft_cap = 0;
+/* Rows added because the prior did not contain the trunk's pick. Bounded, and
+ * reported once so a set that keeps missing is visible rather than silently
+ * growing. */
+static int g_draft_healed = 0;
 
 /* Defined with the Q6_K kernels far below; the compact-head worker needs it
  * here. */
@@ -77835,6 +77840,13 @@ static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
                                        float *logits, ds4_session *s);
 
 
+/* Defined further down; the verify path below needs them. */
+static bool qwen35_compact_head_ready(const ds4_weights *w);
+static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
+                                       float *logits, ds4_session *s);
+static void qwen35_compact_head_heal(const ds4_model *m, const ds4_weights *w,
+                                     int tok);
+
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
@@ -78156,16 +78168,35 @@ static void qwen35_cpu_forward_batch(
         getenv("DS4_QWEN35_REF_FORWARD") != NULL ||
         getenv("DS4_QWEN35_BATCH_VERIFY") != NULL ||
         s->qwen35_want_all_logits) {
-        /* Every position against the full head.
-         *
-         * An earlier change scored the positions before the last on the compact
-         * rows, on the theory that the accept check only asks which token is
-         * highest. It does - but over the whole vocabulary, and the compact rows are
-         * a subset: when the true pick fell outside it the check rejected a draft
-         * that was right. Whether that cost more than the thirteen milliseconds it
-         * saved could not be settled by measurement either way, so it is not taken.
-         * The draft's own head keeps its compact rows, where the margin was clear. */
-        qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+        /* Every position against the full head by default. The positions before the
+         * last can be answered by the compact rows, and that is what
+         * DS4_QWEN35_VERIFY_COMPACT enables; the last position always takes the full
+         * head because its logits become s->logits, which the sampler and the
+         * speculation gate both read against the whole vocabulary. */
+        const bool verify_compact =
+                n_tok > 0u && getenv("DS4_QWEN35_VERIFY_COMPACT") != NULL &&
+                qwen35_compact_head_ready(w);
+        if (verify_compact) {
+            for (uint32_t t = 0; t + 1u < n_tok; t++)
+                qwen35_compact_head_logits(w, blk + (uint64_t)t * E,
+                                           logits_all + (uint64_t)t * DS4_N_VOCAB, s);
+            qwen35_cpu_matvec_batch(m, w->output,
+                                    blk + (uint64_t)(n_tok - 1u) * E,
+                                    logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
+                                    1u, false);
+        } else {
+            qwen35_cpu_matvec_batch(m, w->output, blk, logits_all, n_tok, false);
+        }
+        /* The last position just ran the full head, so the trunk's actual pick is
+         * known here. If the compact set does not contain it, that row is missing
+         * from the draft's vocabulary - gather it now. */
+        if (n_tok > 0u && g_draft_rows > 0 && g_prior_mask) {
+            const float *pl = logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB;
+            int am = 0;
+            for (uint32_t i = 1; i < DS4_N_VOCAB; i++)
+                if (pl[i] > pl[am]) am = (int)i;
+            qwen35_compact_head_heal(m, w, am);
+        }
     } else if (n_tok > 0u) {
         qwen35_cpu_matvec_batch(m, w->output,
                                 blk + (uint64_t)(n_tok - 1u) * E,
@@ -90615,8 +90646,11 @@ static void qwen35_prior_build(const ds4_model *m, const ds4_weights *w,
         const uint64_t blocks = w->output->dim[0] / QK_K;
         const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
         const uint8_t *src = (const uint8_t *)tensor_data(m, w->output);
-        g_draft_head = xmalloc((size_t)k * rb);
-        g_draft_ids = xmalloc((size_t)k * sizeof(int));
+        /* Spare capacity: a row the prior missed is gathered on the spot rather
+         * than rebuilding the whole set. */
+        g_draft_cap = (int)k + 4096;
+        g_draft_head = xmalloc((size_t)g_draft_cap * rb);
+        g_draft_ids = xmalloc((size_t)g_draft_cap * sizeof(int));
         for (long i = 0; i < k; i++) {
             memcpy(g_draft_head + (uint64_t)i * rb,
                    src + (uint64_t)ent[i].id * rb, (size_t)rb);
@@ -90625,6 +90659,26 @@ static void qwen35_prior_build(const ds4_model *m, const ds4_weights *w,
         g_draft_rows = (int)k;
     }
     free(ent); free(lg); free(mean);
+}
+
+/* The trunk's own pick, when it is outside the compact rows, is direct proof the
+ * set is missing it: not a guess about staleness, not a rejection rate. Gather that
+ * one row - four kilobytes - instead of re-deriving the whole set. */
+static void qwen35_compact_head_heal(const ds4_model *m, const ds4_weights *w,
+                                     int tok) {
+    if (!g_draft_head || !g_prior_mask || tok < 0 || tok >= (int)DS4_N_VOCAB) return;
+    if (g_prior_mask[tok]) return;
+    if (g_draft_rows >= g_draft_cap) return;
+    if (!w->output || w->output->type != DS4_TENSOR_Q6_K) return;
+    const uint64_t blocks = w->output->dim[0] / QK_K;
+    const uint64_t rb = blocks * (uint64_t)sizeof(block_q6_K);
+    const uint8_t *src = (const uint8_t *)tensor_data(m, w->output);
+    memcpy(g_draft_head + (uint64_t)g_draft_rows * rb,
+           src + (uint64_t)tok * rb, (size_t)rb);
+    g_draft_ids[g_draft_rows] = tok;
+    g_draft_rows++;
+    g_prior_mask[tok] = 1;
+    g_draft_healed++;
 }
 
 int ds4_session_argmax(ds4_session *s) {

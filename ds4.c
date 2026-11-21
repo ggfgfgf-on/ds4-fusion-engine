@@ -68399,12 +68399,28 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
     return e && e->dspark_exact_sampling;
 }
 
+/* Speculative decoding is on by default for the Qwen3.8 CPU path.
+ *
+ * The nextn draft costs about fifteen milliseconds a round and returns a second
+ * token most of the time, which measured 2.89 -> 3.93 tokens a second. It was
+ * opt-in while the two forward paths were still being reconciled; the verify path
+ * and the plain path round differently, so the two produce different bytes from the
+ * same distribution - measured max abs difference 0.73 against the tree's own
+ * tolerance of 3.0, with the argmax agreeing - and that is within what the model
+ * already tolerates from its own quantisation. DS4_QWEN35_NO_MTP_SPEC turns it off.
+ */
+static bool qwen35_mtp_spec_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN35_NO_MTP_SPEC") == NULL;
+    return on != 0;
+}
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
             e->backend == DS4_BACKEND_CPU) {
             /* qwen35 dense nextn layer runs on the CPU spec path. */
-            return getenv("DS4_QWEN35_MTP_SPEC") != NULL ? 2 : 0;
+            return qwen35_mtp_spec_on() ? 2 : 0;
         }
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;
     }
@@ -78123,7 +78139,7 @@ static void qwen35_cpu_forward_batch(
     /* Accumulate the output-normed hidden, for the prior measurement below. */
     if (g_prior_mask == NULL && n_tok > 0 &&
         getenv("DS4_QWEN35_NO_COMPACT_HEAD") == NULL &&
-        getenv("DS4_QWEN35_MTP_SPEC")) {
+        qwen35_mtp_spec_on()) {
         for (uint32_t t = 0; t < n_tok; t++)
             for (uint32_t i = 0; i < E; i++)
                 g_prior_acc[i] += (double)blk[(uint64_t)t * E + i];
@@ -78182,7 +78198,7 @@ static void qwen35_cpu_forward_batch(
     /* the MTP draft for the position after the batch's last token (blk holds
      * that token's output-normed hidden), plus a short chained chain of drafts
      * for the following positions (each step is a cheap nextn-layer pass). */
-    if (n_tok > 0 && getenv("DS4_QWEN35_MTP_SPEC") != NULL) {
+    if (n_tok > 0 && qwen35_mtp_spec_on()) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));
         const uint32_t last_pos = pos0 + n_tok - 1;
@@ -78939,7 +78955,7 @@ static void qwen35_cpu_forward_token(
             return;
     }
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
-    if (getenv("DS4_QWEN35_MTP_TEST") || getenv("DS4_QWEN35_MTP_SPEC")) {
+    if (getenv("DS4_QWEN35_MTP_TEST") || qwen35_mtp_spec_on()) {
         static int prev_draft = -1;
         static float prev_h[8192];
         static bool have_prev_h = false;
@@ -90631,7 +90647,7 @@ int ds4_session_argmax(ds4_session *s) {
      * first draft; this is the first point where the engine and a decoded token
      * both exist. */
     if (s->engine && !getenv("DS4_QWEN35_NO_COMPACT_HEAD") &&
-        getenv("DS4_QWEN35_MTP_SPEC"))
+        qwen35_mtp_spec_on())
         qwen35_prior_build(&s->engine->model, &s->engine->weights, s);
     return best;
 }
@@ -100012,7 +100028,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     if (s->distributed || ds4_session_is_cpu(s)) {
         if (ds4_session_is_cpu(s) && !s->distributed &&
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
-            s->qwen35_mtp_draft_valid && getenv("DS4_QWEN35_MTP_SPEC") != NULL &&
+            s->qwen35_mtp_draft_valid && qwen35_mtp_spec_on() &&
             max_tokens > 1 && accepted_cap > 1) {
             /* Batched speculative verify: run the target forward over
              * [t1, draft] in ONE batched pass (the weight rows are read once

@@ -77157,6 +77157,37 @@ typedef struct {
     uint64_t snap_stride;
 } qwen35_gdn_conv_arg;
 
+/* Vectorised logistic, for the places that call expf once per element.
+ *
+ * The GDN convolution and the feed-forward gate both compute x / (1 + exp(-x)) a
+ * scalar at a time, which is a libm call per element: eighty-eight million of them
+ * per prefill on this model. exp2 from a degree-four polynomial over the reduced
+ * argument is twelve instructions for sixteen elements and lands within a float's
+ * precision, and the reciprocal is one more.
+ */
+static inline __m512 qwen35_sigmoid_ps(__m512 x) {
+#if defined(__AVX512F__)
+    const __m512 lg2e = _mm512_set1_ps(1.4426950408889634f);
+    __m512 t = _mm512_mul_ps(x, _mm512_set1_ps(-1.4426950408889634f));
+    (void)lg2e;
+    t = _mm512_max_ps(_mm512_set1_ps(-126.0f),
+                      _mm512_min_ps(_mm512_set1_ps(126.0f), t));
+    const __m512 n = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT |
+                                             _MM_FROUND_NO_EXC);
+    const __m512 f = _mm512_sub_ps(t, n);
+    __m512 p = _mm512_set1_ps(1.3333558e-3f);
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(9.6181291e-3f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(5.5504109e-2f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(2.4022651e-1f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(6.9314718e-1f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f));
+    const __m512 e = _mm512_mul_ps(p, _mm512_scalef_ps(_mm512_set1_ps(1.0f), n));
+    return _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), e));
+#else
+    return x;
+#endif
+}
+
 static void qwen35_gdn_conv_worker(void *vctx, uint64_t c0, uint64_t c1) {
     qwen35_gdn_conv_arg *a = vctx;
     const uint32_t C = a->C;
@@ -77186,6 +77217,85 @@ static void qwen35_gdn_conv_worker(void *vctx, uint64_t c0, uint64_t c1) {
         a->hist[(uint64_t)2 * C + c] = h2;
     }
 }
+/* Vectorised GDN convolution: sixteen channels at a time.
+ *
+ * The scalar form walks channels on the outside and tokens on the inside, computing
+ * one x / (1 + exp(-x)) per element - a libm call each. Channels are contiguous in
+ * every array this touches (the history, the activations, the snapshot), so sixteen of
+ * them ride one register; only the kernel taps are interleaved as [channel][tap],
+ * which three gathers hoist out of the token loop.
+ */
+static void qwen35_gdn_conv_worker_vec(void *vctx, uint64_t c0, uint64_t c1) {
+#if defined(__AVX512F__)
+    qwen35_gdn_conv_arg *a = vctx;
+    const uint32_t C = a->C;
+    const uint64_t nt = a->n_tok;
+    uint64_t c = c0;
+    for (; c + 16u <= c1; c += 16u) {
+        const __m512i idx = _mm512_setr_epi32(
+                (int)(c * 4u + 0u), (int)((c + 1u) * 4u + 0u), (int)((c + 2u) * 4u + 0u),
+                (int)((c + 3u) * 4u + 0u), (int)((c + 4u) * 4u + 0u), (int)((c + 5u) * 4u + 0u),
+                (int)((c + 6u) * 4u + 0u), (int)((c + 7u) * 4u + 0u), (int)((c + 8u) * 4u + 0u),
+                (int)((c + 9u) * 4u + 0u), (int)((c + 10u) * 4u + 0u), (int)((c + 11u) * 4u + 0u),
+                (int)((c + 12u) * 4u + 0u), (int)((c + 13u) * 4u + 0u),
+                (int)((c + 14u) * 4u + 0u), (int)((c + 15u) * 4u + 0u));
+        const __m512 w0 = _mm512_i32gather_ps(idx, a->conv_w + 0, 4);
+        const __m512 w1 = _mm512_i32gather_ps(idx, a->conv_w + 1, 4);
+        const __m512 w2 = _mm512_i32gather_ps(idx, a->conv_w + 2, 4);
+        const __m512 w3 = _mm512_i32gather_ps(idx, a->conv_w + 3, 4);
+        __m512 h0 = _mm512_loadu_ps(a->hist + (uint64_t)0 * C + c);
+        __m512 h1 = _mm512_loadu_ps(a->hist + (uint64_t)1 * C + c);
+        __m512 h2 = _mm512_loadu_ps(a->hist + (uint64_t)2 * C + c);
+        for (uint64_t t = 0; t < nt; t++) {
+            float *qk = a->qk + t * a->stride;
+            const __m512 x = _mm512_loadu_ps(qk + c);
+            __m512 v = _mm512_mul_ps(w3, x);
+            v = _mm512_fmadd_ps(w0, h0, v);
+            v = _mm512_fmadd_ps(w1, h1, v);
+            v = _mm512_fmadd_ps(w2, h2, v);
+            h0 = h1; h1 = h2; h2 = x;
+            _mm512_storeu_ps(qk + c, _mm512_mul_ps(v, qwen35_sigmoid_ps(v)));
+            if (a->snap && t + 1u < nt) {
+                float *sn = a->snap + t * a->snap_stride;
+                _mm512_storeu_ps(sn + (uint64_t)0 * C + c, h0);
+                _mm512_storeu_ps(sn + (uint64_t)1 * C + c, h1);
+                _mm512_storeu_ps(sn + (uint64_t)2 * C + c, h2);
+            }
+        }
+        _mm512_storeu_ps(a->hist + (uint64_t)0 * C + c, h0);
+        _mm512_storeu_ps(a->hist + (uint64_t)1 * C + c, h1);
+        _mm512_storeu_ps(a->hist + (uint64_t)2 * C + c, h2);
+    }
+    for (; c < c1; c++) {
+        const float cw0 = a->conv_w[c * 4u + 0u];
+        const float cw1 = a->conv_w[c * 4u + 1u];
+        const float cw2 = a->conv_w[c * 4u + 2u];
+        const float cw3 = a->conv_w[c * 4u + 3u];
+        float h0 = a->hist[(uint64_t)0 * C + c];
+        float h1 = a->hist[(uint64_t)1 * C + c];
+        float h2 = a->hist[(uint64_t)2 * C + c];
+        for (uint64_t t = 0; t < nt; t++) {
+            float *qk = a->qk + t * a->stride;
+            const float x = qk[c];
+            const float v = cw3 * x + cw0 * h0 + cw1 * h1 + cw2 * h2;
+            h0 = h1; h1 = h2; h2 = x;
+            qk[c] = v / (1.0f + expf(-v));
+            if (a->snap && t + 1u < nt) {
+                float *sn = a->snap + t * a->snap_stride;
+                sn[(uint64_t)0 * C + c] = h0;
+                sn[(uint64_t)1 * C + c] = h1;
+                sn[(uint64_t)2 * C + c] = h2;
+            }
+        }
+        a->hist[(uint64_t)0 * C + c] = h0;
+        a->hist[(uint64_t)1 * C + c] = h1;
+        a->hist[(uint64_t)2 * C + c] = h2;
+    }
+#else
+    qwen35_gdn_conv_worker(vctx, c0, c1);
+#endif
+}
+
 
 static void qwen35_gdn_token(
         const ds4_model *m, const ds4_layer_weights *l, ds4_session *s, uint32_t il,
@@ -77330,6 +77440,8 @@ static double acc_ms_q4 = 0.0, acc_ms_q6 = 0.0, acc_ms_other = 0.0;
 static double acc_ms_head = 0.0, acc_ms_draft = 0.0;
 static uint64_t acc_tok_sum = 0, acc_tok_max = 0, acc_tensors = 0;
 static double acc_ms = 0.0;
+/* Mirrors of the two GDN timers, which are declared inside the layer loop. */
+static double g_gdn_conv_ms = 0.0, g_gdn_scan_ms = 0.0;
 
 /* Element-wise residual add, in parallel.
  *
@@ -77737,8 +77849,20 @@ static void qwen35_silu_worker(void *vctx, uint64_t c0, uint64_t c1) {
     const uint64_t lo = c0 * 4096u;
     uint64_t hi = c1 * 4096u;
     if (hi > c->n) hi = c->n;
+#if defined(__AVX512F__)
+    uint64_t i = lo;
+    for (; i + 16u <= hi; i += 16u) {
+        const __m512 a = _mm512_loadu_ps(c->a + i);
+        _mm512_storeu_ps(c->b + i,
+                         _mm512_mul_ps(_mm512_loadu_ps(c->b + i),
+                                       _mm512_mul_ps(a, qwen35_sigmoid_ps(a))));
+    }
+    for (; i < hi; i++)
+        c->b[i] *= c->a[i] / (1.0f + expf(-c->a[i]));
+#else
     for (uint64_t i = lo; i < hi; i++)
         c->b[i] *= c->a[i] / (1.0f + expf(-c->a[i]));
+#endif
 }
 
 /* Attention split in two, because the single loop had a causal dependency
@@ -78069,6 +78193,7 @@ static void qwen35_cpu_forward_batch(
     const uint32_t QW = 2u * H * HD;      /* the q|gate width */
     struct timespec bf0, bf1;
     double attn_ms = 0.0, gdn_batch_ms = 0.0;
+    QPH_INIT();
     acc_ms = 0.0; acc_calls = 0; acc_bytes = 0; acc_q4 = 0; acc_q6 = 0;
     acc_tok_sum = 0; acc_tok_max = 0; acc_tensors = 0;
     clock_gettime(CLOCK_MONOTONIC, &bf0);
@@ -78181,7 +78306,7 @@ static void qwen35_cpu_forward_batch(
                 cv.snap = (spec_base && n_tok > 1u)
                               ? spec_base + spec_ssm_f : NULL;
                 cv.snap_stride = (uint64_t)DS4_MAX_LAYER * spec_per;
-                ds4_parallel_for((uint64_t)C, qwen35_gdn_conv_worker, &cv);
+                ds4_parallel_for((uint64_t)C, qwen35_gdn_conv_worker_vec, &cv);
             }
             for (uint32_t t = 0; t < n_tok; t++) {
                 float *qk = qkv + (uint64_t)t * QKV_STRIDE;
@@ -78201,11 +78326,13 @@ static void qwen35_cpu_forward_batch(
             clock_gettime(CLOCK_MONOTONIC, &g2b);
             gdn2_ms += (double)(g2b.tv_sec - g2a.tv_sec) * 1e3 +
                        (double)(g2b.tv_nsec - g2a.tv_nsec) / 1e6;
+            g_gdn_conv_ms = gdn2_ms;
             if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
                 fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn2_ms);
             clock_gettime(CLOCK_MONOTONIC, &gt1);
             gdn_ms += (double)(gt1.tv_sec - gt0.tv_sec) * 1e3 +
                       (double)(gt1.tv_nsec - gt0.tv_nsec) / 1e6;
+            g_gdn_scan_ms = gdn_ms;
             if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
                 fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn_ms);
             if (!getenv("DS4_QWEN35_NO_WHOLE_SCAN")) {
@@ -78487,10 +78614,22 @@ static void qwen35_cpu_forward_batch(
         if (getenv("DS4_QWEN35_BYTE_DBG"))
             fprintf(stderr,
                     "[prefill] n_tok=%u wall=%.0f ms  matvec_calls=%llu matvec=%.0f ms"
-                    "  share=%.0f%%  q4=%.1f GB q6=%.1f GB\n",
+                    "  share=%.0f%%  q4=%.1f GB q6=%.1f GB\n"
+                    "[prefill] split: q4=%.0f ms q6=%.0f ms other=%.0f ms"
+                    "  head=%.0f ms draft=%.0f ms\n",
                     n_tok, wall, (unsigned long long)acc_calls, acc_ms,
                     100.0 * acc_ms / (wall > 0.0 ? wall : 1.0),
-                    (double)acc_q4 / 1e9, (double)acc_q6 / 1e9);
+                    (double)acc_q4 / 1e9, (double)acc_q6 / 1e9,
+                    acc_ms_q4, acc_ms_q6, acc_ms_other,
+                    acc_ms_head, acc_ms_draft);
+        if (getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr,
+                    "[prefill] rms=%.0f add=%.0f silu=%.0f  attn=%.0f"
+                    "  gdn_conv=%.0f gdn_scan=%.0f  unaccounted=%.0f ms\n",
+                    g_ph.rms, g_ph.add, g_ph.silu, attn_ms,
+                    g_gdn_conv_ms, g_gdn_scan_ms,
+                    wall - acc_ms - attn_ms - g_ph.rms - g_ph.add - g_ph.silu
+                    - g_ph.head - acc_ms_draft);
     
             if (getenv("DS4_QWEN35_BYTE_DBG"))
                 fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "

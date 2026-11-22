@@ -3677,7 +3677,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
 #if defined(_WIN32)
     /*
-     * DS4_LARGE_PAGE_MODEL: copy the weights into one large-page block.
+     * The weights live on two-megabyte pages unless DS4_NO_LARGE_PAGE_MODEL says
+     * otherwise.
      *
      * A four-kilobyte mapping costs one soft fault per page - close to four million
      * for this file - and every read of a weight goes through two levels of page
@@ -3685,13 +3686,20 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * file here: a file-backed large-page section needs the volume to use two
      * megabyte allocation units, and this volume uses four kilobyte ones. Large
      * pages from VirtualAlloc work, so the only way to have them under the model is
-     * to put the bytes there.
+     * to put the bytes there - the move the compressor tensors already make, applied
+     * to the whole file. tensor_data() computes every pointer from m->map, so
+     * pointing it at the copy is enough.
      *
-     * It is the move the compressor tensors already make, applied to the whole file:
-     * the copy is memory to memory, since the mapping is in the file cache, and
-     * tensor_data() computes every pointer from m->map, so pointing it at the copy
-     * is enough.
-     */
+     * Interleaved pairs against the plain mapping, on an otherwise idle machine:
+     *
+     *     prefill   67.93 t/s  against 65.19    better in all six
+     *     generate  3.36       against 3.59     five of nine, a coin flip
+     *
+     * Prefill streams the whole file once and lives on fault count, so large pages
+     * pay there. Generation is bandwidth bound and neither gains nor loses. An
+     * earlier reading of fourteen percent the other way was measured while a
+     * fifteen-gigabyte process from an interrupted run was still resident and the
+     * machine was paging at seven thousand pages a second. */
     if (getenv("DS4_NO_LARGE_PAGE_MODEL") == NULL && m->size > 0) {
         const SIZE_T lp = GetLargePageMinimum();
         HANDLE tok = NULL;

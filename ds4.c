@@ -77691,6 +77691,17 @@ static void qwen35_cpu_matvec_batch(
             return;
         }
     }
+    /* Two gates, and both are needed before this runs at all - which is how a test
+     * that sets only the first one comes back with a perfect no-op and looks like a
+     * neutral result. With both set it does run, and it emits garbage:
+     *
+     *     default                       The capital of France is **Paris**.
+     *     X16 + DS4_REPACK_WRITABLE_MAP Pebaktionenpreuvebsiteanspruch...
+     *
+     * The writable map on its own is correct but two percent slower, because the
+     * in-place repack lives in the file mapping's four-kilobyte pages while the
+     * standalone buffer asks for two-megabyte ones. So neither belongs in a default:
+     * fix the kernel before trusting anything measured through it. */
     if (w->type == DS4_TENSOR_Q4_K && !exact &&
         getenv("DS4_QWEN35_X16") != NULL &&
         getenv("DS4_REPACK_WRITABLE_MAP") != NULL &&

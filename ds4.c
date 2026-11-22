@@ -77660,11 +77660,17 @@ static void qwen35_cpu_matvec_batch(
      * a genuine fifty percent more bytes, which measures as a wash rather than a
      * loss. Measured with all three fixed, it is not a wash either: the wide path
      * runs at 38.5 tokens a second against the packed path's 45.5, because the
-     * fifty percent more bytes outweigh whatever the wider instruction buys. So
-     * this is now opt-in through DS4_QWEN35_Q6W rather than opt-out, and the
-     * packed 2x4 path is what runs. */
+     * fifty percent more bytes outweigh whatever the wider instruction buys.
+     *
+     * That last conclusion was drawn with the repacked buffer on ordinary pages. It
+     * is now on the same two-megabyte pages as the four-bit repack, and the same
+     * measurement turns around: seventy-two point four tokens a second against
+     * sixty-eight point five over five interleaved pairs, so the wider instruction
+     * does come out ahead once the translation lookaside stops being the limit. The
+     * repack costs one to two and a half seconds, once per process, so this is on by
+     * default and DS4_NO_QWEN35_Q6W turns it off. */
     if (w->type == DS4_TENSOR_Q6_K && !exact &&
-        getenv("DS4_QWEN35_Q6W") != NULL) {
+        getenv("DS4_NO_QWEN35_Q6W") == NULL) {
         if (getenv("DS4_QWEN35_Q6DBG")) {
             static int shown = 0;
             if (!shown) { shown = 1;
@@ -86805,7 +86811,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * Parallelising both levels nests two barriers and measures slower than either
      * level alone - the four-bit builder avoids the same trap by being serial inside
      * and letting this pass spread the tensors. */
-    if (getenv("DS4_QWEN35_Q6W") != NULL) {
+    if (getenv("DS4_NO_QWEN35_Q6W") == NULL) {
         for (uint64_t ti = 0; ti < e->model.n_tensors; ti++)
             qwen35_q6k_eager_worker(&ev, ti, ti + 1u);
     }

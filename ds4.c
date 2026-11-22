@@ -101026,13 +101026,26 @@ int ds4_bench_x8(int tokens) {
     for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
     for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
-    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
-                      (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    /* Several passes, best reported. One pass is a few milliseconds, and on this
+     * machine that is short enough for the result to move by half between runs of the
+     * same binary. */
+    double best = 1e30;
+    const char *re = getenv("DS4_BENCH_REPS");
+    int reps = re ? atoi(re) : 5;
+    if (reps < 1) reps = 1;
+    if (reps > 50) reps = 50;
+    for (int r = 0; r < reps; r++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < nt; i++)
+            pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
+        for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double one = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                           (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (one < best) best = one;
+    }
+    const double ms = best;
 
     /* The kernel caps its own token group at eight, so asking for more silently
      * processes fewer tokens than the count below would claim. */

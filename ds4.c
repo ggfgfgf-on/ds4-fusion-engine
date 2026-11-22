@@ -100927,7 +100927,7 @@ typedef struct {
     const uint8_t *w;
     const block_q8_K *xq;
     float *out;
-    uint64_t groups, blocks, tokens, tgs, g0, g1;
+    uint64_t groups, blocks, rows, tokens, tgs, g0, g1;
     int nowload;
 } ds4_bench_x8_job;
 
@@ -100945,7 +100945,7 @@ static void *ds4_bench_x8_worker(void *arg) {
                     if (nt > j->tgs) nt = j->tgs;
                     qwen35_gemm_q4_K_16x8(grp + b * Q4K_X16X8_BYTES, 1u,
                                           j->xq + tt * j->blocks + b, j->blocks,
-                                          nt, j->out + tt * 17408u, 17408u,
+                                          nt, j->out + tt * j->rows, j->rows,
                                           g * Q4K_X16_ROWS, b != 0u);
                 }
             }
@@ -100955,15 +100955,23 @@ static void *ds4_bench_x8_worker(void *arg) {
             uint64_t nt = j->tokens - tt;
             if (nt > j->tgs) nt = j->tgs;
             qwen35_gemm_q4_K_16x8(grp, j->blocks, j->xq + tt * j->blocks,
-                                  j->blocks, nt, j->out + tt * 17408u,
-                                  17408u, g * Q4K_X16_ROWS, 0);
+                                  j->blocks, nt, j->out + tt * j->rows,
+                                  j->rows, g * Q4K_X16_ROWS, 0);
         }
     }
     return NULL;
 }
 
 int ds4_bench_x8(int tokens) {
-    const uint64_t rows = 17408u;      /* one FFN matrix of this model */
+    /* Enough weight bytes that a pass cannot be served from the last-level cache:
+     * fifty-two megabytes is less than twice this machine's thirty-two, so a pass
+     * leaves most of it resident and the next pass is not cold at all. Half a
+     * gigabyte is sixteen times it, and DS4_BENCH_MB moves it. */
+    const char *mbe = getenv("DS4_BENCH_MB");
+    uint64_t rows = mbe ? (uint64_t)atoi(mbe) * 1048576u /
+                              (20u * Q4K_X16X8_BYTES) * Q4K_X16_ROWS : 174080u;
+    if (rows < Q4K_X16_ROWS) rows = Q4K_X16_ROWS;
+    rows = (rows / Q4K_X16_ROWS) * Q4K_X16_ROWS;
     const uint64_t blocks = 20u;       /* 5120 / 256 */
     const uint64_t groups = rows / Q4K_X16_ROWS;
     if (tokens < 1) tokens = 117;
@@ -100973,6 +100981,9 @@ int ds4_bench_x8(int tokens) {
     uint8_t *w = (uint8_t *)malloc((size_t)wbytes);
     block_q8_K *xq = (block_q8_K *)malloc((size_t)tokens * blocks * sizeof(block_q8_K));
     float *out = (float *)malloc((size_t)tokens * rows * sizeof(float));
+    fprintf(stderr, "bench buffers: weights %.2f GiB, out %.0f MiB\n",
+            (double)(groups * blocks * Q4K_X16X8_BYTES) / 1073741824.0,
+            (double)((uint64_t)tokens * rows * sizeof(float)) / 1048576.0);
     if (!w || !xq || !out) { free(w); free(xq); free(out); return 1; }
 
     for (uint64_t g = 0; g < groups; g++) {
@@ -101016,6 +101027,7 @@ int ds4_bench_x8(int tokens) {
         jobs[i].out = out;
         jobs[i].groups = groups;
         jobs[i].blocks = blocks;
+        jobs[i].rows = rows;
         jobs[i].tokens = (uint64_t)tokens;
         jobs[i].tgs = tgs;
         jobs[i].g0 = groups * (uint64_t)i / (uint64_t)nt;
@@ -101025,6 +101037,14 @@ int ds4_bench_x8(int tokens) {
 
     for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
     for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+
+    /* Fault every page in before timing.
+     *
+     * A fresh half-gigabyte allocation is a hundred and thirty thousand first
+     * touches, and those cost more than the pass they are inside. One memset leaves
+     * the pages resident; the buffer is sixteen times the last-level cache, so what
+     * the timed pass reads is still coming from memory. */
+    memset(w, 0, (size_t)wbytes);
 
     /* Several passes, best reported. One pass is a few milliseconds, and on this
      * machine that is short enough for the result to move by half between runs of the

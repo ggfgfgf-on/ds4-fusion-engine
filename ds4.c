@@ -74430,6 +74430,22 @@ typedef struct {
 /* Building one tensor touches every page of its buffer for the first time, so
  * this is mostly page faults and runs about linearly with the tensor size -
  * worth spreading over the threads, 5.2 s serially. */
+/* The six-bit repack is lazy, so its cost lands inside whichever batch first asks
+ * for it - which is the first prefill. Two and a third seconds there look exactly
+ * like the wide kernel being slow. Build it up front when that kernel is enabled. */
+static uint8_t *qwen35_q6k_get(const uint8_t *d);
+static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w);
+
+static void qwen35_q6k_eager_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    qwen35_x8_eager_t *e = vctx;
+    for (uint64_t ti = t0; ti < t1; ti++) {
+        const ds4_tensor *tt = &e->m->tensors[ti];
+        if (tt->type != DS4_TENSOR_Q6_K) continue;
+        const uint8_t *td = (const uint8_t *)tensor_data(e->m, tt);
+        if (td && !qwen35_q6k_get(td)) (void)qwen35_q6k_build(e->m, tt);
+    }
+}
+
 static void qwen35_x8_eager_worker(void *vctx, uint64_t t0, uint64_t t1) {
     qwen35_x8_eager_t *e = vctx;
     long n = 0;
@@ -86769,6 +86785,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             struct timespec xt0, xt1;
             clock_gettime(CLOCK_MONOTONIC, &xt0);
             qwen35_x8_eager_t ev = { &e->model, 0, 0 };
+    if (getenv("DS4_QWEN35_Q6W") != NULL)
+        ds4_parallel_for(e->model.n_tensors, qwen35_q6k_eager_worker, &ev);
             ds4_parallel_for(e->model.n_tensors, qwen35_x8_eager_worker, &ev);
             clock_gettime(CLOCK_MONOTONIC, &xt1);
             if (getenv("DS4_QWEN35_BYTE_DBG"))

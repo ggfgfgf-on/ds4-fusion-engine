@@ -100965,6 +100965,8 @@ typedef struct {
     const block_q8_K *xq;
     float *out;
     uint64_t groups, blocks, rows, tokens, tgs, g0, g1, step;
+    int32_t *xt;
+    int trans;
     int nowload;
 } ds4_bench_x8_job;
 
@@ -101001,6 +101003,16 @@ static void *ds4_bench_x8_worker(void *arg) {
                                           g * Q4K_X16_ROWS, b != 0u);
                 }
             }
+            continue;
+        }
+        if (j->trans && j->tokens == 8u && j->tgs == 8u) {
+            /* The transposed form puts the tokens in the lanes and broadcasts the
+             * weights, which is two instructions per dpbusd instead of three. It
+             * needs the activations rearranged, and the engine only builds that
+             * arrangement for a batch of exactly eight. */
+            qwen35_xq8_transpose(j->xq, j->blocks, j->blocks, j->xt);
+            qwen35_gemm_q4_K_16x8_t(grp, j->blocks, j->xq, j->xt, j->blocks,
+                                    j->out, j->rows, g * Q4K_X16_ROWS);
             continue;
         }
         for (uint64_t tt = 0; tt < j->tokens; tt += j->tgs) {
@@ -101104,6 +101116,10 @@ int ds4_bench_x8(int tokens) {
     pthread_t th[64];
     memset(jobs, 0, sizeof jobs);
     const int strided = getenv("DS4_BENCH_STRIDED") != NULL;
+    const int trans = getenv("DS4_BENCH_TRANS") != NULL;
+    int32_t *xtbuf = NULL;
+    if (trans && tokens == 8)
+        xtbuf = (int32_t *)malloc((size_t)blocks * 4u * 8u * 16u * sizeof(int32_t));
     for (int i = 0; i < nt; i++) {
         jobs[i].w = w;
         jobs[i].xq = xq;
@@ -101111,6 +101127,8 @@ int ds4_bench_x8(int tokens) {
         jobs[i].groups = groups;
         jobs[i].blocks = blocks;
         jobs[i].rows = rows;
+        jobs[i].xt = xtbuf;
+        jobs[i].trans = trans;
         jobs[i].tokens = (uint64_t)tokens;
         jobs[i].tgs = tgs;
         if (strided) {
@@ -101189,6 +101207,7 @@ int ds4_bench_x8(int tokens) {
            gb, ms, gb * 1e3 / ms, macs / (ms * 1e9),
            100.0 * (macs / (ms * 1e9)) / 17.6);
 
+    free(xtbuf);
     if (w_virtual) VirtualFree(w, 0, MEM_RELEASE); else free(w);
     free(xq); free(out);
     return 0;

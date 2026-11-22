@@ -3692,7 +3692,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      *
      * Interleaved pairs against the plain mapping, on an otherwise idle machine:
      *
-     *     prefill   67.93 t/s  against 65.19    better in all six
+     *     prefill   70.29 t/s  median of eight, best 71.25
+     *     plain     65.19 t/s  median of six, better in all six pairs
      *     generate  3.36       against 3.59     five of nine, a coin flip
      *
      * Prefill streams the whole file once and lives on fault count, so large pages

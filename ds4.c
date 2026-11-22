@@ -74731,7 +74731,23 @@ static uint8_t *qwen35_q6k_build(const ds4_model *m, const ds4_tensor *w) {
     const uint8_t *src = (const uint8_t *)tensor_data(m, w);
     if (!src) return NULL;
     const uint64_t ng = rows / 16u;
-    uint8_t *buf = xmalloc((size_t)(ng * blocks * Q6K_X16_BYTES));
+    const size_t need6 = (size_t)(ng * blocks * Q6K_X16_BYTES);
+    uint8_t *buf = NULL;
+    if (getenv("DS4_QWEN35_NO_HUGE") == NULL) {
+        extern void ds4_win_enable_lock_memory(void);
+        ds4_win_enable_lock_memory();
+        const size_t hs = (size_t)2u << 20;
+        const size_t want = (need6 + hs - 1u) & ~(hs - 1u);
+        buf = (uint8_t *)VirtualAlloc(NULL, want,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                      PAGE_READWRITE);
+        if (buf && getenv("DS4_QWEN35_BYTE_DBG"))
+            fprintf(stderr, "[q6] large pages, %.1f MB\n", (double)need6 / 1048576.0);
+    }
+    if (!buf) {
+        uint8_t *raw = xmalloc(need6 + 64u);
+        buf = (uint8_t *)(((uintptr_t)raw + 63u) & ~(uintptr_t)63u);
+    }
     qwen35_q6build_ctx bc = { src, buf, blocks, row_bytes };
     ds4_parallel_for(ng, qwen35_q6build_worker, &bc);
     qwen35_q6k_put(src, buf);
@@ -86785,8 +86801,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             struct timespec xt0, xt1;
             clock_gettime(CLOCK_MONOTONIC, &xt0);
             qwen35_x8_eager_t ev = { &e->model, 0, 0 };
-    if (getenv("DS4_QWEN35_Q6W") != NULL)
-        ds4_parallel_for(e->model.n_tensors, qwen35_q6k_eager_worker, &ev);
+    /* Serial over tensors, because the build parallelises over row groups itself.
+     * Parallelising both levels nests two barriers and measures slower than either
+     * level alone - the four-bit builder avoids the same trap by being serial inside
+     * and letting this pass spread the tensors. */
+    if (getenv("DS4_QWEN35_Q6W") != NULL) {
+        for (uint64_t ti = 0; ti < e->model.n_tensors; ti++)
+            qwen35_q6k_eager_worker(&ev, ti, ti + 1u);
+    }
             ds4_parallel_for(e->model.n_tensors, qwen35_x8_eager_worker, &ev);
             clock_gettime(CLOCK_MONOTONIC, &xt1);
             if (getenv("DS4_QWEN35_BYTE_DBG"))

@@ -77688,6 +77688,19 @@ static void qwen35_cpu_matvec_batch(
             w6.n_tok = n_tok;
             ds4_parallel_for(rows / 16u, qwen35_q6_worker, &w6);
             free(xq);
+            /* Feed the same counters the other two paths feed, or a breakdown taken
+             * with this path on shows the six-bit matvec time as "other" and reads
+             * as though fifty-five percent of a prefill were unaccounted for. */
+            {
+                struct timespec q1;
+                clock_gettime(CLOCK_MONOTONIC, &q1);
+                const double this_ms = (double)(q1.tv_sec - mv0.tv_sec) * 1e3 +
+                                       (double)(q1.tv_nsec - mv0.tv_nsec) / 1e6;
+                acc_ms += this_ms;
+                acc_ms_q6 += this_ms;
+                acc_q6 += w->bytes;
+                acc_calls++;
+            }
             return;
         }
     }

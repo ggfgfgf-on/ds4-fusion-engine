@@ -74556,7 +74556,7 @@ static void qwen35_q6k_wide_block(const block_q6_K *const *rows, uint8_t *dst) {
 static void qwen35_gemm_q6_K_16x8(
         const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
         uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
-        uint64_t row0) {
+        uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const uint64_t lim = nt < 8u ? nt : 8u;
     __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
@@ -74655,7 +74655,9 @@ static void qwen35_gemm_q6_K_16x8(
         float clane[Q6K_X16_ROWS];
         _mm512_storeu_ps(clane, cv);
         for (uint32_t r = 0; r < Q6K_X16_ROWS; r++)
-            out[t * out_stride + row0 + r] = lane[r] - 32.0f * clane[r];
+            out[t * out_stride + row0 + r] =
+                    (add ? out[t * out_stride + row0 + r] : 0.0f) +
+                    lane[r] - 32.0f * clane[r];
     }
 #else
     (void)grp; (void)blocks; (void)y; (void)ystride; (void)nt;
@@ -74767,14 +74769,40 @@ static void qwen35_q6_worker(void *vctx, uint64_t g0, uint64_t g1) {
      * With them outside, the dispatcher ran a separate parallel region per
      * group, so every group re-walked the whole weight tensor - fifteen passes
      * over 4.4 GB where one is needed. */
+    /* Only worth it when there is more than one token group. With one - which is
+     * every generation round, the batch being two to five tokens - both orders read
+     * each block once, and this one additionally reads and writes the output row
+     * twenty times. */
+    const int blkout = c->n_tok > 8u;
     for (uint64_t g = g0; g < g1; g++) {
         const uint8_t *grp = c->data + g * c->blocks * Q6K_X16_BYTES;
+        if (blkout) {
+            /* One pass over the weights, the sum accumulated in the output.
+             *
+             * The token groups used to sit inside this loop, so a batch of n_tok
+             * walked the whole tensor ceil(n_tok / 8) times - fifteen passes over
+             * five and a half gigabytes for a prefill of a hundred and nineteen
+             * tokens. Here each block is read once and every token group adds to
+             * the same output row. */
+            for (uint64_t b = 0; b < c->blocks; b++) {
+                for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
+                    uint64_t nb = c->n_tok - tt;
+                    if (nb > 8u) nb = 8u;
+                    qwen35_gemm_q6_K_16x8(
+                            grp + b * Q6K_X16_BYTES, 1u,
+                            c->xq + tt * c->blocks + b, c->blocks, nb,
+                            c->out + tt * c->out_dim, c->out_dim, g * 16u,
+                            b != 0u);
+                }
+            }
+            continue;
+        }
         for (uint64_t tt = 0; tt < c->n_tok; tt += 8u) {
             uint64_t nt8 = c->n_tok - tt;
             if (nt8 > 8u) nt8 = 8u;
             qwen35_gemm_q6_K_16x8(grp, c->blocks, c->xq + tt * c->blocks,
                                   c->blocks, nt8, c->out + tt * c->out_dim,
-                                  c->out_dim, g * 16u);
+                                  c->out_dim, g * 16u, 0);
         }
     }
 }

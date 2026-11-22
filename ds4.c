@@ -74860,8 +74860,7 @@ static void qwen35_gemm_q4_K_16x8_t(
          * L1, so the earlier attempt to prefetch a whole group evicted what it
          * had just fetched; a bounded distance in blocks cannot. DS4_QWEN35_PFD
          * sets the distance, in blocks; unset or 0 disables. */
-        static int nobcast = -1;
-    if (nobcast < 0) nobcast = getenv("DS4_QWEN35_NOBCAST") != NULL;
+    
     static int pfnext = -1;
     if (pfnext < 0) {
         const char *e = getenv("DS4_QWEN35_PFNEXT");
@@ -75069,12 +75068,10 @@ static void qwen35_gemm_q4_K_16x8(
 #define Q4K8N(k) do {                                                      \
                         const block_q8_K *_y =                             \
                                 y + (uint64_t)(k) * ystride + b;           \
-                        const int32_t _al = nobcast                        \
-                                ? 0x01010101                               \
-                                : *(const int32_t *)(_y->qs + jlo * 32 + c * 4); \
-                        const int32_t _ah = nobcast                        \
-                                ? 0x02020202                               \
-                                : *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4); \
+                        const int32_t _al =                          \
+                                *(const int32_t *)(_y->qs + jlo * 32 + c * 4); \
+                        const int32_t _ah =                          \
+                                *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4); \
                         lo##k = _mm512_dpbusd_epi32(lo##k, ql,             \
                                 _mm512_set1_epi32(_al));                   \
                         hi##k = _mm512_dpbusd_epi32(hi##k, qh,             \

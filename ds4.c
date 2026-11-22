@@ -3366,21 +3366,38 @@ static void model_close(ds4_model *m) {
     m->ngram_fd = -1;
 }
 
-/* DS4_LARGE_PAGE_MODEL copy worker: one slice of the mapping into large pages. */
-typedef struct lp_copy_job {
+/* DS4 large-page copy: one worker's share of the mapping.
+ *
+ * Each window is mapped, copied, and unmapped before the next, so the file's pages
+ * leave the machine as the copy takes their place instead of both being resident.
+ * Windows cannot unmap part of a view, so the windows are separate views. */
+typedef struct {
+    int fd;
     uint8_t *dst;
-    const uint8_t *src;
-    uint64_t bytes;
-    int thread;
+    uint64_t total;
+    uint64_t window;
+    uint64_t window_count;
+    volatile uint64_t *next;
 } lp_copy_job;
 
 static void *lp_copy_worker(void *arg) {
     lp_copy_job *j = (lp_copy_job *)arg;
-    if (j->bytes) memcpy(j->dst, j->src, (size_t)j->bytes);
+    for (;;) {
+        const uint64_t w = __atomic_fetch_add(j->next, 1u, __ATOMIC_RELAXED);
+        if (w >= j->window_count) break;
+        const uint64_t off = w * j->window;
+        uint64_t n = j->total - off;
+        if (n > j->window) n = j->window;
+        void *src = mmap(NULL, (size_t)n, PROT_READ, MAP_PRIVATE, j->fd, (off_t)off);
+        if (src == MAP_FAILED) continue;
+        memcpy(j->dst + off, src, (size_t)n);
+        munmap(src, (size_t)n);
+    }
     return NULL;
 }
 
-static void model_prefetch_cpu_mapping(const ds4_model *m) {    if (!m || !m->map || m->size == 0) return;
+static void model_prefetch_cpu_mapping(const ds4_model *m) {
+    if (!m || !m->map || m->size == 0) return;
 
     /*
      * CPU generation touches expert weights according to router decisions, so a
@@ -3675,7 +3692,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * tensor_data() computes every pointer from m->map, so pointing it at the copy
      * is enough.
      */
-    if (getenv("DS4_LARGE_PAGE_MODEL") != NULL && m->size > 0) {
+    if (getenv("DS4_NO_LARGE_PAGE_MODEL") == NULL && m->size > 0) {
         const SIZE_T lp = GetLargePageMinimum();
         HANDLE tok = NULL;
         if (lp && OpenProcessToken(GetCurrentProcess(),
@@ -3693,47 +3710,40 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         const uint64_t rounded = (m->size + (uint64_t)lp - 1u) &
                                  ~((uint64_t)lp - 1u);
         struct timespec t0, t1;
-        lp_copy_job jobs[16];
+        lp_copy_job jobs[8];
         clock_gettime(CLOCK_MONOTONIC, &t0);
         void *big = lp ? VirtualAlloc(NULL, (SIZE_T)rounded,
                                       MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
                                       PAGE_READWRITE) : NULL;
         if (big) {
-            /* Parallel, because the first touch of a large page is where the
-             * operating system does the zero fill, and one thread spends most of
-             * the copy waiting on that. */
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-            int nt = ncpu > 1 ? (int)ncpu : 1;
-            if (nt > 16) nt = 16;
-            if ((uint64_t)nt > m->size / (1u << 20)) nt = 1;
-            const uint64_t chunk = (m->size + (uint64_t)nt - 1u) / (uint64_t)nt;
-            pthread_t th[16];
+            const uint64_t window = (uint64_t)256u << 20;
+            const uint64_t nwin = (m->size + window - 1u) / window;
+            int nt = 8;
+            if ((uint64_t)nt > nwin) nt = (int)nwin;
+            pthread_t th[8];
             int started = 0;
-            for (int i = 1; i < nt; i++) {
-                struct lp_copy_job *j = &jobs[i - 1];
-                j->dst = (uint8_t *)big + (uint64_t)i * chunk;
-                j->src = m->map + (uint64_t)i * chunk;
-                j->bytes = ((uint64_t)i * chunk < m->size)
-                                   ? ((uint64_t)(i + 1) * chunk <= m->size
-                                              ? chunk
-                                              : m->size - (uint64_t)i * chunk)
-                                   : 0;
-                j->thread = i;
-                if (j->bytes &&
-                    pthread_create(&th[started], NULL, lp_copy_worker, j) == 0)
+            volatile uint64_t next = 0;
+            for (int i = 0; i < nt; i++) {
+                lp_copy_job *j = &jobs[i];
+                j->fd = m->fd;
+                j->dst = (uint8_t *)big;
+                j->total = m->size;
+                j->window = window;
+                j->window_count = nwin;
+                j->next = &next;
+                if (pthread_create(&th[started], NULL, lp_copy_worker, j) == 0)
                     started++;
             }
-            const uint64_t head = chunk < m->size ? chunk : m->size;
-            memcpy(big, m->map, (size_t)head);
             for (int i = 0; i < started; i++) pthread_join(th[i], NULL);
             m->lp_base = big;
             m->map = (const uint8_t *)big;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             fprintf(stderr, "ds4: model in %.0f KiB pages: %.2f GiB copied in %.0f ms"
-                    " (%d threads)\n",
+                    " (%d threads, %llu MiB windows)\n",
                     (double)lp / 1024.0, (double)m->size / 1073741824.0,
                     (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
-                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6, started + 1);
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6, started,
+                    (unsigned long long)(window >> 20));
         } else {
             fprintf(stderr, "ds4: large-page model copy unavailable (err=%lu)\n",
                     (unsigned long)GetLastError());

@@ -74800,7 +74800,16 @@ static void qwen35_gemm_q4_K_16x8_t(
          * L1, so the earlier attempt to prefetch a whole group evicted what it
          * had just fetched; a bounded distance in blocks cannot. DS4_QWEN35_PFD
          * sets the distance, in blocks; unset or 0 disables. */
-        static int pfd = -1;
+        static int nobcast = -1;
+    if (nobcast < 0) nobcast = getenv("DS4_QWEN35_NOBCAST") != NULL;
+    static int pfnext = -1;
+    if (pfnext < 0) {
+        const char *e = getenv("DS4_QWEN35_PFNEXT");
+        pfnext = e ? atoi(e) : 0;
+        if (pfnext < 0) pfnext = 0;
+        if (pfnext > 8) pfnext = 8;
+    }
+    static int pfd = -1;
         if (pfd < 0) {
             const char *e = getenv("DS4_QWEN35_PFD");
             pfd = (e && e[0] >= '0' && e[0] <= '9') ? (e[0] - '0') * 8 : 0;
@@ -74926,6 +74935,15 @@ static void qwen35_gemm_q4_K_16x8(
         uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
+    static int nobcast = -1;
+    if (nobcast < 0) nobcast = getenv("DS4_QWEN35_NOBCAST") != NULL;
+    static int pfnext = -1;
+    if (pfnext < 0) {
+        const char *e = getenv("DS4_QWEN35_PFNEXT");
+        pfnext = e ? atoi(e) : 0;
+        if (pfnext < 0) pfnext = 0;
+        if (pfnext > 8) pfnext = 8;
+    }
     const uint64_t lim = nt < 8u ? nt : 8u;
     if (g_nibs1 < 0) {
         /* One pass is the default. The two-pass split was added here on the
@@ -74952,6 +74970,21 @@ static void qwen35_gemm_q4_K_16x8(
         for (uint64_t b = 0; b < blocks; b++) {
             const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
                     (grp + b * Q4K_X16X8_BYTES);
+            /* Ask for the whole next block up front.
+             *
+             * Cold, a block's thirty-eight lines arrive one round trip after another
+             * - three and a half microseconds against the two thousand cycles the
+             * arithmetic needs - because a prefetch placed next to the load it serves
+             * is issued only after the previous load has completed. Issuing all
+             * thirty-eight at the top of this block gives them a block's worth of
+             * lead. */
+            if (pfnext > 0) {
+                const uint8_t *nx = grp + (b + (uint64_t)pfnext) * Q4K_X16X8_BYTES;
+                if (b + (uint64_t)pfnext < blocks) {
+                    for (uint64_t ln = 0; ln < Q4K_X16X8_BYTES; ln += 64u)
+                        _mm_prefetch((const char *)nx + ln, _MM_HINT_T0);
+                }
+            }
             const __m512 dv = _mm512_loadu_ps(xp->d);
             for (int jp = 0; jp < 4; jp++) {
                 const int jlo = 2 * jp;
@@ -74976,12 +75009,16 @@ static void qwen35_gemm_q4_K_16x8(
 #define Q4K8N(k) do {                                                      \
                         const block_q8_K *_y =                             \
                                 y + (uint64_t)(k) * ystride + b;           \
+                        const int32_t _al = nobcast                        \
+                                ? 0x01010101                               \
+                                : *(const int32_t *)(_y->qs + jlo * 32 + c * 4); \
+                        const int32_t _ah = nobcast                        \
+                                ? 0x02020202                               \
+                                : *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4); \
                         lo##k = _mm512_dpbusd_epi32(lo##k, ql,             \
-                                _mm512_set1_epi32(                         \
-                                    *(const int32_t *)(_y->qs + jlo * 32 + c * 4))); \
+                                _mm512_set1_epi32(_al));                   \
                         hi##k = _mm512_dpbusd_epi32(hi##k, qh,             \
-                                _mm512_set1_epi32(                         \
-                                    *(const int32_t *)(_y->qs + (jlo + 1) * 32 + c * 4))); \
+                                _mm512_set1_epi32(_ah));                   \
                     } while (0)
                         Q4K8N(0); Q4K8N(1); Q4K8N(2); Q4K8N(3);
                         Q4K8N(4); Q4K8N(5); Q4K8N(6); Q4K8N(7);
@@ -100927,13 +100964,28 @@ typedef struct {
     const uint8_t *w;
     const block_q8_K *xq;
     float *out;
-    uint64_t groups, blocks, rows, tokens, tgs, g0, g1;
+    uint64_t groups, blocks, rows, tokens, tgs, g0, g1, step;
     int nowload;
 } ds4_bench_x8_job;
 
+/* Read the same buffer with nothing but adds, as a control: if this also lands near
+ * twelve gigabytes a second then the number says nothing about the kernel. */
+static void *ds4_bench_sum_worker(void *arg) {
+    ds4_bench_x8_job *j = (ds4_bench_x8_job *)arg;
+    const size_t stride = (size_t)j->blocks * Q4K_X16X8_BYTES;
+    __m512 acc = _mm512_setzero_ps();
+    for (uint64_t g = j->g0; g < j->g1; g += j->step) {
+        const uint8_t *row = j->w + g * stride;
+        for (size_t o = 0; o + 64u <= stride; o += 64u)
+            acc = _mm512_add_ps(acc, _mm512_loadu_ps((const void *)(row + o)));
+    }
+    j->out[0] += _mm512_reduce_add_ps(acc);
+    return NULL;
+}
+
 static void *ds4_bench_x8_worker(void *arg) {
     ds4_bench_x8_job *j = (ds4_bench_x8_job *)arg;
-    for (uint64_t g = j->g0; g < j->g1; g++) {
+    for (uint64_t g = j->g0; g < j->g1; g += j->step) {
         const uint8_t *row = j->w + g * j->blocks * Q4K_X16X8_BYTES;
         const uint8_t *grp = j->nowload ? j->w : row;
         if (getenv("DS4_BENCH_BLOCKOUTER") != NULL) {
@@ -100978,7 +101030,37 @@ int ds4_bench_x8(int tokens) {
     if (tokens > 4096) tokens = 4096;
 
     const uint64_t wbytes = groups * blocks * Q4K_X16X8_BYTES;
-    uint8_t *w = (uint8_t *)malloc((size_t)wbytes);
+    /* Large pages, because that is how the engine holds its weights: the model
+     * loader copies them into one, so a benchmark on ordinary four-kilobyte pages
+     * would measure a page table the engine never uses. */
+    uint8_t *w = NULL;
+#if defined(_WIN32)
+    {
+        const SIZE_T lp = GetLargePageMinimum();
+        if (lp && getenv("DS4_BENCH_4K") == NULL) {
+            HANDLE tok = NULL;
+            if (OpenProcessToken(GetCurrentProcess(),
+                                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+                TOKEN_PRIVILEGES tp;
+                LUID luid;
+                if (LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+                    tp.PrivilegeCount = 1;
+                    tp.Privileges[0].Luid = luid;
+                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                    (void)AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
+                }
+                CloseHandle(tok);
+            }
+            const SIZE_T rounded = (SIZE_T)((wbytes + lp - 1u) & ~(uint64_t)(lp - 1u));
+            w = (uint8_t *)VirtualAlloc(NULL, rounded,
+                                        MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                        PAGE_READWRITE);
+            if (w) fprintf(stderr, "bench weights on %.0f KiB pages\n", (double)lp / 1024.0);
+        }
+    }
+#endif
+    const int w_virtual = (w != NULL);
+    if (!w) w = (uint8_t *)malloc((size_t)wbytes);
     block_q8_K *xq = (block_q8_K *)malloc((size_t)tokens * blocks * sizeof(block_q8_K));
     float *out = (float *)malloc((size_t)tokens * rows * sizeof(float));
     fprintf(stderr, "bench buffers: weights %.2f GiB, out %.0f MiB\n",
@@ -101021,6 +101103,7 @@ int ds4_bench_x8(int tokens) {
     static ds4_bench_x8_job jobs[64];
     pthread_t th[64];
     memset(jobs, 0, sizeof jobs);
+    const int strided = getenv("DS4_BENCH_STRIDED") != NULL;
     for (int i = 0; i < nt; i++) {
         jobs[i].w = w;
         jobs[i].xq = xq;
@@ -101030,8 +101113,18 @@ int ds4_bench_x8(int tokens) {
         jobs[i].rows = rows;
         jobs[i].tokens = (uint64_t)tokens;
         jobs[i].tgs = tgs;
-        jobs[i].g0 = groups * (uint64_t)i / (uint64_t)nt;
-        jobs[i].g1 = groups * (uint64_t)(i + 1) / (uint64_t)nt;
+        if (strided) {
+            /* Strided: the threads walk the buffer together instead of each taking
+             * a slab. Twenty-eight slabs are twenty-eight concurrent streams, and
+             * that thrashes the memory's own row buffers however wide the bus is. */
+            jobs[i].g0 = (uint64_t)i;
+            jobs[i].g1 = groups;
+            jobs[i].step = (uint64_t)nt;
+        } else {
+            jobs[i].g0 = groups * (uint64_t)i / (uint64_t)nt;
+            jobs[i].g1 = groups * (uint64_t)(i + 1) / (uint64_t)nt;
+            jobs[i].step = 1u;
+        }
         jobs[i].nowload = getenv("DS4_BENCH_NOWLOAD") != NULL;
     }
 
@@ -101057,8 +101150,11 @@ int ds4_bench_x8(int tokens) {
     for (int r = 0; r < reps; r++) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        const int sum_only = getenv("DS4_BENCH_SUM") != NULL;
         for (int i = 0; i < nt; i++)
-            pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
+            pthread_create(&th[i], NULL,
+                           sum_only ? ds4_bench_sum_worker : ds4_bench_x8_worker,
+                           &jobs[i]);
         for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         const double one = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
@@ -101077,7 +101173,15 @@ int ds4_bench_x8(int tokens) {
         eff += nt;
     }
     const double macs = (double)rows * (double)blocks * (double)QK_K * (double)eff;
-    const double gb = (double)wbytes / 1073741824.0;
+    /* Every token group re-walks the row group's weights, so the bytes moved are the
+     * buffer times the number of groups - reporting the buffer alone made the kernel
+     * look thirty times slower than a plain streaming read. */
+    uint64_t tgroups = 0;
+    for (uint64_t tt = 0; tt < (uint64_t)tokens; tt += tgs) tgroups++;
+    /* The sum control reads the buffer once, so it must not be multiplied by the
+     * group count - otherwise the two are reported in different units. */
+    const uint64_t passes = getenv("DS4_BENCH_SUM") ? 1u : tgroups;
+    const double gb = (double)wbytes * (double)passes / 1073741824.0;
     printf("bench-x8 tokens=%d threads=%d tgs=%llu nowload=%d\n",
            tokens, nt, (unsigned long long)tgs,
            getenv("DS4_BENCH_NOWLOAD") != NULL ? 1 : 0);
@@ -101085,7 +101189,8 @@ int ds4_bench_x8(int tokens) {
            gb, ms, gb * 1e3 / ms, macs / (ms * 1e9),
            100.0 * (macs / (ms * 1e9)) / 17.6);
 
-    free(w); free(xq); free(out);
+    if (w_virtual) VirtualFree(w, 0, MEM_RELEASE); else free(w);
+    free(xq); free(out);
     return 0;
 }
 

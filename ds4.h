@@ -677,4 +677,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 /* ReMoE router trainer CLI (Part 1): trains the learned-router layers and
  * writes a router-delta sidecar for DS4_ROUTER_DELTA. */
+/* Synthetic microbenchmark of the sixteen-row Q4_K kernel on fabricated data; it
+ * needs no model, so it can vary the kernel's own structure safely. */
+int ds4_bench_x8(int tokens);
+
 int ds4_router_train_main(int argc, char **argv);

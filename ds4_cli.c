@@ -2261,6 +2261,10 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    /* Dispatched before option parsing: this benchmark needs neither a model nor an
+     * engine, only the kernel. */
+    if (argc >= 3 && strcmp(argv[1], "--bench-x8") == 0)
+        return ds4_bench_x8(atoi(argv[2]));
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prefix.count != 0) {

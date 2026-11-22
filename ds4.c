@@ -100909,3 +100909,150 @@ bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt
     return ok;
 }
 #endif
+
+/* Microbenchmark of the sixteen-row Q4_K kernel, on synthetic data.
+ *
+ * No model and no engine state: a repacked buffer and a set of activations are
+ * fabricated and the kernel is driven over them exactly as the batch path drives it.
+ * That makes structural experiments safe - pinning the weight address so every read
+ * hits L1, removing the loads, changing the token group - because a wrong answer here
+ * changes nothing downstream. The end-to-end attempt at the first of those produced
+ * nonsense tokens, sent the engine down unintended paths, and left a run spinning for
+ * three CPU-hours.
+ *
+ *   ds4 --bench-x8 [tokens]
+ *   DS4_BENCH_THREADS, DS4_BENCH_TGS, DS4_BENCH_NOWLOAD
+ */
+typedef struct {
+    const uint8_t *w;
+    const block_q8_K *xq;
+    float *out;
+    uint64_t groups, blocks, tokens, tgs, g0, g1;
+    int nowload;
+} ds4_bench_x8_job;
+
+static void *ds4_bench_x8_worker(void *arg) {
+    ds4_bench_x8_job *j = (ds4_bench_x8_job *)arg;
+    for (uint64_t g = j->g0; g < j->g1; g++) {
+        const uint8_t *row = j->w + g * j->blocks * Q4K_X16X8_BYTES;
+        const uint8_t *grp = j->nowload ? j->w : row;
+        if (getenv("DS4_BENCH_BLOCKOUTER") != NULL) {
+            /* Block outer, tokens inner: the weight block is read once and all the
+             * tokens run against it, with the running sum living in out. */
+            for (uint64_t b = 0; b < j->blocks; b++) {
+                for (uint64_t tt = 0; tt < j->tokens; tt += j->tgs) {
+                    uint64_t nt = j->tokens - tt;
+                    if (nt > j->tgs) nt = j->tgs;
+                    qwen35_gemm_q4_K_16x8(grp + b * Q4K_X16X8_BYTES, 1u,
+                                          j->xq + tt * j->blocks + b, j->blocks,
+                                          nt, j->out + tt * 17408u, 17408u,
+                                          g * Q4K_X16_ROWS, b != 0u);
+                }
+            }
+            continue;
+        }
+        for (uint64_t tt = 0; tt < j->tokens; tt += j->tgs) {
+            uint64_t nt = j->tokens - tt;
+            if (nt > j->tgs) nt = j->tgs;
+            qwen35_gemm_q4_K_16x8(grp, j->blocks, j->xq + tt * j->blocks,
+                                  j->blocks, nt, j->out + tt * 17408u,
+                                  17408u, g * Q4K_X16_ROWS, 0);
+        }
+    }
+    return NULL;
+}
+
+int ds4_bench_x8(int tokens) {
+    const uint64_t rows = 17408u;      /* one FFN matrix of this model */
+    const uint64_t blocks = 20u;       /* 5120 / 256 */
+    const uint64_t groups = rows / Q4K_X16_ROWS;
+    if (tokens < 1) tokens = 117;
+    if (tokens > 4096) tokens = 4096;
+
+    const uint64_t wbytes = groups * blocks * Q4K_X16X8_BYTES;
+    uint8_t *w = (uint8_t *)malloc((size_t)wbytes);
+    block_q8_K *xq = (block_q8_K *)malloc((size_t)tokens * blocks * sizeof(block_q8_K));
+    float *out = (float *)malloc((size_t)tokens * rows * sizeof(float));
+    if (!w || !xq || !out) { free(w); free(xq); free(out); return 1; }
+
+    for (uint64_t g = 0; g < groups; g++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            qwen35_blk16x8 *blk =
+                    (qwen35_blk16x8 *)(w + ((g * blocks + b) * Q4K_X16X8_BYTES));
+            for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
+                blk->d[r] = 1.0f;
+                blk->dmin[r] = 0.0f;
+                for (int j = 0; j < 8; j++) { blk->sc[j][r] = 1u; blk->mn[j][r] = 0u; }
+            }
+            for (uint64_t i = 0; i < sizeof blk->qs; i++)
+                blk->qs[i] = (uint8_t)((i * 37u + g * 11u + b) & 0xFFu);
+        }
+    }
+    for (int t = 0; t < tokens; t++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            block_q8_K *y = &xq[(uint64_t)t * blocks + b];
+            y->d = 1.0f;
+            for (int i = 0; i < QK_K; i++) y->qs[i] = (int8_t)(i + t);
+            for (int i = 0; i < QK_K / 16; i++) y->bsums[i] = (int16_t)(i + t);
+        }
+    }
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = ncpu > 1 ? (int)ncpu : 1;
+    const char *te = getenv("DS4_BENCH_THREADS");
+    if (te) nt = atoi(te);
+    if (nt < 1) nt = 1;
+    if (nt > 64) nt = 64;
+    const char *tg = getenv("DS4_BENCH_TGS");
+    uint64_t tgs = tg ? (uint64_t)atoi(tg) : 8u;
+    if (tgs < 1 || tgs > 16) tgs = 8u;
+
+    static ds4_bench_x8_job jobs[64];
+    pthread_t th[64];
+    memset(jobs, 0, sizeof jobs);
+    for (int i = 0; i < nt; i++) {
+        jobs[i].w = w;
+        jobs[i].xq = xq;
+        jobs[i].out = out;
+        jobs[i].groups = groups;
+        jobs[i].blocks = blocks;
+        jobs[i].tokens = (uint64_t)tokens;
+        jobs[i].tgs = tgs;
+        jobs[i].g0 = groups * (uint64_t)i / (uint64_t)nt;
+        jobs[i].g1 = groups * (uint64_t)(i + 1) / (uint64_t)nt;
+        jobs[i].nowload = getenv("DS4_BENCH_NOWLOAD") != NULL;
+    }
+
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, ds4_bench_x8_worker, &jobs[i]);
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                      (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    /* The kernel caps its own token group at eight, so asking for more silently
+     * processes fewer tokens than the count below would claim. */
+    uint64_t eff = 0;
+    for (uint64_t tt = 0; tt < (uint64_t)tokens; tt += tgs) {
+        uint64_t nt = (uint64_t)tokens - tt;
+        if (nt > tgs) nt = tgs;
+        if (nt > 8u) nt = 8u;
+        eff += nt;
+    }
+    const double macs = (double)rows * (double)blocks * (double)QK_K * (double)eff;
+    const double gb = (double)wbytes / 1073741824.0;
+    printf("bench-x8 tokens=%d threads=%d tgs=%llu nowload=%d\n",
+           tokens, nt, (unsigned long long)tgs,
+           getenv("DS4_BENCH_NOWLOAD") != NULL ? 1 : 0);
+    printf("  weights %.2f GiB  %.1f ms  %.1f GB/s  %.2f T MAC/s  %.1f%% of dpbusd peak\n",
+           gb, ms, gb * 1e3 / ms, macs / (ms * 1e9),
+           100.0 * (macs / (ms * 1e9)) / 17.6);
+
+    free(w); free(xq); free(out);
+    return 0;
+}
+

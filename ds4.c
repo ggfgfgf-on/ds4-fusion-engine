@@ -3110,6 +3110,9 @@ typedef struct {
 typedef struct ds4_model {
     int fd;
     const uint8_t *map;
+    /* When the weights were copied into large pages, this is the allocation that
+     * replaces the file view and has to be freed instead of unmapped. */
+    void *lp_base;
     uint64_t size;       /* Addressable weights, excluding disk-only n-grams. */
     uint64_t file_size;
     bool non_routed_weights_locked;
@@ -3352,15 +3355,32 @@ static void model_close(ds4_model *m) {
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->lp_base) {
+        VirtualFree(m->lp_base, 0, MEM_RELEASE);
+        m->lp_base = NULL;
+        m->map = NULL;
+    } else if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
 }
 
-static void model_prefetch_cpu_mapping(const ds4_model *m) {
-    if (!m || !m->map || m->size == 0) return;
+/* DS4_LARGE_PAGE_MODEL copy worker: one slice of the mapping into large pages. */
+typedef struct lp_copy_job {
+    uint8_t *dst;
+    const uint8_t *src;
+    uint64_t bytes;
+    int thread;
+} lp_copy_job;
+
+static void *lp_copy_worker(void *arg) {
+    lp_copy_job *j = (lp_copy_job *)arg;
+    if (j->bytes) memcpy(j->dst, j->src, (size_t)j->bytes);
+    return NULL;
+}
+
+static void model_prefetch_cpu_mapping(const ds4_model *m) {    if (!m || !m->map || m->size == 0) return;
 
     /*
      * CPU generation touches expert weights according to router decisions, so a
@@ -3637,6 +3657,89 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     model_unmap_qwen_ngrams(m, path);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+
+#if defined(_WIN32)
+    /*
+     * DS4_LARGE_PAGE_MODEL: copy the weights into one large-page block.
+     *
+     * A four-kilobyte mapping costs one soft fault per page - close to four million
+     * for this file - and every read of a weight goes through two levels of page
+     * table. Two-megabyte pages remove both, but Windows cannot hand them out over a
+     * file here: a file-backed large-page section needs the volume to use two
+     * megabyte allocation units, and this volume uses four kilobyte ones. Large
+     * pages from VirtualAlloc work, so the only way to have them under the model is
+     * to put the bytes there.
+     *
+     * It is the move the compressor tensors already make, applied to the whole file:
+     * the copy is memory to memory, since the mapping is in the file cache, and
+     * tensor_data() computes every pointer from m->map, so pointing it at the copy
+     * is enough.
+     */
+    if (getenv("DS4_LARGE_PAGE_MODEL") != NULL && m->size > 0) {
+        const SIZE_T lp = GetLargePageMinimum();
+        HANDLE tok = NULL;
+        if (lp && OpenProcessToken(GetCurrentProcess(),
+                                   TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp;
+            LUID luid;
+            if (LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luid;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                (void)AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
+            }
+            CloseHandle(tok);
+        }
+        const uint64_t rounded = (m->size + (uint64_t)lp - 1u) &
+                                 ~((uint64_t)lp - 1u);
+        struct timespec t0, t1;
+        lp_copy_job jobs[16];
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        void *big = lp ? VirtualAlloc(NULL, (SIZE_T)rounded,
+                                      MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                      PAGE_READWRITE) : NULL;
+        if (big) {
+            /* Parallel, because the first touch of a large page is where the
+             * operating system does the zero fill, and one thread spends most of
+             * the copy waiting on that. */
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            int nt = ncpu > 1 ? (int)ncpu : 1;
+            if (nt > 16) nt = 16;
+            if ((uint64_t)nt > m->size / (1u << 20)) nt = 1;
+            const uint64_t chunk = (m->size + (uint64_t)nt - 1u) / (uint64_t)nt;
+            pthread_t th[16];
+            int started = 0;
+            for (int i = 1; i < nt; i++) {
+                struct lp_copy_job *j = &jobs[i - 1];
+                j->dst = (uint8_t *)big + (uint64_t)i * chunk;
+                j->src = m->map + (uint64_t)i * chunk;
+                j->bytes = ((uint64_t)i * chunk < m->size)
+                                   ? ((uint64_t)(i + 1) * chunk <= m->size
+                                              ? chunk
+                                              : m->size - (uint64_t)i * chunk)
+                                   : 0;
+                j->thread = i;
+                if (j->bytes &&
+                    pthread_create(&th[started], NULL, lp_copy_worker, j) == 0)
+                    started++;
+            }
+            const uint64_t head = chunk < m->size ? chunk : m->size;
+            memcpy(big, m->map, (size_t)head);
+            for (int i = 0; i < started; i++) pthread_join(th[i], NULL);
+            m->lp_base = big;
+            m->map = (const uint8_t *)big;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            fprintf(stderr, "ds4: model in %.0f KiB pages: %.2f GiB copied in %.0f ms"
+                    " (%d threads)\n",
+                    (double)lp / 1024.0, (double)m->size / 1073741824.0,
+                    (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) / 1e6, started + 1);
+        } else {
+            fprintf(stderr, "ds4: large-page model copy unavailable (err=%lu)\n",
+                    (unsigned long)GetLastError());
+        }
+    }
+#endif
 }
 
 static void print_size(uint64_t bytes) {

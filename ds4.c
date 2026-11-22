@@ -77968,7 +77968,8 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
 static bool qwen35_cpu_matvec_multi(
         const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
         uint64_t n, const float *x, uint64_t n_tok) {
-    if (n == 0 || n > 4u) return false;
+    const int mdbg = getenv("DS4_QWEN35_MULTI_DBG") != NULL;
+    if (n == 0 || n > 4u) { if (mdbg) fprintf(stderr, "[multi] n out of range\n"); return false; }
     qwen35_mv_multi_ctx c;
     memset(&c, 0, sizeof c);
     c.m = m;
@@ -77976,15 +77977,37 @@ static bool qwen35_cpu_matvec_multi(
     uint64_t blocks = 0;
     for (uint64_t i = 0; i < n; i++) {
         const ds4_tensor *w = ws[i];
-        if (!w || w->type != DS4_TENSOR_Q4_K) return false;
-        if (w->ndim < 2 || w->dim[0] % QK_K != 0) return false;
+        if (!w || w->type != DS4_TENSOR_Q4_K) {
+            if (mdbg) fprintf(stderr, "[multi] %llu type=%u not Q4_K\n",
+                              (unsigned long long)i, w ? (unsigned)w->type : 999u);
+            return false;
+        }
+        if (w->ndim < 2 || w->dim[0] % QK_K != 0) {
+            if (mdbg) fprintf(stderr, "[multi] %llu ndim=%u dim0=%llu\n",
+                              (unsigned long long)i, (unsigned)w->ndim,
+                              (unsigned long long)w->dim[0]);
+            return false;
+        }
         const uint64_t rows = w->dim[1];
         const uint64_t bl = w->dim[0] / QK_K;
-        if (rows < 16u || (rows % 16u) != 0u) return false;
+        if (rows < 16u || (rows % 16u) != 0u) {
+            if (mdbg) fprintf(stderr, "[multi] %llu rows=%llu\n",
+                              (unsigned long long)i, (unsigned long long)rows);
+            return false;
+        }
         if (i == 0) blocks = bl;
-        else if (bl != blocks) return false;
+        else if (bl != blocks) {
+            if (mdbg) fprintf(stderr, "[multi] %llu blocks=%llu vs %llu\n",
+                              (unsigned long long)i, (unsigned long long)bl,
+                              (unsigned long long)blocks);
+            return false;
+        }
         const uint8_t *tb = (const uint8_t *)tensor_data(m, w);
-        if (!qwen35_x8_get(tb)) return false;
+        if (!qwen35_x8_get(tb)) {
+            if (mdbg) fprintf(stderr, "[multi] %llu no x8 repack\n",
+                              (unsigned long long)i);
+            return false;
+        }
         c.jobs[i].w = w;
         c.jobs[i].out = outs[i];
         c.jobs[i].rows = rows;

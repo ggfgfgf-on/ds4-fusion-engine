@@ -74861,13 +74861,6 @@ static void qwen35_gemm_q4_K_16x8_t(
          * had just fetched; a bounded distance in blocks cannot. DS4_QWEN35_PFD
          * sets the distance, in blocks; unset or 0 disables. */
     
-    static int pfnext = -1;
-    if (pfnext < 0) {
-        const char *e = getenv("DS4_QWEN35_PFNEXT");
-        pfnext = e ? atoi(e) : 0;
-        if (pfnext < 0) pfnext = 0;
-        if (pfnext > 8) pfnext = 8;
-    }
     static int pfd = -1;
         if (pfd < 0) {
             const char *e = getenv("DS4_QWEN35_PFD");
@@ -74994,8 +74987,6 @@ static void qwen35_gemm_q4_K_16x8(
         uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
-    static int nobcast = -1;
-    if (nobcast < 0) nobcast = getenv("DS4_QWEN35_NOBCAST") != NULL;
     static int pfnext = -1;
     if (pfnext < 0) {
         const char *e = getenv("DS4_QWEN35_PFNEXT");
@@ -75029,21 +75020,6 @@ static void qwen35_gemm_q4_K_16x8(
         for (uint64_t b = 0; b < blocks; b++) {
             const qwen35_blk16x8 *xp = (const qwen35_blk16x8 *)
                     (grp + b * Q4K_X16X8_BYTES);
-            /* Ask for the whole next block up front.
-             *
-             * Cold, a block's thirty-eight lines arrive one round trip after another
-             * - three and a half microseconds against the two thousand cycles the
-             * arithmetic needs - because a prefetch placed next to the load it serves
-             * is issued only after the previous load has completed. Issuing all
-             * thirty-eight at the top of this block gives them a block's worth of
-             * lead. */
-            if (pfnext > 0) {
-                const uint8_t *nx = grp + (b + (uint64_t)pfnext) * Q4K_X16X8_BYTES;
-                if (b + (uint64_t)pfnext < blocks) {
-                    for (uint64_t ln = 0; ln < Q4K_X16X8_BYTES; ln += 64u)
-                        _mm_prefetch((const char *)nx + ln, _MM_HINT_T0);
-                }
-            }
             const __m512 dv = _mm512_loadu_ps(xp->d);
             for (int jp = 0; jp < 4; jp++) {
                 const int jlo = 2 * jp;
@@ -76199,6 +76175,14 @@ static float qwen35_dot_q6_K_q8_K(const block_q6_K *x, const block_q8_K *y) {
     return qwen35_dot_q6_K_q8_K_avx2(x, y);
 }
 
+/* Read once. getenv takes a lock and walks the environment, and this switch was
+ * being asked again on every matvec call. */
+static int qwen35_no_x4(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN35_NO_X4") != NULL;
+    return v;
+}
+
 static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
     qwen35_cpu_matvec_ctx *ctx = vctx;
     const uint64_t blocks = ctx->in_dim / QK_K;
@@ -76223,7 +76207,7 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
     uint64_t row = row0;
     if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
-        getenv("DS4_QWEN35_NO_X4") == NULL) {
+        !qwen35_no_x4()) {
         /* Use the same 4-row kernel the batched path uses, so both paths
          * compute bit-identical results (and this one gets the ILP win too). */
         /* same 2-row x 4-token kernel the batched path uses (nt=1 here) so the
@@ -76306,6 +76290,7 @@ static void qwen35_cpu_matvec_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 #endif
 }
+
 
 static void qwen35_cpu_matvec(const ds4_model *m, const ds4_tensor *w, const float *x,
                               float *out, block_q8_K *q8_scratch, bool exact) {
@@ -76946,7 +76931,7 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
      * per-row dot, generation 3.71 against 4.02. Below eight tokens the row dot is
      * the faster of the two, so the dispatch follows the batch size. */
     if (ctx->type == DS4_TENSOR_Q6_K && !ctx->exact && ctx->n_tok > 8u &&
-        getenv("DS4_QWEN35_NO_X4") == NULL) {
+        !qwen35_no_x4()) {
         int16_t *pre = g_q6_pre ? xmalloc((size_t)(blocks * 2u * 256u) * sizeof(int16_t)) : NULL;
         for (; row + 1u < row1; row += 2u) {
             const block_q6_K *u0 = (const block_q6_K *)(ctx->data + (row + 0u) * ctx->row_bytes);
@@ -76979,9 +76964,20 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
         free(pre);
     }
     if (ctx->type == DS4_TENSOR_Q4_K && !ctx->exact &&
-        getenv("DS4_QWEN35_NO_X4") == NULL) {
+        !qwen35_no_x4()) {
         /* four rows at a time: the activation loads are shared and the four
          * accumulator chains overlap in the madd pipelines. */
+        {
+            static int shown[512];
+            const int id = (int)(ctx->data ? (ctx->data - (const uint8_t *)0) % 512 : 0);
+            if (getenv("DS4_QWEN35_NARROW_DBG") && !shown[id]) {
+                shown[id] = 1;
+                fprintf(stderr, "[narrow] rows=%llu blocks=%llu n_tok=%llu\n",
+                        (unsigned long long)(row1 - row),
+                        (unsigned long long)blocks,
+                        (unsigned long long)ctx->n_tok);
+            }
+        }
         /* 2 rows x 4 tokens: the weight stream is walked n_tok/4 times.
          * Only taken when the token count is a multiple of 4, so no tail
          * kernel is needed; everything else falls through to x8/x4. */

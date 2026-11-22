@@ -74554,9 +74554,10 @@ static void qwen35_q6k_wide_block(const block_q6_K *const *rows, uint8_t *dst) {
  * quantiser already computes. So no work happens inside the inner loop for it.
  */
 static void qwen35_gemm_q6_K_16x8(
-        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
-        uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
-        uint64_t row0, int add) {
+        const uint8_t *__restrict__ grp, uint64_t blocks,
+        const block_q8_K *__restrict__ y,
+        uint64_t ystride, uint64_t nt, float *__restrict__ out,
+        uint64_t out_stride, uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const uint64_t lim = nt < 8u ? nt : 8u;
     __m512 f0 = _mm512_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
@@ -74982,9 +74983,10 @@ static int g_nibs1 = -1;   /* DS4_QWEN35_NIBS=1 selects the one-pass form */
  * L1 - twenty blocks is sixty-seven kilobytes against a forty-eight kilobyte L1,
  * so without it every token group re-reads the weights from L2. */
 static void qwen35_gemm_q4_K_16x8(
-        const uint8_t *grp, uint64_t blocks, const block_q8_K *y,
-        uint64_t ystride, uint64_t nt, float *out, uint64_t out_stride,
-        uint64_t row0, int add) {
+        const uint8_t *__restrict__ grp, uint64_t blocks,
+        const block_q8_K *__restrict__ y,
+        uint64_t ystride, uint64_t nt, float *__restrict__ out,
+        uint64_t out_stride, uint64_t row0, int add) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i m0F = _mm512_set1_epi8(0x0F);
     static int pfnext = -1;
@@ -75035,9 +75037,35 @@ static void qwen35_gemm_q4_K_16x8(
                     __m512i lo3 = lo0, lo4 = lo0, lo5 = lo0, lo6 = lo0, lo7 = lo0;
                     __m512i hi0 = lo0, hi1 = lo0, hi2 = lo0, hi3 = lo0;
                     __m512i hi4 = lo0, hi5 = lo0, hi6 = lo0, hi7 = lo0;
+                    /* Eight loads issued back to back, before the arithmetic that
+                     * consumes any of them.
+                     *
+                     * Written as plain loads the compiler emits one load followed by
+                     * the sixteen dpbusd that depend on it, so a thread keeps exactly
+                     * one weight access in flight - and one access per thread is what
+                     * caps this kernel at twenty-seven gigabytes a second while a plain
+                     * streaming read of the same buffer reaches forty-five. Every C
+                     * formulation of "load several first" was reordered back. The asm
+                     * block is the one place the order is not the compiler's to change. */
+                    __m512i w8[8];
+                    {
+                        const uint8_t *q0 = xp->qs + (uint64_t)jp * 512u;
+                        __asm__ __volatile__(
+                            "vmovdqu64   0(%8), %0\n\t"
+                            "vmovdqu64  64(%8), %1\n\t"
+                            "vmovdqu64 128(%8), %2\n\t"
+                            "vmovdqu64 192(%8), %3\n\t"
+                            "vmovdqu64 256(%8), %4\n\t"
+                            "vmovdqu64 320(%8), %5\n\t"
+                            "vmovdqu64 384(%8), %6\n\t"
+                            "vmovdqu64 448(%8), %7"
+                            : "=v"(w8[0]), "=v"(w8[1]), "=v"(w8[2]), "=v"(w8[3]),
+                              "=v"(w8[4]), "=v"(w8[5]), "=v"(w8[6]), "=v"(w8[7])
+                            : "r"(q0)
+                            : "memory");
+                    }
                     for (int c = 0; c < 8; c++) {
-                        const __m512i raw = _mm512_loadu_si512(
-                                (const void *)(xp->qs + ((jp * 8 + c) * 64)));
+                        const __m512i raw = w8[c];
                         const __m512i ql = _mm512_and_si512(raw, m0F);
                         const __m512i qh = _mm512_and_si512(
                                 _mm512_srli_epi16(raw, 4), m0F);

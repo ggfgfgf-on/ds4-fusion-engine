@@ -101240,6 +101240,12 @@ static void *ds4_bench_sum_worker(void *arg) {
 
 static void *ds4_bench_x8_worker(void *arg) {
     ds4_bench_x8_job *j = (ds4_bench_x8_job *)arg;
+    /* Once per worker. The arrangement depends only on the activations, and building
+     * it inside the row loop meant ten thousand rebuilds of the same bytes - which
+     * drowned the kernel it was preparing and made the transposed form read as half
+     * the speed of the plain one. */
+    if (j->trans && j->xt && j->tokens == 8u && j->tgs == 8u)
+        qwen35_xq8_transpose(j->xq, j->blocks, j->blocks, j->xt);
     for (uint64_t g = j->g0; g < j->g1; g += j->step) {
         const uint8_t *row = j->w + g * j->blocks * Q4K_X16X8_BYTES;
         const uint8_t *grp = j->nowload ? j->w : row;
@@ -101258,12 +101264,10 @@ static void *ds4_bench_x8_worker(void *arg) {
             }
             continue;
         }
-        if (j->trans && j->tokens == 8u && j->tgs == 8u) {
+        if (j->trans && j->xt && j->tokens == 8u && j->tgs == 8u) {
             /* The transposed form puts the tokens in the lanes and broadcasts the
-             * weights, which is two instructions per dpbusd instead of three. It
-             * needs the activations rearranged, and the engine only builds that
-             * arrangement for a batch of exactly eight. */
-            qwen35_xq8_transpose(j->xq, j->blocks, j->blocks, j->xt);
+             * weights, so the two int32 groups a chunk needs arrive as one
+             * sixty-four byte read instead of sixteen four-byte reads. */
             qwen35_gemm_q4_K_16x8_t(grp, j->blocks, j->xq, j->xt, j->blocks,
                                     j->out, j->rows, g * Q4K_X16_ROWS);
             continue;

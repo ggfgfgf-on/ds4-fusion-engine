@@ -74373,11 +74373,12 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
         for (uint64_t b = 0; b < blocks; b++) {
             qwen35_blk16x8 *o = (qwen35_blk16x8 *)
                     (buf + ((g * blocks + b) * Q4K_X16X8_BYTES));
+            const uint8_t *rp[Q4K_X16_ROWS];
             for (unsigned r = 0; r < Q4K_X16_ROWS; r++) {
-                const uint8_t *rp = src + ((g * 16u + r) * row_bytes) + b * Q4K_ROW;
-                o->d[r] = f16_to_f32(*(const uint16_t *)(rp + 0));
-                o->dmin[r] = f16_to_f32(*(const uint16_t *)(rp + 2));
-                const uint8_t *q = rp + 4;
+                rp[r] = src + ((g * 16u + r) * row_bytes) + b * Q4K_ROW;
+                o->d[r] = f16_to_f32(*(const uint16_t *)(rp[r] + 0));
+                o->dmin[r] = f16_to_f32(*(const uint16_t *)(rp[r] + 2));
+                const uint8_t *q = rp[r] + 4;
                 for (int j = 0; j < 8; j++) {
                     if (j < 4) {
                         o->sc[j][r] = q[j] & 63;
@@ -74389,12 +74390,33 @@ static uint8_t *qwen35_x8_build(const ds4_model *m, const ds4_tensor *w) {
                                                 ((q[j + 4] & 240) >> 4));
                     }
                 }
-                /* four-byte interleave over the sixteen rows */
-                for (int c = 0; c < 32; c++)
-                    memcpy(o->qs + c * 64 + r * 4, rp + 16 + c * 4, 4);
+            }
+            /* Four-byte interleave over the sixteen rows, a whole line at a time.
+             *
+             * Written row by row this is thirty-two four-byte stores per row, each
+             * landing in a different cache line - the lines do get filled, but only
+             * after sixteen passes over them, and the buffer is fresh so every line
+             * also costs its read-for-ownership. Gathering a line first turns that
+             * into one full-line store, and a streaming store skips the fetch the
+             * write would otherwise need. The whole repack is one pass over twelve
+             * gigabytes that nothing reads again until it is complete, which is what
+             * streaming stores are for. */
+            for (int c = 0; c < 32; c++) {
+                uint8_t line[64];
+                for (unsigned r = 0; r < Q4K_X16_ROWS; r++)
+                    memcpy(line + r * 4u, rp[r] + 16 + c * 4, 4);
+#if defined(__AVX512F__)
+                _mm512_stream_si512((void *)(o->qs + c * 64),
+                                    _mm512_loadu_si512((const void *)line));
+#else
+                memcpy(o->qs + c * 64, line, 64);
+#endif
             }
         }
     }
+#if defined(__AVX512F__)
+    _mm_sfence();
+#endif
     qwen35_x8_put(src, buf);
     return buf;
 }

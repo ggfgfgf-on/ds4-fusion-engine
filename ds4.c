@@ -78006,21 +78006,8 @@ static void qwen35_attn_phase_a(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-/* DS4_QWEN35_ATTN_TWOPASS runs the old two-pass softmax with its ceiling raised to
- * the whole context. It is a probe, not a mode: the two forms are algebraically
- * identical, so a disagreement attributes a bad long-context answer to the algorithm
- * rather than to the engine around it. */
-static int qwen35_attn_twopass_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("DS4_QWEN35_ATTN_TWOPASS") != NULL ? 1 : 0;
-    return on;
-}
-
 static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
     qwen35_attn_work *w = vctx;
-    /* Resolved once per call rather than once per unit: the environment lookup
-     * inside the unit loop cost about five percent of prefill. */
-    const int twopass = qwen35_attn_twopass_on();
     const uint64_t nHD = w->nHD, nKV = w->nKV, nH = w->nH;
     const float scale = 1.0f / sqrtf((float)nHD);
     const uint64_t vbase = (uint64_t)(w->kv_cap * nKV * nHD);
@@ -78063,44 +78050,6 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         float oacc[512];
         const uint32_t nacc = nHD < 512u ? (uint32_t)nHD : 512u;
         for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
-        if (twopass && visible <= 16384u) {
-            float sbuf[16384];
-            for (uint32_t x = 0; x < visible; x++) {
-                const uint64_t base = (uint64_t)(x % w->kv_cap) * kstride + krow;
-                const float *restrict kvr = w->kv + base;
-                __m256 acc = _mm256_setzero_ps();
-                uint32_t i = 0;
-                for (; i + 8u <= nHD; i += 8u)
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
-                                          _mm256_loadu_ps(kvr + i), acc);
-                float dd = qwen35_hsum_ps256(acc);
-                for (; i < nHD; i++) dd += qh[i] * kvr[i];
-                sbuf[x] = dd * scale;
-            }
-            float tmx = sbuf[0];
-            for (uint32_t x = 1; x < visible; x++) tmx = fmaxf(tmx, sbuf[x]);
-            double tss = 0.0;
-            for (uint32_t x = 0; x < visible; x++) {
-                sbuf[x] = expf(sbuf[x] - tmx);
-                tss += sbuf[x];
-            }
-            for (uint32_t x = 0; x < visible; x++) {
-                const float *restrict vr = w->kv + (uint64_t)(x % w->kv_cap) * kstride +
-                                           vbase + krow;
-                const __m256 sv = _mm256_set1_ps(sbuf[x]);
-                uint32_t i = 0;
-                for (; i + 8u <= nacc; i += 8u)
-                    _mm256_storeu_ps(oacc + i,
-                                     _mm256_fmadd_ps(sv, _mm256_loadu_ps(vr + i),
-                                                     _mm256_loadu_ps(oacc + i)));
-                for (; i < nacc; i++) oacc[i] += sbuf[x] * vr[i];
-            }
-            for (uint32_t i = 0; i < (uint32_t)nHD; i++) {
-                const float o = (i < nacc) ? oacc[i] : 0.0f;
-                outh[i] = o / (float)tss * (1.0f / (1.0f + expf(-gt[i])));
-            }
-            continue;
-        }
         /* Seed the running maximum from the first position instead of from
          * -INFINITY: this translation unit is built with -ffast-math, which lets
          * the compiler assume no operand is ever infinite, and an infinite sentinel

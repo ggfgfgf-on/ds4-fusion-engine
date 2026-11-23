@@ -78006,8 +78006,21 @@ static void qwen35_attn_phase_a(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
+/* DS4_QWEN35_ATTN_TWOPASS runs the old two-pass softmax with its ceiling raised to
+ * the whole context. It is a probe, not a mode: the two forms are algebraically
+ * identical, so a disagreement attributes a bad long-context answer to the algorithm
+ * rather than to the engine around it. */
+static int qwen35_attn_twopass_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN35_ATTN_TWOPASS") != NULL ? 1 : 0;
+    return on;
+}
+
 static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
     qwen35_attn_work *w = vctx;
+    /* Resolved once per call rather than once per unit: the environment lookup
+     * inside the unit loop cost about five percent of prefill. */
+    const int twopass = qwen35_attn_twopass_on();
     const uint64_t nHD = w->nHD, nKV = w->nKV, nH = w->nH;
     const float scale = 1.0f / sqrtf((float)nHD);
     const uint64_t vbase = (uint64_t)(w->kv_cap * nKV * nHD);
@@ -78050,12 +78063,6 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         float oacc[512];
         const uint32_t nacc = nHD < 512u ? (uint32_t)nHD : 512u;
         for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
-        /* Isolation probe: DS4_QWEN35_ATTN_TWOPASS swaps in the old two-pass
-         * softmax with its ceiling raised to the whole context, so a long-context
-         * result can be attributed to the algorithm rather than to the engine. */
-        static int twopass = -1;
-        if (twopass < 0)
-            twopass = getenv("DS4_QWEN35_ATTN_TWOPASS") != NULL ? 1 : 0;
         if (twopass && visible <= 16384u) {
             float sbuf[16384];
             for (uint32_t x = 0; x < visible; x++) {

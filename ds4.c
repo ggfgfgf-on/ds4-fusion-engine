@@ -78167,16 +78167,18 @@ typedef struct {
  *
  * `cap` is the ring capacity (the context), `win` the window; a position whose distance
  * from the newest one is under the window is still a float row. */
-static inline void qwen35_kv_row(const float *kvbuf, const int8_t *kvq,
-                                 const uint8_t *kvq4, const float *kvqs,
-                                 uint32_t cap, uint32_t win, uint32_t newest, uint32_t x,
-                                 uint32_t half, uint32_t nKV, uint32_t nHD, uint32_t kh,
-                                 float *dst) {
+static inline const float *qwen35_kv_row(const float *kvbuf, const int8_t *kvq,
+                                         const uint8_t *kvq4, const float *kvqs,
+                                         uint32_t cap, uint32_t win, uint32_t newest,
+                                         uint32_t x, uint32_t half, uint32_t nKV,
+                                         uint32_t nHD, uint32_t kh, float *dst) {
+    /* Inside the window the row is already floats: hand back a pointer to it rather
+     * than copy a kilobyte per head per position - at nine thousand tokens of context
+     * that copy, not the arithmetic, was most of the decode time. Only the quantised
+     * tiers need the staging row. */
     if (win != 0u && (newest - x) < win) {
-        const float *s = kvbuf + (uint64_t)(x % win) * nKV * nHD +
-                         (uint64_t)half * (uint64_t)win * nKV * nHD + (uint64_t)kh * nHD;
-        memcpy(dst, s, (size_t)nHD * sizeof(float));
-        return;
+        return kvbuf + (uint64_t)(x % win) * nKV * nHD +
+               (uint64_t)half * (uint64_t)win * nKV * nHD + (uint64_t)kh * nHD;
     }
     const float sc = kvqs[(uint64_t)(x % cap) * nKV +
                           (uint64_t)half * (uint64_t)cap * nKV + kh];
@@ -78185,11 +78187,13 @@ static inline void qwen35_kv_row(const float *kvbuf, const int8_t *kvq,
                           (uint64_t)half * (uint64_t)QWEN35_KV_TIER1 * nKV * nHD +
                           (uint64_t)kh * nHD;
         qwen35_kv_deq_row(q, sc, dst, nHD);
+        return dst;
     } else {
         const uint8_t *q = kvq4 + (uint64_t)(x % cap) * nKV * (nHD / 2u) +
                            (uint64_t)half * (uint64_t)cap * nKV * (nHD / 2u) +
                            (uint64_t)kh * (nHD / 2u);
         qwen35_kv_deq_row4(q, sc, dst, nHD);
+        return dst;
     }
 }
 
@@ -78308,9 +78312,9 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         float kbuf[512], vbuf[512];
         {
             float k0b[512];
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          pos, 0u, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, k0b);
-            const float *restrict k0 = k0b;
+            const float *restrict k0 = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    pos, 0u, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, k0b);
             __m256 a0 = _mm256_setzero_ps();
             uint32_t i = 0;
             for (; i + 8u <= nHD; i += 8u)
@@ -78321,9 +78325,9 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             mx = d0 * scale;
             ss = 1.0;
             float v0b[512];
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          pos, 0u, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, v0b);
-            const float *restrict v0 = v0b;
+            const float *restrict v0 = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    pos, 0u, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, v0b);
             const __m256 p0 = _mm256_set1_ps(1.0f);
             i = 0;
             for (; i + 8u <= nacc; i += 8u)
@@ -78331,9 +78335,9 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             for (; i < nacc; i++) oacc[i] = v0[i];
         }
         for (uint32_t x = 1; x < visible; x++) {
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          pos, x, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, kbuf);
-            const float *restrict kvr = kbuf;
+            const float *restrict kvr = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    pos, x, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, kbuf);
             __m256 acc = _mm256_setzero_ps();
             uint32_t i = 0;
             for (; i + 8u <= nHD; i += 8u)
@@ -78350,9 +78354,9 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             }
             const float pv = expf(s - mx);
             ss += pv;
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          pos, x, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, vbuf);
-            const float *restrict vr = vbuf;
+            const float *restrict vr = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    pos, x, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, vbuf);
             const __m256 sv = _mm256_set1_ps(pv);
             i = 0;
             for (; i + 8u <= nacc; i += 8u)
@@ -79164,10 +79168,11 @@ static void qwen35_cpu_mtp_forward_h(
         const uint32_t kh = h / (H / KV);
         for (uint32_t t = 0; t < visible; t++) {
             float mrow[512];
-            qwen35_kv_row(kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 0u,
-                          KV, HD, kh, mrow);
+            const float *mptr = qwen35_kv_row(
+                    kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 0u,
+                    KV, HD, kh, mrow);
             float dd = 0.0f;
-            for (uint32_t i = 0; i < HD; i++) dd += q2[(uint64_t)h * HD + i] * mrow[i];
+            for (uint32_t i = 0; i < HD; i++) dd += q2[(uint64_t)h * HD + i] * mptr[i];
             score[t] = dd * scale;
         }
         float mx = score[0];
@@ -79178,9 +79183,10 @@ static void qwen35_cpu_mtp_forward_h(
             float o = 0.0f;
             for (uint32_t t = 0; t < visible; t++) {
                 float mrow[512];
-                qwen35_kv_row(kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
-                              KV, HD, kh, mrow);
-                o += score[t] * mrow[i];
+                const float *mptr = qwen35_kv_row(
+                        kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
+                        KV, HD, kh, mrow);
+                o += score[t] * mptr[i];
             }
             ff_b[(uint64_t)h * HD + i] = o / (float)ss *
                     (1.0f / (1.0f + expf(-gate[h * HD + i])));
@@ -79499,28 +79505,30 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
         for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
         {   /* seed from the first position, never from infinity: this unit is built
              * with -ffast-math, which assumes no operand is ever infinite. */
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          w->newest, 0u, 0u, KV, HD, kh, krow);
+            const float *kseed = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    w->newest, 0u, 0u, KV, HD, kh, krow);
             __m256 a = _mm256_setzero_ps();
             uint32_t i = 0;
             for (; i + 8u <= HD; i += 8u)
                 a = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
-                                    _mm256_loadu_ps(krow + i), a);
+                                    _mm256_loadu_ps(kseed + i), a);
             float d = qwen35_hsum_ps256(a);
-            for (; i < HD; i++) d += qh[i] * krow[i];
+            for (; i < HD; i++) d += qh[i] * kseed[i];
             mx = d * w->scale;
             ss = 1.0;
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          w->newest, 0u, 1u, KV, HD, kh, vrow);
+            const float *vseed = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    w->newest, 0u, 1u, KV, HD, kh, vrow);
             i = 0;
             for (; i + 8u <= nacc; i += 8u)
-                _mm256_storeu_ps(oacc + i, _mm256_loadu_ps(vrow + i));
-            for (; i < nacc; i++) oacc[i] = vrow[i];
+                _mm256_storeu_ps(oacc + i, _mm256_loadu_ps(vseed + i));
+            for (; i < nacc; i++) oacc[i] = vseed[i];
         }
         for (uint32_t t = 1; t < visible; t++) {
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          w->newest, t, 0u, KV, HD, kh, krow);
-            const float *kp = krow;
+            const float *kp = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    w->newest, t, 0u, KV, HD, kh, krow);
             __m256 a = _mm256_setzero_ps();
             uint32_t i = 0;
             for (; i + 8u <= HD; i += 8u)
@@ -79537,9 +79545,9 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
             }
             const float pv = expf(s - mx);
             ss += pv;
-            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                          w->newest, t, 1u, KV, HD, kh, vrow);
-            const float *vp = vrow;
+            const float *vp = qwen35_kv_row(
+                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+                    w->newest, t, 1u, KV, HD, kh, vrow);
             const __m256 sv = _mm256_set1_ps(pv);
             i = 0;
             for (; i + 8u <= nacc; i += 8u)

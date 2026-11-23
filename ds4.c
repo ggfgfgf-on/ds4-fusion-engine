@@ -66493,6 +66493,9 @@ struct ds4_session {
     /* Every token, quantised: [2][ctx][KV][HD] int8, keys then values, with one scale
      * per (token, head) in qwen35_cpu_kvqs: [2][ctx][KV]. */
     int8_t *qwen35_cpu_kvq[DS4_MAX_LAYER];
+    /* Values further back than QWEN35_KV_TIER1, four bits packed two per byte,
+     * again keys then values with one scale per (token, head). */
+    uint8_t *qwen35_cpu_kvq4[DS4_MAX_LAYER];
     float *qwen35_cpu_kvqs[DS4_MAX_LAYER];
     /* Non-zero when that layer's KV came from VirtualAlloc with large pages, which
      * has to be released with VirtualFree rather than free. */
@@ -73901,6 +73904,52 @@ static void qwen35_cpu_rope(float *row, int32_t pos) {
  * megabytes, so it costs almost nothing. */
 #define QWEN35_KV_WINDOW 2048u
 
+/* Past this distance values drop to four bits. Keys and values both stop at eight bits
+ * inside it: this is the second step of a three-step decay, not a cliff, because the
+ * attention weight a position carries falls with its distance. */
+#define QWEN35_KV_TIER1 16384u
+
+/* Eight-bit rows: one byte per value, one scale per (token, head). */
+static void qwen35_kv_quant_row(const float *src, int8_t *dst, float *sc,
+                                uint32_t KV, uint32_t HD);
+
+/* Four-bit rows: two values packed per byte, one scale per (token, head). */
+static void qwen35_kv_quant_row4(const float *src, uint8_t *dst, float *sc,
+                                 uint32_t KV, uint32_t HD) {
+    for (uint32_t h = 0; h < KV; h++) {
+        const float *s = src + (uint64_t)h * HD;
+        float mxv = 0.0f;
+        for (uint32_t i = 0; i < HD; i++) {
+            const float a = fabsf(s[i]);
+            if (a > mxv) mxv = a;
+        }
+        const float step = mxv > 0.0f ? mxv / 7.0f : 0.0f;
+        const float g = mxv > 0.0f ? 7.0f / mxv : 0.0f;
+        sc[h] = step;
+        uint8_t *d = dst + (uint64_t)h * (HD / 2u);
+        for (uint32_t i = 0; i < HD; i += 2u) {
+            int lo = (int)lrintf(s[i] * g);
+            int hi = (int)lrintf(s[i + 1u] * g);
+            if (lo > 7) lo = 7; else if (lo < -7) lo = -7;
+            if (hi > 7) hi = 7; else if (hi < -7) hi = -7;
+            d[i / 2u] = (uint8_t)(((uint8_t)(lo & 0xF)) |
+                                  (uint8_t)(((uint8_t)(hi & 0xF)) << 4));
+        }
+    }
+}
+
+static void qwen35_kv_deq_row4(const uint8_t *src, float sc, float *dst, uint32_t HD) {
+    for (uint32_t i = 0; i < HD; i += 2u) {
+        const uint8_t b = src[i / 2u];
+        int lo = (int)(b & 0xFu);
+        int hi = (int)((b >> 4) & 0xFu);
+        if (lo >= 8) lo -= 16;
+        if (hi >= 8) hi -= 16;
+        dst[i] = (float)lo * sc;
+        dst[i + 1u] = (float)hi * sc;
+    }
+}
+
 struct ds4_session;
 
 /* Store one key or value row group (KV*HD floats) for a position into both tiers.
@@ -73950,11 +73999,19 @@ static void qwen35_kv_store_row(struct ds4_session *s, uint32_t il, uint32_t pos
     const uint32_t cap = (uint32_t)s->ctx_size;
     const uint32_t win = QWEN35_KV_WINDOW;
     const uint32_t p = pos % cap;
-    int8_t *q = s->qwen35_cpu_kvq[il] +
-                (uint64_t)half * (uint64_t)cap * KV * HD + (uint64_t)p * KV * HD;
     float *sc = s->qwen35_cpu_kvqs[il] +
                 (uint64_t)half * (uint64_t)cap * KV + (uint64_t)p * KV;
-    qwen35_kv_quant_row(row, q, sc, KV, HD);
+    if (pos < QWEN35_KV_TIER1) {
+        int8_t *q = s->qwen35_cpu_kvq[il] +
+                    (uint64_t)half * (uint64_t)QWEN35_KV_TIER1 * KV * HD +
+                    (uint64_t)(pos % QWEN35_KV_TIER1) * KV * HD;
+        qwen35_kv_quant_row(row, q, sc, KV, HD);
+    } else {
+        uint8_t *q = s->qwen35_cpu_kvq4[il] +
+                     (uint64_t)half * (uint64_t)cap * KV * (HD / 2u) +
+                     (uint64_t)p * KV * (HD / 2u);
+        qwen35_kv_quant_row4(row, q, sc, KV, HD);
+    }
     if (win != 0u) {
         const uint32_t wp = pos % win;
         float *h = s->qwen35_cpu_kvh[il] +
@@ -78060,6 +78117,7 @@ static void qwen35_silu_worker(void *vctx, uint64_t c0, uint64_t c1) {
 typedef struct {
     float *qkv, *gate, *k2, *v2, *q2, *kv, *score, *attn_o;
     const int8_t *kvq;
+    const uint8_t *kvq4;
     const float *kvqs;
     const float *qnorm, *knorm;
     float eps;
@@ -78076,7 +78134,8 @@ typedef struct {
  *
  * `cap` is the ring capacity (the context), `win` the window; a position whose distance
  * from the newest one is under the window is still a float row. */
-static inline void qwen35_kv_row(const float *kvbuf, const int8_t *kvq, const float *kvqs,
+static inline void qwen35_kv_row(const float *kvbuf, const int8_t *kvq,
+                                 const uint8_t *kvq4, const float *kvqs,
                                  uint32_t cap, uint32_t win, uint32_t newest, uint32_t x,
                                  uint32_t half, uint32_t nKV, uint32_t nHD, uint32_t kh,
                                  float *dst) {
@@ -78084,12 +78143,20 @@ static inline void qwen35_kv_row(const float *kvbuf, const int8_t *kvq, const fl
         const float *s = kvbuf + (uint64_t)(x % win) * nKV * nHD +
                          (uint64_t)half * (uint64_t)win * nKV * nHD + (uint64_t)kh * nHD;
         memcpy(dst, s, (size_t)nHD * sizeof(float));
-    } else {
-        const int8_t *q = kvq + (uint64_t)(x % cap) * nKV * nHD +
-                          (uint64_t)half * (uint64_t)cap * nKV * nHD + (uint64_t)kh * nHD;
-        const float sc = kvqs[(uint64_t)(x % cap) * nKV +
-                              (uint64_t)half * (uint64_t)cap * nKV + kh];
+        return;
+    }
+    const float sc = kvqs[(uint64_t)(x % cap) * nKV +
+                          (uint64_t)half * (uint64_t)cap * nKV + kh];
+    if (x < QWEN35_KV_TIER1) {
+        const int8_t *q = kvq + (uint64_t)(x % QWEN35_KV_TIER1) * nKV * nHD +
+                          (uint64_t)half * (uint64_t)QWEN35_KV_TIER1 * nKV * nHD +
+                          (uint64_t)kh * nHD;
         qwen35_kv_deq_row(q, sc, dst, nHD);
+    } else {
+        const uint8_t *q = kvq4 + (uint64_t)(x % cap) * nKV * (nHD / 2u) +
+                           (uint64_t)half * (uint64_t)cap * nKV * (nHD / 2u) +
+                           (uint64_t)kh * (nHD / 2u);
+        qwen35_kv_deq_row4(q, sc, dst, nHD);
     }
 }
 
@@ -78122,15 +78189,25 @@ static void qwen35_attn_phase_a(void *vctx, uint64_t t0, uint64_t t1) {
         /* Quantised copy for every token, so nothing has to be moved when the window
          * slides; the float copy only exists while the token is still inside it. */
         {
-            const uint64_t qoff = (uint64_t)kv_pos * nKV * nHD;
-            const uint64_t qvoff = qoff + (uint64_t)w->kv_cap * nKV * nHD;
-            int8_t *kq = (int8_t *)w->kvq + qoff;
-            int8_t *vq = (int8_t *)w->kvq + qvoff;
+            const uint32_t tier1 = QWEN35_KV_TIER1;
             float *ks = (float *)w->kvqs + (uint64_t)kv_pos * nKV;
             float *vs = (float *)w->kvqs + (uint64_t)w->kv_cap * nKV +
                         (uint64_t)kv_pos * nKV;
-            qwen35_kv_quant_row(kt, kq, ks, (uint32_t)nKV, (uint32_t)nHD);
-            qwen35_kv_quant_row(vt, vq, vs, (uint32_t)nKV, (uint32_t)nHD);
+            if (pos < tier1) {
+                const uint32_t ip = pos % tier1;
+                int8_t *kq = (int8_t *)w->kvq + (uint64_t)ip * nKV * nHD;
+                int8_t *vq = (int8_t *)w->kvq + (uint64_t)tier1 * nKV * nHD +
+                             (uint64_t)ip * nKV * nHD;
+                qwen35_kv_quant_row(kt, kq, ks, (uint32_t)nKV, (uint32_t)nHD);
+                qwen35_kv_quant_row(vt, vq, vs, (uint32_t)nKV, (uint32_t)nHD);
+            } else {
+                const uint64_t half_row = (uint64_t)nKV * (nHD / 2u);
+                uint8_t *kq = (uint8_t *)w->kvq4 + (uint64_t)kv_pos * half_row;
+                uint8_t *vq = (uint8_t *)w->kvq4 +
+                              (uint64_t)w->kv_cap * half_row + (uint64_t)kv_pos * half_row;
+                qwen35_kv_quant_row4(kt, kq, ks, (uint32_t)nKV, (uint32_t)nHD);
+                qwen35_kv_quant_row4(vt, vq, vs, (uint32_t)nKV, (uint32_t)nHD);
+            }
         }
         if (win != 0u) {
             memcpy(w->kv + (uint64_t)wpos * nKV * nHD, kt,
@@ -78198,7 +78275,7 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         float kbuf[512], vbuf[512];
         {
             float k0b[512];
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           pos, 0u, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, k0b);
             const float *restrict k0 = k0b;
             __m256 a0 = _mm256_setzero_ps();
@@ -78211,7 +78288,7 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             mx = d0 * scale;
             ss = 1.0;
             float v0b[512];
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           pos, 0u, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, v0b);
             const float *restrict v0 = v0b;
             const __m256 p0 = _mm256_set1_ps(1.0f);
@@ -78221,7 +78298,7 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             for (; i < nacc; i++) oacc[i] = v0[i];
         }
         for (uint32_t x = 1; x < visible; x++) {
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           pos, x, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, kbuf);
             const float *restrict kvr = kbuf;
             __m256 acc = _mm256_setzero_ps();
@@ -78240,7 +78317,7 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             }
             const float pv = expf(s - mx);
             ss += pv;
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           pos, x, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, vbuf);
             const float *restrict vr = vbuf;
             const __m256 sv = _mm256_set1_ps(pv);
@@ -78653,6 +78730,7 @@ static void qwen35_cpu_forward_batch(
             const float *knorm = qwen4_ref_f32(m, l->attn_k_norm);
             float *kv = s->qwen35_cpu_kvh[il];
             const int8_t *kvq = s->qwen35_cpu_kvq[il];
+            const uint8_t *kvq4 = s->qwen35_cpu_kvq4[il];
             const float *kvqs = s->qwen35_cpu_kvqs[il];
             const uint32_t kv_cap = (uint32_t)s->ctx_size;
             struct timespec at0, at1;
@@ -78661,7 +78739,7 @@ static void qwen35_cpu_forward_batch(
             qwen35_attn_work aw;
             aw.qkv = qkv; aw.gate = gate; aw.k2 = k2; aw.v2 = v2; aw.q2 = q2;
             aw.kv = kv; aw.score = score; aw.attn_o = attn_o;
-            aw.kvq = kvq; aw.kvqs = kvqs;
+            aw.kvq = kvq; aw.kvq4 = kvq4; aw.kvqs = kvqs;
             aw.qnorm = qnorm; aw.knorm = knorm; aw.eps = eps;
             aw.kv_cap = kv_cap; aw.pos0 = pos0; aw.n_tok = n_tok;
             aw.nH = H; aw.nKV = KV; aw.nHD = HD; aw.nC = C; aw.nQW = QW;
@@ -79038,6 +79116,7 @@ static void qwen35_cpu_mtp_forward_h(
     } else {
     const float *kvh = s->qwen35_cpu_kvh[DS4_N_LAYER - 1u];
     const int8_t *kvq = s->qwen35_cpu_kvq[DS4_N_LAYER - 1u];
+    const uint8_t *kvq4 = s->qwen35_cpu_kvq4[DS4_N_LAYER - 1u];
     const float *kvqs = s->qwen35_cpu_kvqs[DS4_N_LAYER - 1u];
     const uint32_t kv_cap = (uint32_t)s->ctx_size;
     qwen35_kv_store_row(s, DS4_N_LAYER - 1u, dpos, 0u, k2);
@@ -79048,7 +79127,7 @@ static void qwen35_cpu_mtp_forward_h(
         const uint32_t kh = h / (H / KV);
         for (uint32_t t = 0; t < visible; t++) {
             float mrow[512];
-            qwen35_kv_row(kvh, kvq, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 0u,
+            qwen35_kv_row(kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 0u,
                           KV, HD, kh, mrow);
             float dd = 0.0f;
             for (uint32_t i = 0; i < HD; i++) dd += q2[(uint64_t)h * HD + i] * mrow[i];
@@ -79062,7 +79141,7 @@ static void qwen35_cpu_mtp_forward_h(
             float o = 0.0f;
             for (uint32_t t = 0; t < visible; t++) {
                 float mrow[512];
-                qwen35_kv_row(kvh, kvq, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
+                qwen35_kv_row(kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
                               KV, HD, kh, mrow);
                 o += score[t] * mrow[i];
             }
@@ -79361,6 +79440,7 @@ static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
 typedef struct {
     const float *q2, *gate, *kv, *out;
     const int8_t *kvq;
+    const uint8_t *kvq4;
     const float *kvqs;
     uint32_t H, KV, HD, visible, kv_cap, newest;
     float scale;
@@ -79382,7 +79462,7 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
         for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
         {   /* seed from the first position, never from infinity: this unit is built
              * with -ffast-math, which assumes no operand is ever infinite. */
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           w->newest, 0u, 0u, KV, HD, kh, krow);
             __m256 a = _mm256_setzero_ps();
             uint32_t i = 0;
@@ -79393,7 +79473,7 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
             for (; i < HD; i++) d += qh[i] * krow[i];
             mx = d * w->scale;
             ss = 1.0;
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           w->newest, 0u, 1u, KV, HD, kh, vrow);
             i = 0;
             for (; i + 8u <= nacc; i += 8u)
@@ -79401,7 +79481,7 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
             for (; i < nacc; i++) oacc[i] = vrow[i];
         }
         for (uint32_t t = 1; t < visible; t++) {
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           w->newest, t, 0u, KV, HD, kh, krow);
             const float *kp = krow;
             __m256 a = _mm256_setzero_ps();
@@ -79420,7 +79500,7 @@ static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
             }
             const float pv = expf(s - mx);
             ss += pv;
-            qwen35_kv_row(w->kv, w->kvq, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
+            qwen35_kv_row(w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                           w->newest, t, 1u, KV, HD, kh, vrow);
             const float *vp = vrow;
             const __m256 sv = _mm256_set1_ps(pv);
@@ -79571,6 +79651,7 @@ static void qwen35_cpu_forward_token(
             ds4_layer_cache *cache = &s->cpu_cache.layer[il];
             (void)cache;
             const int8_t *kvq = s->qwen35_cpu_kvq[il];
+            const uint8_t *kvq4 = s->qwen35_cpu_kvq4[il];
             const float *kvqs = s->qwen35_cpu_kvqs[il];
             const uint32_t kv_cap = (uint32_t)s->ctx_size;
             qwen35_kv_store_row(s, il, pos, 0u, k2);
@@ -79583,6 +79664,7 @@ static void qwen35_cpu_forward_token(
                 aw.gate = gate;
                 aw.kv = s->qwen35_cpu_kvh[il];
                 aw.kvq = kvq;
+                aw.kvq4 = kvq4;
                 aw.kvqs = kvqs;
                 aw.newest = pos;
                 aw.out = ff_b;
@@ -87202,8 +87284,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         const size_t row_b = (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
                         s->qwen35_cpu_kvh[il] =
                                 xmalloc((size_t)2u * QWEN35_KV_WINDOW * row_f);
-                        s->qwen35_cpu_kvq[il] =
-                                xmalloc((size_t)2u * (size_t)ctx_size * row_b);
+                        s->qwen35_cpu_kvq[il] = xmalloc(
+                                (size_t)2u * (size_t)QWEN35_KV_TIER1 * row_b);
+                        s->qwen35_cpu_kvq4[il] = xmalloc(
+                                (size_t)2u * (size_t)ctx_size * (row_b / 2u));
                         s->qwen35_cpu_kvqs[il] = xmalloc(
                                 (size_t)2u * (size_t)ctx_size * DS4_N_HEAD_KV *
                                 sizeof(float));
@@ -87723,6 +87807,7 @@ void ds4_session_free(ds4_session *s) {
                 free(s->qwen35_cpu_ssm_state[il]);
                 free(s->qwen35_cpu_kvh[il]);
             free(s->qwen35_cpu_kvq[il]);
+            free(s->qwen35_cpu_kvq4[il]);
             free(s->qwen35_cpu_kvqs[il]);
             }
             for (int b = 0; b < 12; b++) free(s->qwen35_cpu_buf[b]);

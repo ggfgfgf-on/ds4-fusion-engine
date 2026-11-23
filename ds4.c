@@ -66496,6 +66496,11 @@ struct ds4_session {
     /* Values further back than QWEN35_KV_TIER1, four bits packed two per byte,
      * again keys then values with one scale per (token, head). */
     uint8_t *qwen35_cpu_kvq4[DS4_MAX_LAYER];
+    /* Rows of qwen35_cpu_kvq4 that are actually committed. The buffer is reserved at
+     * startup and committed as positions reach it: charging the whole thing up front is
+     * what made a large --ctx cost memory, and through it speed, for a prompt that never
+     * touches a far row. */
+    uint32_t qwen35_cpu_kvq4_commit[DS4_MAX_LAYER];
     float *qwen35_cpu_kvqs[DS4_MAX_LAYER];
     /* Non-zero when that layer's KV came from VirtualAlloc with large pages, which
      * has to be released with VirtualFree rather than free. */
@@ -73993,8 +73998,36 @@ static void qwen35_kv_deq_row(const int8_t *src, float sc, float *dst, uint32_t 
     for (; i < HD; i++) dst[i] = (float)src[i] * sc;
 }
 
+/* Commit the four-bit tier up to the row a position needs.
+ *
+ * A slab, not a single row: VirtualAlloc rounds to page granularity anyway and a
+ * commit per token per layer would be a lot of calls for no gain. */
+static void qwen35_kv4_ensure(struct ds4_session *s, uint32_t il, uint32_t pos) {
+#if defined(_WIN32)
+    const uint32_t cap = (uint32_t)s->ctx_size;
+    if (pos >= cap) return;
+    if (pos < s->qwen35_cpu_kvq4_commit[il]) return;
+    const size_t half_row = (size_t)DS4_N_HEAD_KV * (DS4_N_HEAD_DIM / 2u);
+    const size_t bytes = (size_t)2u * (size_t)cap * half_row;
+    uint32_t want = s->qwen35_cpu_kvq4_commit[il] + 65536u;
+    if (want <= pos) want = pos + 1u;
+    if (want > cap) want = cap;
+    uint8_t *base = s->qwen35_cpu_kvq4[il];
+    const size_t off = (size_t)2u * (size_t)s->qwen35_cpu_kvq4_commit[il] * half_row;
+    const size_t len = (size_t)2u * (size_t)(want - s->qwen35_cpu_kvq4_commit[il]) *
+                       half_row;
+    if (off + len > bytes) ds4_die("KV tier 3 commit beyond reservation");
+    void *got = VirtualAlloc(base + off, len, MEM_COMMIT, PAGE_READWRITE);
+    if (!got) ds4_die("out of memory committing KV tier 3");
+    s->qwen35_cpu_kvq4_commit[il] = want;
+#else
+    (void)s; (void)il; (void)pos;
+#endif
+}
+
 static void qwen35_kv_store_row(struct ds4_session *s, uint32_t il, uint32_t pos,
                                 uint32_t half, const float *row) {
+    qwen35_kv4_ensure(s, il, pos);
     const uint32_t KV = DS4_N_HEAD_KV, HD = DS4_N_HEAD_DIM;
     const uint32_t cap = (uint32_t)s->ctx_size;
     const uint32_t win = QWEN35_KV_WINDOW;
@@ -78733,6 +78766,10 @@ static void qwen35_cpu_forward_batch(
             const uint8_t *kvq4 = s->qwen35_cpu_kvq4[il];
             const float *kvqs = s->qwen35_cpu_kvqs[il];
             const uint32_t kv_cap = (uint32_t)s->ctx_size;
+            /* phase_a writes the four-bit tier from inside the workers, so the rows
+             * this batch will touch are committed here, before they start. */
+            if (pos0 + n_tok > QWEN35_KV_TIER1)
+                qwen35_kv4_ensure(s, il, pos0 + n_tok - 1u);
             struct timespec at0, at1;
             clock_gettime(CLOCK_MONOTONIC, &at0);
             /* Two phases instead of one loop, see qwen35_attn_phase_a. */
@@ -87286,8 +87323,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                 xmalloc((size_t)2u * QWEN35_KV_WINDOW * row_f);
                         s->qwen35_cpu_kvq[il] = xmalloc(
                                 (size_t)2u * (size_t)QWEN35_KV_TIER1 * row_b);
-                        s->qwen35_cpu_kvq4[il] = xmalloc(
-                                (size_t)2u * (size_t)ctx_size * (row_b / 2u));
+                        {
+                            const size_t need4 =
+                                    (size_t)2u * (size_t)ctx_size * (row_b / 2u);
+                            void *p4 = NULL;
+#if defined(_WIN32)
+                            p4 = VirtualAlloc(NULL, need4, MEM_RESERVE, PAGE_READWRITE);
+#endif
+                            if (!p4) p4 = calloc(1, need4);
+                            if (!p4) ds4_die("out of memory reserving KV tier 3");
+                            s->qwen35_cpu_kvq4[il] = (uint8_t *)p4;
+                            s->qwen35_cpu_kvq4_commit[il] =
+                                    (getenv("DS4_NO_KV_ONDEMAND") != NULL)
+                                            ? (uint32_t)ctx_size
+                                            : 0u;
+                        }
                         s->qwen35_cpu_kvqs[il] = xmalloc(
                                 (size_t)2u * (size_t)ctx_size * DS4_N_HEAD_KV *
                                 sizeof(float));

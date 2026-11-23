@@ -79196,6 +79196,93 @@ static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
 
 #endif /* !DS4_NO_GPU */
 
+/* Single-token attention, vectorised and spread over the heads.
+ *
+ * The scalar form this replaces was 1.5 seconds per token at nine thousand tokens of
+ * context - one float multiply-add per cycle down a dependency chain, on one thread,
+ * with the value accumulation running positions on the inner loop and striding four
+ * kilobytes between them. Same arithmetic, laid out so it costs what it should: eight
+ * lanes at a time on the dot product, the value accumulation taking the feature axis as
+ * its inner loop so the loads are contiguous, the modulo against the ring capacity
+ * hoisted out because a decode position never exceeds the context, and the heads handed
+ * to the worker pool rather than the main thread.
+ *
+ * The softmax runs online, like the batch path, so it needs no score buffer. */
+typedef struct {
+    const float *q2, *gate, *kv, *kv_v, *out;
+    uint32_t H, KV, HD, visible, kv_cap;
+    float scale;
+} qwen35_dec_attn_work;
+
+static void qwen35_dec_attn_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    qwen35_dec_attn_work *w = vctx;
+    const uint32_t HD = w->HD, KV = w->KV;
+    const uint64_t kvrow = (uint64_t)KV * HD;
+    const uint32_t nacc = HD < 512u ? HD : 512u;
+    const uint32_t visible = w->visible;
+    for (uint64_t h = h0; h < h1; h++) {
+        const uint32_t kh = (uint32_t)h / (w->H / KV);
+        const float *qh = w->q2 + h * HD;
+        const float *kp0 = w->kv + (uint64_t)kh * HD;
+        const float *vp0 = w->kv_v + (uint64_t)kh * HD;
+        float oacc[512];
+        float mx;
+        double ss;
+        for (uint32_t i = 0; i < nacc; i++) oacc[i] = 0.0f;
+        {   /* seed from the first position, never from infinity: this unit is built
+             * with -ffast-math, which assumes no operand is ever infinite. */
+            __m256 a = _mm256_setzero_ps();
+            uint32_t i = 0;
+            for (; i + 8u <= HD; i += 8u)
+                a = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
+                                    _mm256_loadu_ps(kp0 + i), a);
+            float d = qwen35_hsum_ps256(a);
+            for (; i < HD; i++) d += qh[i] * kp0[i];
+            mx = d * w->scale;
+            ss = 1.0;
+            i = 0;
+            for (; i + 8u <= nacc; i += 8u)
+                _mm256_storeu_ps(oacc + i, _mm256_loadu_ps(vp0 + i));
+            for (; i < nacc; i++) oacc[i] = vp0[i];
+        }
+        for (uint32_t t = 1; t < visible; t++) {
+            const uint32_t pp = (t < w->kv_cap) ? t : (t % w->kv_cap);
+            const float *kp = kp0 + (uint64_t)pp * kvrow;
+            __m256 a = _mm256_setzero_ps();
+            uint32_t i = 0;
+            for (; i + 8u <= HD; i += 8u)
+                a = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
+                                    _mm256_loadu_ps(kp + i), a);
+            float d = qwen35_hsum_ps256(a);
+            for (; i < HD; i++) d += qh[i] * kp[i];
+            const float s = d * w->scale;
+            if (s > mx) {
+                const float c = expf(mx - s);
+                ss *= c;
+                for (uint32_t q = 0; q < nacc; q++) oacc[q] *= c;
+                mx = s;
+            }
+            const float pv = expf(s - mx);
+            ss += pv;
+            const float *vp = vp0 + (uint64_t)pp * kvrow;
+            const __m256 sv = _mm256_set1_ps(pv);
+            i = 0;
+            for (; i + 8u <= nacc; i += 8u)
+                _mm256_storeu_ps(oacc + i,
+                                 _mm256_fmadd_ps(sv, _mm256_loadu_ps(vp + i),
+                                                 _mm256_loadu_ps(oacc + i)));
+            for (; i < nacc; i++) oacc[i] += pv * vp[i];
+        }
+        const float inv = 1.0f / (float)ss;
+        const float *gt = w->gate + h * HD;
+        float *oh = w->out + h * HD;
+        for (uint32_t i = 0; i < HD; i++) {
+            const float o = (i < nacc) ? oacc[i] : 0.0f;
+            oh[i] = o * inv * (1.0f / (1.0f + expf(-gt[i])));
+        }
+    }
+}
+
 static void qwen35_cpu_forward_token(
         float *logits, const ds4_model *m, const ds4_weights *w,
         ds4_session *s, int token, uint32_t pos) {
@@ -79333,30 +79420,17 @@ static void qwen35_cpu_forward_token(
                    v2, (size_t)KV * HD * sizeof(float));
             const uint32_t visible = pos + 1u;
             const float scale = 1.0f / sqrtf((float)HD);
-            for (uint32_t h = 0; h < H; h++) {
-                const uint32_t kh = h / (H / KV); /* GQA: h/6, not h%KV */
-                for (uint32_t t = 0; t < visible; t++) {
-                    const uint32_t p = t % kv_cap;
-                    float d = 0.0f;
-                    for (uint32_t i = 0; i < HD; i++)
-                        d += q2[(uint64_t)h * HD + i] *
-                             kv[(uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
-                    score[t] = d * scale;
-                }
-                float mx = score[0];
-                for (uint32_t t = 1; t < visible; t++) mx = fmaxf(mx, score[t]);
-                double ss = 0.0;
-                for (uint32_t t = 0; t < visible; t++) { score[t] = expf(score[t] - mx); ss += score[t]; }
-                for (uint32_t i = 0; i < HD; i++) {
-                    float o = 0.0f;
-                    for (uint32_t t = 0; t < visible; t++) {
-                        const uint32_t p = t % kv_cap;
-                        o += score[t] * kv[(uint64_t)(kv_cap * KV * HD) +
-                                            (uint64_t)p * KV * HD + (uint64_t)kh * HD + i];
-                    }
-                    ff_b[(uint64_t)h * HD + i] = o / (float)ss *
-                            (1.0f / (1.0f + expf(-gate[h * HD + i])));
-                }
+            {
+                qwen35_dec_attn_work aw;
+                aw.q2 = q2;
+                aw.gate = gate;
+                aw.kv = kv;
+                aw.kv_v = kv + (uint64_t)kv_cap * KV * HD;
+                aw.out = ff_b;
+                aw.H = H; aw.KV = KV; aw.HD = HD;
+                aw.visible = visible; aw.kv_cap = kv_cap;
+                aw.scale = scale;
+                ds4_parallel_for(H, qwen35_dec_attn_worker, &aw);
             }
             PROF_TOCK(t_att);
             PROF_TICK();

@@ -66488,6 +66488,9 @@ struct ds4_session {
     float *qwen35_cpu_conv_hist[DS4_MAX_LAYER];
     float *qwen35_cpu_ssm_state[DS4_MAX_LAYER];
     float *qwen35_cpu_kv[DS4_MAX_LAYER]; /* (cap x KV x HD) k and v halves */
+    /* Non-zero when that layer's KV came from VirtualAlloc with large pages, which
+     * has to be released with VirtualFree rather than free. */
+    uint8_t qwen35_cpu_kv_lp[DS4_MAX_LAYER];
     float *qwen35_cpu_buf[12]; /* scratch: qkv,z,tmp,lin_o,ff_a,ff_b,blk,xn,q,k,v,score */
     block_q8_K *qwen35_cpu_q8; /* Q8_K quantized activations (FFN dim) */
     bool qwen35_cpu_ready;
@@ -86903,9 +86906,43 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                     DS4_N_LIN_HEAD_DIM,
                             sizeof(float));
                 } else {
-                    s->qwen35_cpu_kv[il] = xcalloc(
-                            (size_t)ctx_size * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u,
-                            sizeof(float));
+                {
+                    /* Large pages, like the weights.
+                     *
+                     * At a thousand tokens of context one layer's cache is eight
+                     * megabytes, which on four-kilobyte pages is two thousand TLB
+                     * entries per layer and sixty-five thousand across the attention
+                     * layers - enough to thrash a TLB that holds a few thousand. The
+                     * same buffer on two-megabyte pages is four entries per layer.
+                     * This is the last large resident buffer in the engine still on
+                     * ordinary pages. */
+                    const size_t kv_row = (size_t)DS4_N_HEAD_KV *
+                                          DS4_N_HEAD_DIM * 2u * sizeof(float);
+                    const size_t kv_need = (size_t)ctx_size * kv_row;
+                    void *kvp = NULL;
+#if defined(_WIN32)
+                    if (getenv("DS4_NO_LARGE_PAGE_KV") == NULL) {
+                        extern void ds4_win_enable_lock_memory(void);
+                        ds4_win_enable_lock_memory();
+                        const SIZE_T lpk = GetLargePageMinimum();
+                        if (lpk) {
+                            const size_t rounds =
+                                    (kv_need + (size_t)lpk - 1u) / (size_t)lpk;
+                            kvp = VirtualAlloc(NULL, rounds * (size_t)lpk,
+                                               MEM_RESERVE | MEM_COMMIT |
+                                                       MEM_LARGE_PAGES,
+                                               PAGE_READWRITE);
+                        }
+                    }
+#endif
+                    s->qwen35_cpu_kv_lp[il] = kvp ? 1u : 0u;
+                    if (!kvp)
+                        kvp = calloc((size_t)ctx_size,
+                                     (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u *
+                                             sizeof(float));
+                    if (!kvp) ds4_die("out of memory allocating KV");
+                    s->qwen35_cpu_kv[il] = (float *)kvp;
+                }
                 }
             }
             s->qwen35_cpu_ready = true;
@@ -87418,6 +87455,11 @@ void ds4_session_free(ds4_session *s) {
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 free(s->qwen35_cpu_conv_hist[il]);
                 free(s->qwen35_cpu_ssm_state[il]);
+    #if defined(_WIN32)
+            if (s->qwen35_cpu_kv_lp[il] && s->qwen35_cpu_kv[il])
+                VirtualFree(s->qwen35_cpu_kv[il], 0, MEM_RELEASE);
+            else
+#endif
                 free(s->qwen35_cpu_kv[il]);
             }
             for (int b = 0; b < 12; b++) free(s->qwen35_cpu_buf[b]);

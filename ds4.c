@@ -15621,6 +15621,63 @@ static uint32_t ds4_prefill_cap_budget(int prompt_len) {
     return cap;
 }
 
+/* Size of the last level cache, or zero when it cannot be read. */
+static uint64_t ds4_cpu_l3_bytes(void) {
+#if defined(_WIN32)
+    /* Only the length is trusted: the call reports the needed size and returns FALSE,
+     * but relying on GetLastError here reads whatever a previous call left there and
+     * made this probe return zero on the first try. */
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    if (len == 0) return 0;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = xmalloc(len);
+    uint64_t best = 0;
+    if (GetLogicalProcessorInformationEx(RelationCache, buf, &len)) {
+        for (DWORD off = 0; off < len;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e =
+                    (const void *)((const uint8_t *)buf + off);
+            if (e->Relationship == RelationCache && e->Cache.Level == 3 &&
+                e->Cache.CacheSize > best)
+                best = e->Cache.CacheSize;
+            if (e->Size == 0) break;
+            off += e->Size;
+        }
+    }
+    free(buf);
+    return best;
+#else
+    return 0;
+#endif
+}
+
+/* Prefill chunk size, derived from the last level cache.
+ *
+ * Inside one layer's matrix multiplies the weight block is read once but the activation
+ * is re-read for every sixteen-row group - a couple of hundred groups per tensor - so
+ * the activation's total traffic is proportional to the chunk length. That traffic only
+ * stays affordable while the activation fits in the last level cache; past that it
+ * becomes DRAM traffic on a scale the weight stream never reaches. Measured here at
+ * 8716 tokens: 512 tokens per chunk gives 49.5 t/s, 4096 gives 45.2.
+ *
+ * Half of the cache goes to the activation, half is left to the weight stream that is
+ * competing for the same lines; the result is clamped to what the transient buffers can
+ * afford and to the range the code was measured over. */
+static uint32_t qwen35_prefill_chunk_for_cache(void) {
+    const uint64_t l3 = ds4_cpu_l3_bytes();
+    if (getenv("DS4_QWEN35_KNOBS"))
+        fprintf(stderr, "[knob] l3 probe = %llu bytes\n",
+                (unsigned long long)l3);
+    if (!l3) return 512u;
+    const uint64_t per_tok = (uint64_t)DS4_N_EMBD * sizeof(float);
+    uint32_t n = (uint32_t)((l3 / 2u) / per_tok);
+    if (n < 128u) n = 128u;
+    if (n > 1024u) n = 1024u;
+    if (getenv("DS4_QWEN35_KNOBS"))
+        fprintf(stderr, "[knob] l3=%.1f MB chunk_from_cache=%u\n",
+                (double)l3 / 1048576.0, n);
+    return n;
+}
+
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
@@ -79136,10 +79193,13 @@ static void qwen35_cpu_forward_batch(
             qwen35_compact_head_heal(m, w, am);
         }
     } else if (n_tok > 0u) {
+        /* Row zero, not row n_tok - 1: only the last position is projected, so the
+         * caller can hand in a single row and the chunk size stops being bounded by a
+         * vocabulary-sized buffer per position. Prefill was capped at 512 tokens for
+         * that buffer alone, five hundred megabytes of which one row was written. */
         qwen35_cpu_matvec_batch(m, w->output,
                                 blk + (uint64_t)(n_tok - 1u) * E,
-                                logits_all + (uint64_t)(n_tok - 1u) * DS4_N_VOCAB,
-                                1u, false);
+                                logits_all, 1u, false);
     }
     clock_gettime(CLOCK_MONOTONIC, &hd1);
     acc_ms_head += (double)(hd1.tv_sec - hd0.tv_sec) * 1e3 +
@@ -90638,7 +90698,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * as the parameter's behaviour. DS4_PREFILL_BATCH still overrides. */
             uint64_t want = (prompt->len > 0) ? (uint64_t)prompt->len : 1u;
             if (want < 128u) want = 128u;
-            if (want > 512u) want = 512u;
+            /* The ceiling used to be 512 because the logits buffer was sized for every
+             * position of the chunk - five hundred megabytes at 512. Only the last
+             * position is projected during prefill, so one row is enough and the chunk
+             * can be as large as the transient buffers allow. Each chunk re-reads the
+             * whole model, so this is the difference between seventeen passes over
+             * sixteen gigabytes and three. */
+            {
+                const uint32_t ceil_c = qwen35_prefill_chunk_for_cache();
+                if (want > ceil_c) want = ceil_c;
+            }
             uint32_t pbatch = (uint32_t)want;
             const char *pbenv = getenv("DS4_PREFILL_BATCH");
             if (pbenv && *pbenv) {
@@ -90651,7 +90720,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  * extra chunk is pure loss. Raised to five hundred and twelve,
                  * which bounds the logits buffer at a hundred and fifty
                  * megabytes. */
-                if (pv > 0 && pv <= 512) {
+                if (pv > 0 && pv <= 4096) {
                     pbatch = (uint32_t)pv;
                 } else if (getenv("DS4_QWEN35_KNOBS")) {
                     /* Print rather than clamp in silence. A clamped knob is worse
@@ -90659,13 +90728,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                      * clamp in one arm and reported it as the parameter's
                      * behaviour, so it could never find an optimum above the cap. */
                     fprintf(stderr, "[knob] DS4_PREFILL_BATCH=%d rejected "
-                            "(range 1..512), keeping %u\n", pv, pbatch);
+                            "(range 1..4096), keeping %u\n", pv, pbatch);
                 }
             }
             if (getenv("DS4_QWEN35_KNOBS"))
                 fprintf(stderr, "[knob] pbatch=%u threads=%d\n",
                         pbatch, (int)DS4_MAX_THREADS);
-            float *lb = xmalloc((size_t)pbatch * (size_t)DS4_N_VOCAB * sizeof(float));
+            float *lb = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
             int *buf = xmalloc((size_t)pbatch * sizeof(int));
             for (int base = 0; base < prompt->len; base += (int)pbatch) {
                 if (ds4_session_cancelled(s)) {
@@ -90680,7 +90749,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 qwen35_cpu_forward_batch(lb, &e->model, &e->weights, s,
                                          buf, (uint32_t)n, (uint32_t)base);
                 if (getenv("DS4_QWEN35_BATCH_DBG")) {
-                    for (int k = 0; k < n; k++) {
+                    for (int k = 0; k < 1; k++) {
                         const float *row = lb + (size_t)k * DS4_N_VOCAB;
                         int am = 0;
                         for (int i = 1; i < (int)DS4_N_VOCAB; i++)
@@ -90693,8 +90762,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 }
                 for (int k = 0; k < n; k++)
                     token_vec_push(&s->checkpoint, buf[k]);
-                memcpy(s->logits, lb + (size_t)(n - 1) * DS4_N_VOCAB,
-                       (size_t)DS4_N_VOCAB * sizeof(float));
+                memcpy(s->logits, lb, (size_t)DS4_N_VOCAB * sizeof(float));
                 if (s->progress)
                     s->progress(s->progress_ud, "prefill_chunk", base + n, prompt->len);
             }

@@ -78496,16 +78496,35 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             }
             const float pv = expf(s - mx);
             ss += pv;
-            const float *restrict vr = qwen35_kv_row(
-                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                    pos, x, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, vbuf);
-            const __m256 sv = _mm256_set1_ps(pv);
-            uint32_t i = 0;
-            for (; i + 8u <= nacc; i += 8u)
-                _mm256_storeu_ps(oacc + i,
-                                 _mm256_fmadd_ps(sv, _mm256_loadu_ps(vr + i),
-                                                 _mm256_loadu_ps(oacc + i)));
-            for (; i < nacc; i++) oacc[i] += pv * vr[i];
+            if (x >= win0) {
+                const float *restrict vr = w->kv + (uint64_t)QWEN35_KV_WINDOW * halfrow +
+                                           (uint64_t)(x % QWEN35_KV_WINDOW) * halfrow +
+                                           krow;
+                const __m256 sv = _mm256_set1_ps(pv);
+                uint32_t i = 0;
+                for (; i + 8u <= nacc; i += 8u)
+                    _mm256_storeu_ps(oacc + i,
+                                     _mm256_fmadd_ps(sv, _mm256_loadu_ps(vr + i),
+                                                     _mm256_loadu_ps(oacc + i)));
+                for (; i < nacc; i++) oacc[i] += pv * vr[i];
+            } else {
+                /* The eight-bit tier is [2][TIER1][KV][HD]: the value half starts at
+                 * TIER1 * halfrow, not at the context size. Getting that wrong shifted
+                 * every value row and the logits went with it. */
+                const float vs = w->kvqs[(uint64_t)w->kv_cap * nKV +
+                                         (uint64_t)x * nKV + kh];
+                if (x < QWEN35_KV_TIER1) {
+                    qwen35_kv_acc8(oacc,
+                                   w->kvq + (uint64_t)QWEN35_KV_TIER1 * halfrow +
+                                            (uint64_t)x * halfrow + krow,
+                                   vs, pv, nacc);
+                } else {
+                    qwen35_kv_acc4(oacc,
+                                   w->kvq4 + (uint64_t)w->kv_cap * (halfrow / 2u) +
+                                            (uint64_t)x * (halfrow / 2u) +
+                                            (uint64_t)(krow / 2u), vs, pv, nacc);
+                }
+            }
         }
         for (uint32_t i = 0; i < (uint32_t)nHD; i++) {
             /* Keep the division: the reciprocal form moved max abs diff from

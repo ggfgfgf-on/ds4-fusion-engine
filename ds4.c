@@ -78273,6 +78273,7 @@ typedef struct {
     const int8_t *kvq;
     const uint8_t *kvq4;
     const float *kvqs;
+    const float *kvsum;
     const float *qnorm, *knorm;
     float eps;
     uint32_t kv_cap, pos0, n_tok;
@@ -78431,6 +78432,11 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
         float mx;
         double ss;
         float kbuf[512], vbuf[512];
+        uint8_t qu[512];
+        const float qscale = qwen35_kv_quant_q(qh, qu, (uint32_t)nHD);
+        const uint32_t win0 = (visible > QWEN35_KV_WINDOW)
+                                      ? (visible - QWEN35_KV_WINDOW) : 0u;
+        const uint64_t halfrow = (uint64_t)nKV * nHD;
         {
             float k0b[512];
             const float *restrict k0 = qwen35_kv_row(
@@ -78456,16 +78462,31 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
             for (; i < nacc; i++) oacc[i] = v0[i];
         }
         for (uint32_t x = 1; x < visible; x++) {
-            const float *restrict kvr = qwen35_kv_row(
-                    w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
-                    pos, x, 0u, (uint32_t)nKV, (uint32_t)nHD, kh, kbuf);
-            __m256 acc = _mm256_setzero_ps();
-            uint32_t i = 0;
-            for (; i + 8u <= nHD; i += 8u)
-                acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
-                                      _mm256_loadu_ps(kvr + i), acc);
-            float dd = qwen35_hsum_ps256(acc);
-            for (; i < nHD; i++) dd += qh[i] * kvr[i];
+            float dd;
+            if (x >= win0) {
+                const float *restrict kvr =
+                        w->kv + (uint64_t)(x % QWEN35_KV_WINDOW) * halfrow + krow;
+                __m256 acc = _mm256_setzero_ps();
+                uint32_t i = 0;
+                for (; i + 8u <= nHD; i += 8u)
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + i),
+                                          _mm256_loadu_ps(kvr + i), acc);
+                dd = qwen35_hsum_ps256(acc);
+                for (; i < nHD; i++) dd += qh[i] * kvr[i];
+            } else {
+                const float ks = w->kvqs[(uint64_t)x * nKV + kh];
+                const float ksum = w->kvsum[(uint64_t)x * nKV + kh];
+                if (x < QWEN35_KV_TIER1) {
+                    dd = qwen35_kv_dotq(qu, w->kvq + (uint64_t)x * halfrow + krow,
+                                        ksum, qscale, ks, (uint32_t)nHD);
+                } else {
+                    int8_t k4[512];
+                    qwen35_kv_unpack4(w->kvq4 + (uint64_t)x * (halfrow / 2u) +
+                                              (uint64_t)(krow / 2u), k4,
+                                      (uint32_t)nHD);
+                    dd = qwen35_kv_dotq(qu, k4, ksum, qscale, ks, (uint32_t)nHD);
+                }
+            }
             const float s = dd * scale;
             if (s > mx) {
                 const float corr = expf(mx - s);   /* first entry: exp(-inf) is 0 */
@@ -78479,7 +78500,7 @@ static void qwen35_attn_phase_b(void *vctx, uint64_t u0, uint64_t u1) {
                     w->kv, w->kvq, w->kvq4, w->kvqs, w->kv_cap, QWEN35_KV_WINDOW,
                     pos, x, 1u, (uint32_t)nKV, (uint32_t)nHD, kh, vbuf);
             const __m256 sv = _mm256_set1_ps(pv);
-            i = 0;
+            uint32_t i = 0;
             for (; i + 8u <= nacc; i += 8u)
                 _mm256_storeu_ps(oacc + i,
                                  _mm256_fmadd_ps(sv, _mm256_loadu_ps(vr + i),
@@ -78902,6 +78923,7 @@ static void qwen35_cpu_forward_batch(
             aw.qkv = qkv; aw.gate = gate; aw.k2 = k2; aw.v2 = v2; aw.q2 = q2;
             aw.kv = kv; aw.score = score; aw.attn_o = attn_o;
             aw.kvq = kvq; aw.kvq4 = kvq4; aw.kvqs = kvqs;
+            aw.kvsum = s->qwen35_cpu_kvsum[il];
             aw.qnorm = qnorm; aw.knorm = knorm; aw.eps = eps;
             aw.kv_cap = kv_cap; aw.pos0 = pos0; aw.n_tok = n_tok;
             aw.nH = H; aw.nKV = KV; aw.nHD = HD; aw.nC = C; aw.nQW = QW;
@@ -87500,8 +87522,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                 xmalloc((size_t)2u * QWEN35_KV_WINDOW * row_f);
                         s->qwen35_cpu_kvq[il] = xmalloc(
                                 (size_t)2u * (size_t)QWEN35_KV_TIER1 * row_b);
-                        s->qwen35_cpu_kvsum[il] = xmalloc(
-                                (size_t)ctx_size * DS4_N_HEAD_KV * sizeof(float));
+                        /* Zeroed: a position the attention reaches before it was stored
+                         * must read as zero rather than as whatever the allocator had.
+                         * The uninitialised scales made long-context generation differ
+                         * between runs. */
+                        s->qwen35_cpu_kvsum[il] = xcalloc(
+                                (size_t)ctx_size * DS4_N_HEAD_KV, sizeof(float));
                         {
                             const size_t need4 =
                                     (size_t)2u * (size_t)ctx_size * (row_b / 2u);
@@ -87517,8 +87543,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                             ? (uint32_t)ctx_size
                                             : 0u;
                         }
-                        s->qwen35_cpu_kvqs[il] = xmalloc(
-                                (size_t)2u * (size_t)ctx_size * DS4_N_HEAD_KV *
+                        s->qwen35_cpu_kvqs[il] = xcalloc(
+                                (size_t)2u * (size_t)ctx_size * DS4_N_HEAD_KV,
                                 sizeof(float));
                     }
                 }

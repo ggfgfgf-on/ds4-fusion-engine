@@ -77968,7 +77968,8 @@ static double g_gdn_conv_ms = 0.0, g_gdn_scan_ms = 0.0;
  * is 327 thousand elements each time, 65 layers, so around 64 million additions
  * per pass with nobody else helping. There is no dependence anywhere in it. */
 typedef struct {
-    float *dst, *src;
+    float *dst;
+    const float *src;   /* read only; the worker never writes it */
     uint64_t n, chunk;
 } qwen35_add_work;
 
@@ -77997,7 +77998,8 @@ static void qwen35_add_par(float *dst, const float *src, uint64_t n) {
 /* Per-token RMS norm over a contiguous range of tokens. Same arithmetic as
  * qwen4_ref_rms, called once per token, just no longer on one thread. */
 typedef struct {
-    float *out, *src;
+    float *out;
+    const float *src;   /* read only */
     const float *w;
     uint64_t e, n_tok;
     float eps;
@@ -78433,7 +78435,7 @@ typedef struct {
     const int8_t *kvq;
     const uint8_t *kvq4;
     const float *kvqs;
-    const float *kvsum;
+    float *kvsum;       /* written by phase_a, read by phase_b */
     const float *qnorm, *knorm;
     float eps;
     uint32_t kv_cap, pos0, n_tok;
@@ -79840,7 +79842,8 @@ static int qwen35_gpu_head_logits(const float *hidden, float *logits) {
  *
  * The softmax runs online, like the batch path, so it needs no score buffer. */
 typedef struct {
-    const float *q2, *gate, *kv, *out;
+    const float *q2, *gate, *kv;
+    float *out;         /* written by the worker */
     const int8_t *kvq;
     const uint8_t *kvq4;
     const float *kvqs;

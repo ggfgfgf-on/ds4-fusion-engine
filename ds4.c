@@ -78990,7 +78990,11 @@ static void qwen35_cpu_forward_batch(
             clock_gettime(CLOCK_MONOTONIC, &gt1);
             gdn_ms += (double)(gt1.tv_sec - gt0.tv_sec) * 1e3 +
                       (double)(gt1.tv_nsec - gt0.tv_nsec) / 1e6;
-            g_gdn_scan_ms = gdn_ms;
+            /* gdn_ms spans the whole GDN section and already contains gdn2_ms, which the
+             * conv timer reports on its own. Reporting both in full made the phase
+             * ledger add up to more than the wall time, so the remainder came out
+             * negative and the accounting was useless. */
+            g_gdn_scan_ms = gdn_ms - gdn2_ms;
             if (getenv("DS4_QWEN35_PHASE_DBG") && il == 0)
                 fprintf(stderr, "[phase] gdn_total=%.1f ms\n", gdn_ms);
             if (!getenv("DS4_QWEN35_NO_WHOLE_SCAN")) {

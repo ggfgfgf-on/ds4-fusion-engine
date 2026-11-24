@@ -79506,18 +79506,24 @@ static void qwen35_cpu_mtp_forward_h(
         for (uint32_t t = 1; t < visible; t++) mx = fmaxf(mx, score[t]);
         double ss = 0.0;
         for (uint32_t t = 0; t < visible; t++) { score[t] = expf(score[t] - mx); ss += score[t]; }
-        for (uint32_t i = 0; i < HD; i++) {
-            float o = 0.0f;
-            for (uint32_t t = 0; t < visible; t++) {
-                float mrow[512];
-                const float *mptr = qwen35_kv_row(
-                        kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
-                        KV, HD, kh, mrow);
-                o += score[t] * mptr[i];
-            }
-            ff_b[(uint64_t)h * HD + i] = o / (float)ss *
-                    (1.0f / (1.0f + expf(-gate[h * HD + i])));
+        /* Position outside, feature inside: the row for every position is fetched and
+         * dequantised once instead of once per feature. The draft attends once per link
+         * per draft, and at nine thousand tokens of transcript that inner call ran
+         * against eight thousand positions per head either way, but the old order paid
+         * the dequantisation two hundred and fifty-six times over. */
+        float oacc_mtp[512];
+        for (uint32_t i = 0; i < HD; i++) oacc_mtp[i] = 0.0f;
+        for (uint32_t t = 0; t < visible; t++) {
+            float mrow[512];
+            const float *mptr = qwen35_kv_row(
+                    kvh, kvq, kvq4, kvqs, kv_cap, QWEN35_KV_WINDOW, dpos, t, 1u,
+                    KV, HD, kh, mrow);
+            const float pv = score[t];
+            for (uint32_t i = 0; i < HD; i++) oacc_mtp[i] += pv * mptr[i];
         }
+        for (uint32_t i = 0; i < HD; i++)
+            ff_b[(uint64_t)h * HD + i] = oacc_mtp[i] / (float)ss *
+                    (1.0f / (1.0f + expf(-gate[h * HD + i])));
     }
     qwen35_cpu_matvec(m, l->attn_output, ff_b, blk, s->qwen35_cpu_q8, mtp_exact);
     for (uint32_t i = 0; i < E; i++) blk[i] += inpSA[i];

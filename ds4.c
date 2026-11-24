@@ -78505,6 +78505,20 @@ static void qwen35_attn_phase_a(void *vctx, uint64_t t0, uint64_t t1) {
                              (uint64_t)ip * nKV * nHD;
                 qwen35_kv_quant_row(kt, kq, ks, (uint32_t)nKV, (uint32_t)nHD);
                 qwen35_kv_quant_row(vt, vq, vs, (uint32_t)nKV, (uint32_t)nHD);
+                /* The key row sums that the integer dot needs to undo the query's 128
+                 * bias. Only the single-token store filled them, so every key written by
+                 * a batch carried a zero correction and the attention had a systematic
+                 * error - deterministic, so it survived a correctness check that only
+                 * looked for the right answer, and large enough to matter. */
+                {
+                    float *sum = w->kvsum + (uint64_t)ip * nKV;
+                    for (uint32_t k = 0; k < (uint32_t)nKV; k++) {
+                        int32_t acc = 0;
+                        const int8_t *qq = kq + (uint64_t)k * nHD;
+                        for (uint32_t i = 0; i < (uint32_t)nHD; i++) acc += qq[i];
+                        sum[k] = (float)acc;
+                    }
+                }
             } else {
                 const uint64_t half_row = (uint64_t)nKV * (nHD / 2u);
                 uint8_t *kq = (uint8_t *)w->kvq4 + (uint64_t)kv_pos * half_row;

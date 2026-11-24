@@ -78853,6 +78853,13 @@ static void qwen35_cpu_forward_batch(
     double attn_ms = 0.0, gdn_batch_ms = 0.0;
     QPH_INIT();
     acc_ms = 0.0; acc_calls = 0; acc_bytes = 0; acc_q4 = 0; acc_q6 = 0;
+    /* The phase counters are printed against this call's wall time, so they have to be
+     * this call's counters. They were cumulative, which is why the remainder always came
+     * out negative and nothing in the ledger could be read. */
+    g_ph.rms = g_ph.matvec = g_ph.gdn = g_ph.attn = 0.0;
+    g_ph.silu = g_ph.add = g_ph.head = 0.0;
+    g_gdn_conv_ms = g_gdn_scan_ms = 0.0;
+    acc_ms_head = acc_ms_draft = 0.0;
     acc_tok_sum = 0; acc_tok_max = 0; acc_tensors = 0;
     clock_gettime(CLOCK_MONOTONIC, &bf0);
     const uint32_t OW = Hv * D;           /* the GDN output width */
@@ -78927,10 +78934,10 @@ static void qwen35_cpu_forward_batch(
             /* tmp rows are lin_out's input width, NOT C (they differ). */
             const uint32_t TW = (uint32_t)l->lin_out->dim[0];
             int gdn_ga_gb_pre = 0;
-            static double gdn2_ms = 0.0;
+            double gdn2_ms = 0.0;   /* per call, like the phase ledger */
             struct timespec g2a, g2b;
             clock_gettime(CLOCK_MONOTONIC, &g2a);
-            static double gdn_ms = 0.0;
+            double gdn_ms = 0.0;    /* per call */
             struct timespec gt0, gt1;
             clock_gettime(CLOCK_MONOTONIC, &gt0);
             /* Every token's alpha and beta in two regions, not 2 * n_tok. */

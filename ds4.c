@@ -73922,6 +73922,45 @@ static void qwen35_cpu_rope(float *row, int32_t pos) {
  * attention weight a position carries falls with its distance. */
 #define QWEN35_KV_TIER1 16384u
 
+/* Shared by the two row quantisers.
+ *
+ * The scalar form spent a multiply, an lrintf and two compares on every value and
+ * another compare on the maximum pass; a four hundred value row, sixteen layers, every
+ * position of a long transcript is a lot of scalar work. Eight values move per
+ * iteration here: andnot clears the sign for the maximum, and the scaled values are
+ * widened, clamped and packed with two signed packs. */
+static inline float qwen35_kv_hmax(__m256 v) {
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 0x55));
+    return _mm_cvtss_f32(m);
+}
+
+static inline float qwen35_kv_maxabs(const float *s, uint32_t n) {
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    __m256 mx = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 8u <= n; i += 8u)
+        mx = _mm256_max_ps(mx, _mm256_andnot_ps(sign, _mm256_loadu_ps(s + i)));
+    float m = qwen35_kv_hmax(mx);
+    for (; i < n; i++) {
+        const float a = fabsf(s[i]);
+        if (a > m) m = a;
+    }
+    return m;
+}
+
+static inline void qwen35_kv_pack8(const float *s, float g, int8_t *d, int32_t lo,
+                                   int32_t hi) {
+    const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(s), _mm256_set1_ps(g));
+    const __m256i q = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_cvtps_epi32(v), _mm256_set1_epi32(lo)),
+            _mm256_set1_epi32(hi));
+    const __m128i a = _mm_packs_epi32(_mm256_castsi256_si128(q),
+                                      _mm256_extracti128_si256(q, 1));
+    _mm_storel_epi64((__m128i *)d, _mm_packs_epi16(a, a));
+}
+
 /* Eight-bit rows: one byte per value, one scale per (token, head). */
 static void qwen35_kv_quant_row(const float *src, int8_t *dst, float *sc,
                                 uint32_t KV, uint32_t HD);
@@ -73929,25 +73968,24 @@ static void qwen35_kv_quant_row(const float *src, int8_t *dst, float *sc,
 /* Four-bit rows: two values packed per byte, one scale per (token, head). */
 static void qwen35_kv_quant_row4(const float *src, uint8_t *dst, float *sc,
                                  uint32_t KV, uint32_t HD) {
+    int8_t t8[512];
     for (uint32_t h = 0; h < KV; h++) {
         const float *s = src + (uint64_t)h * HD;
-        float mxv = 0.0f;
-        for (uint32_t i = 0; i < HD; i++) {
-            const float a = fabsf(s[i]);
-            if (a > mxv) mxv = a;
-        }
-        const float step = mxv > 0.0f ? mxv / 7.0f : 0.0f;
+        const float mxv = qwen35_kv_maxabs(s, HD);
         const float g = mxv > 0.0f ? 7.0f / mxv : 0.0f;
-        sc[h] = step;
-        uint8_t *d = dst + (uint64_t)h * (HD / 2u);
-        for (uint32_t i = 0; i < HD; i += 2u) {
-            int lo = (int)lrintf(s[i] * g);
-            int hi = (int)lrintf(s[i + 1u] * g);
-            if (lo > 7) lo = 7; else if (lo < -7) lo = -7;
-            if (hi > 7) hi = 7; else if (hi < -7) hi = -7;
-            d[i / 2u] = (uint8_t)(((uint8_t)(lo & 0xF)) |
-                                  (uint8_t)(((uint8_t)(hi & 0xF)) << 4));
+        sc[h] = mxv > 0.0f ? mxv / 7.0f : 0.0f;
+        uint32_t i = 0;
+        for (; i + 8u <= HD; i += 8u) qwen35_kv_pack8(s + i, g, t8 + i, -7, 7);
+        for (; i < HD; i++) {
+            int v = (int)lrintf(s[i] * g);
+            if (v > 7) v = 7;
+            else if (v < -7) v = -7;
+            t8[i] = (int8_t)v;
         }
+        uint8_t *d = dst + (uint64_t)h * (HD / 2u);
+        for (uint32_t j = 0; j < HD; j += 2u)
+            d[j / 2u] = (uint8_t)(((uint8_t)(t8[j] & 0xF)) |
+                                  (uint8_t)(((uint8_t)(t8[j + 1u] & 0xF)) << 4));
     }
 }
 
@@ -73976,16 +74014,13 @@ static void qwen35_kv_quant_row(const float *src, int8_t *dst, float *sc,
                                 uint32_t KV, uint32_t HD) {
     for (uint32_t h = 0; h < KV; h++) {
         const float *s = src + (uint64_t)h * HD;
-        float mxv = 0.0f;
-        for (uint32_t i = 0; i < HD; i++) {
-            const float a = fabsf(s[i]);
-            if (a > mxv) mxv = a;
-        }
-        const float step = mxv > 0.0f ? mxv / 127.0f : 0.0f;
-        const float g = mxv > 0.0f ? 127.0f / mxv : 0.0f;
-        sc[h] = step;
         int8_t *d = dst + (uint64_t)h * HD;
-        for (uint32_t i = 0; i < HD; i++) {
+        const float mxv = qwen35_kv_maxabs(s, HD);
+        const float g = mxv > 0.0f ? 127.0f / mxv : 0.0f;
+        sc[h] = mxv > 0.0f ? mxv / 127.0f : 0.0f;
+        uint32_t i = 0;
+        for (; i + 8u <= HD; i += 8u) qwen35_kv_pack8(s + i, g, d + i, -127, 127);
+        for (; i < HD; i++) {
             int v = (int)lrintf(s[i] * g);
             if (v > 127) v = 127;
             else if (v < -127) v = -127;

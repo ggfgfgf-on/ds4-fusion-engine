@@ -101378,15 +101378,27 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 uint32_t n_lin = 0;
                 for (uint32_t il = 0; il < n_trunk_s; il++)
                     if (ds4_qwen4_layer_is_linear(il)) n_lin++;
-                float *snap = xmalloc((size_t)(n_lin * per) * sizeof(float));
+                /* Only when the forward will not write the per-position snapshots.
+                 *
+                 * The restore the accept path takes copies from those, and they cover
+                 * every point a partial accept can land on because the first token is
+                 * always accepted. A verify of two or more tokens therefore never reads
+                 * this buffer, and copying a hundred megabytes into it per round was
+                 * forty milliseconds of pure waste. With one token the partial path is
+                 * unreachable, so neither mechanism is needed. */
+                float *snap = NULL;
                 uint32_t nl = 0;
-                for (uint32_t il = 0; il < n_trunk_s; il++) {
-                    if (!ds4_qwen4_layer_is_linear(il)) continue;
-                    memcpy(snap + (uint64_t)nl * per, s->qwen35_cpu_ssm_state[il],
-                           (size_t)ssm_f * sizeof(float));
-                    memcpy(snap + (uint64_t)nl * per + ssm_f, s->qwen35_cpu_conv_hist[il],
-                           (size_t)conv_f * sizeof(float));
-                    nl++;
+                if (nt <= 1u) {
+                    snap = xmalloc((size_t)(n_lin * per) * sizeof(float));
+                    for (uint32_t il = 0; il < n_trunk_s; il++) {
+                        if (!ds4_qwen4_layer_is_linear(il)) continue;
+                        memcpy(snap + (uint64_t)nl * per, s->qwen35_cpu_ssm_state[il],
+                               (size_t)ssm_f * sizeof(float));
+                        memcpy(snap + (uint64_t)nl * per + ssm_f,
+                               s->qwen35_cpu_conv_hist[il],
+                               (size_t)conv_f * sizeof(float));
+                        nl++;
+                    }
                 }
                 float *lg = xmalloc((size_t)nt * (size_t)V * sizeof(float));
                 /* The accept check below reads lg[0], the logits of the first
@@ -101563,7 +101575,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                         return na;
                     }
                     /* Fallback: restore the pre-verify snapshot and replay the
-                     * survivors as one batch. */
+                     * survivors as one batch. Unreachable without a snapshot - a
+                     * partial accept needs nt >= 2, which is exactly when the
+                     * per-position restore above is taken - but refuse rather than
+                     * dereference null if that ever changes. */
+                    if (!snap) {
+                        snprintf(err, errlen, "speculative restore without a snapshot");
+                        free(lg);
+                        return -1;
+                    }
                     nl = 0;
                     for (uint32_t il = 0; il < n_trunk_s; il++) {
                         if (!ds4_qwen4_layer_is_linear(il)) continue;

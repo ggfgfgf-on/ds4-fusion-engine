@@ -68623,6 +68623,23 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
  * tolerance of 3.0, with the argmax agreeing - and that is within what the model
  * already tolerates from its own quantisation. DS4_QWEN35_NO_MTP_SPEC turns it off.
  */
+/* Whether a speculative round is worth starting at this transcript length.
+ *
+ * A round pays for a second attention over the whole transcript - the draft head walks
+ * the cache exactly as the trunk does - and then projects the compact vocabulary on top.
+ * The ledger puts that at 1633 of the round's 2501 milliseconds at 8716 tokens, to buy
+ * one and a half accepted tokens. Below a few thousand tokens the same draft costs
+ * almost nothing and the round wins; above it the round loses by more than two to one
+ * (measured 0.70 t/s with speculation against 1.57 without, at 8716). */
+static bool qwen35_spec_worth(uint32_t transcript) {
+    static long limit = -2;
+    if (limit == -2) {
+        const char *e = getenv("DS4_QWEN35_SPEC_MAX");
+        limit = e ? atol(e) : 4096;
+    }
+    return (long)transcript < limit;
+}
+
 static bool qwen35_mtp_spec_on(void) {
     static int on = -1;
     if (on < 0) on = getenv("DS4_QWEN35_NO_MTP_SPEC") == NULL;
@@ -79225,7 +79242,12 @@ static void qwen35_cpu_forward_batch(
      * the first decoded token speculate. A prompt of a hundred and seventeen
      * tokens is one chunk, so its draft is used immediately - the two percent of
      * prefill this costs buys forty percent off the first step. */
-    if (n_tok > 0 && qwen35_mtp_spec_on()) {
+    /* The draft walks the whole transcript to build one link, so past the crossover it
+     * costs more than the speculation it enables - 1633 of a 2501 millisecond round at
+     * 8716 tokens - and it was paid on every batch forward, plain decode included,
+     * because the gate only looked at the global switch. */
+    if (n_tok > 0 && qwen35_mtp_spec_on() &&
+        qwen35_spec_worth(pos0 + n_tok)) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));
         const uint32_t last_pos = pos0 + n_tok - 1;
@@ -80142,7 +80164,12 @@ static void qwen35_cpu_forward_token(
             return;
     }
     qwen35_cpu_matvec(m, w->output, blk, logits, s->qwen35_cpu_q8, false);
-    if (getenv("DS4_QWEN35_MTP_TEST") || qwen35_mtp_spec_on()) {
+    /* Same gate as the batch path: past the crossover the draft's walk over the whole
+     * transcript costs more than the speculation it enables, and this is the path plain
+     * decode takes - it runs one token at a time through here, so the draft was being
+     * paid once per token rather than once per round. */
+    if (getenv("DS4_QWEN35_MTP_TEST") ||
+        (qwen35_mtp_spec_on() && qwen35_spec_worth(pos + 1u))) {
         static int prev_draft = -1;
         static float prev_h[8192];
         static bool have_prev_h = false;
@@ -101314,6 +101341,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         if (ds4_session_is_cpu(s) && !s->distributed &&
             DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
             s->qwen35_mtp_draft_valid && qwen35_mtp_spec_on() &&
+            qwen35_spec_worth((uint32_t)s->checkpoint.len) &&
             max_tokens > 1 && accepted_cap > 1) {
             /* Batched speculative verify: run the target forward over
              * [t1, draft] in ONE batched pass (the weight rows are read once

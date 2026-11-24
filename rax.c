@@ -2720,7 +2720,7 @@ unsigned long raxTouch(raxNode *n) {
     debugf("Touching %p\n", (void*)n);
     unsigned long sum = 0;
     if (n->iskey) {
-        sum += (unsigned long)raxGetData(n);
+        sum += (unsigned long)(uintptr_t)raxGetData(n);
     }
 
     int numchildren = n->iscompr ? 1 : n->size;
@@ -2733,7 +2733,7 @@ unsigned long raxTouch(raxNode *n) {
         if (raxIsInlineLeaf(n,i)) {
             void *val;
             memcpy(&val,cp,sizeof(val));
-            sum += (unsigned long)val;
+            sum += (unsigned long)(uintptr_t)val;
         } else {
             raxNode *child;
             memcpy(&child,cp,sizeof(child));

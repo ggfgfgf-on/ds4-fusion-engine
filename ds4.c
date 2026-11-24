@@ -77434,7 +77434,7 @@ static void qwen35_cpu_matvec_batch_worker(void *vctx, uint64_t row0, uint64_t r
          * accumulator chains overlap in the madd pipelines. */
         {
             static int shown[512];
-            const int id = (int)(ctx->data ? (ctx->data - (const uint8_t *)0) % 512 : 0);
+            const int id = (int)(((uintptr_t)ctx->data) % 512u);
             if (getenv("DS4_QWEN35_NARROW_DBG") && !shown[id]) {
                 shown[id] = 1;
                 fprintf(stderr, "[narrow] rows=%llu blocks=%llu n_tok=%llu\n",
@@ -79353,7 +79353,7 @@ static void qwen35_cpu_forward_batch(
                     (double)acc_q4 / 1e9, (double)acc_q6 / 1e9,
                     acc_ms_q4, acc_ms_q6, acc_ms_other,
                     acc_ms_head, acc_ms_draft);
-        if (getenv("DS4_QWEN35_BYTE_DBG"))
+        if (getenv("DS4_QWEN35_BYTE_DBG")) {
             fprintf(stderr,
                     "[prefill] rms=%.0f add=%.0f silu=%.0f  attn=%.0f"
                     "  gdn_conv=%.0f gdn_scan=%.0f  unaccounted=%.0f ms\n",
@@ -79361,6 +79361,7 @@ static void qwen35_cpu_forward_batch(
                     g_gdn_conv_ms, g_gdn_scan_ms,
                     wall - acc_ms - attn_ms - g_ph.rms - g_ph.add - g_ph.silu
                     - g_ph.head - acc_ms_draft);
+                }
     
             if (getenv("DS4_QWEN35_BYTE_DBG"))
                 fprintf(stderr, "[prefill] attention core=%.0f ms (%.0f%%)  "
@@ -80205,7 +80206,7 @@ static void qwen35_cpu_forward_token(
      * paid once per token rather than once per round. */
     if (getenv("DS4_QWEN35_MTP_TEST") ||
         (qwen35_mtp_spec_on() && qwen35_spec_worth(pos + 1u))) {
-        static int prev_draft = -1;
+        /* no carried draft token */
         static float prev_h[8192];
         static bool have_prev_h = false;
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -80219,8 +80220,8 @@ static void qwen35_cpu_forward_token(
         qwen35_cpu_mtp_forward(m, w, s, h_in, token, pos, draft);
         int dmx = 0, lmx = 0;
         int top5[5] = {0, 0, 0, 0, 0};
-        for (int i = 1; i < DS4_N_VOCAB; i++) {
-            if (draft[i] > draft[dmx]) dmx = i;
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+            if (draft[i] > draft[dmx]) dmx = (int)i;
             if (logits[i] > logits[lmx]) lmx = i;
             for (int t = 0; t < 5; t++) {
                 if (draft[i] > draft[top5[t]]) {
@@ -80288,20 +80289,18 @@ static void qwen35_cpu_forward_token(
             free(hb);
         }
         if (!getenv("DS4_QWEN35_MTP_TEST")) {
-            prev_draft = dmx;
+            /* no carried draft token */
             free(draft);
             goto mtp_probe_done;
         }
-        int in5 = 0;
-        for (int t = 0; t < 5; t++) if (top5[t] == lmx) in5 = 1;
         float mx = draft[0];
-        for (int i = 1; i < DS4_N_VOCAB; i++) mx = fmaxf(mx, draft[i]);
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) mx = fmaxf(mx, draft[i]);
         double ss = 0.0;
-        for (int i = 0; i < DS4_N_VOCAB; i++) ss += (double)expf(draft[i] - mx);
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) ss += (double)expf(draft[i] - mx);
         const float p1 = expf(draft[dmx] - mx) / (float)ss;
         int rank = 1;
-        for (int i = 0; i < DS4_N_VOCAB; i++)
-            if (i != lmx && draft[i] > draft[lmx]) rank++;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++)
+            if ((int)i != lmx && draft[i] > draft[lmx]) rank++;
         size_t mlen = 0;
         char *mpc = ds4_token_text(s->engine, lmx, &mlen);
         fprintf(stderr, "[mtp] pos=%u same_hit=%d draft=%d main=%d'%.*s' p1=%.3f rank=%d",
@@ -80315,7 +80314,7 @@ static void qwen35_cpu_forward_token(
         }
         fprintf(stderr, "\n");
         fflush(stderr);
-        prev_draft = dmx;
+        /* no carried draft token */
         memcpy(prev_h, blk, E * sizeof(float));
         have_prev_h = true;
         free(draft);
@@ -101417,7 +101416,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                  * unreachable, so neither mechanism is needed. */
                 float *snap = NULL;
                 uint32_t nl = 0;
-                if (nt <= 1u) {
+                if (nt <= 1) {
                     snap = xmalloc((size_t)(n_lin * per) * sizeof(float));
                     for (uint32_t il = 0; il < n_trunk_s; il++) {
                         if (!ds4_qwen4_layer_is_linear(il)) continue;
@@ -101445,7 +101444,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                  * but the last. A partial accept then becomes a copy instead of
                  * another whole forward. */
                 const int ckpt_before = s->checkpoint.len;
-                const uint32_t snap_pos = nt > 1u ? (uint32_t)nt - 1u : 0u;
+                const uint32_t snap_pos = nt > 1 ? (uint32_t)nt - 1u : 0u;
                 if (snap_pos > 0) {
                     const uint64_t need = (uint64_t)snap_pos *
                                           (uint64_t)DS4_MAX_LAYER * per;

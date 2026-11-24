@@ -1081,7 +1081,7 @@ static int dist_set_socket_low_latency(int fd) {
 static int dist_write_full(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
     while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
+        ssize_t n = send(fd, (const char *)p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -1096,7 +1096,7 @@ static int dist_write_full(int fd, const void *buf, size_t len) {
 static int dist_read_full(int fd, void *buf, size_t len) {
     unsigned char *p = buf;
     while (len > 0) {
-        ssize_t n = recv(fd, p, len, 0);
+        ssize_t n = recv(fd, (char *)p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;

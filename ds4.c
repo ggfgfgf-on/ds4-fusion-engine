@@ -68702,8 +68702,16 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
 static bool qwen35_spec_worth(uint32_t transcript) {
     static long limit = -2;
     if (limit == -2) {
+        /* Where the draft's cost crosses what it buys.
+         *
+         * The draft walks the transcript, so its cost grows with the context while one
+         * accepted token is worth the same at any length. Measured on this machine the
+         * crossover sits near three hundred tokens, not the four thousand assumed when
+         * the gate was written: 3.37 against 2.98 tokens a second at 130 tokens, and
+         * 2.63 against 2.92 at 2300. A four-thousand-token gate therefore paid for the
+         * draft through a range where it was already losing. */
         const char *e = getenv("DS4_QWEN35_SPEC_MAX");
-        limit = e ? atol(e) : 4096;
+        limit = e ? atol(e) : 512;
     }
     return (long)transcript < limit;
 }

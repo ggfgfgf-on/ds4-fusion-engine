@@ -8655,6 +8655,24 @@ static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision
                                      uint32_t min_tokens, uint32_t max_tokens, float **out, ds4_image_patches *patches,
                                      char *error, size_t error_cap) {
     *out = NULL;
+    /* The encoder runs as a GPU kernel even when the text model is CPU-resident, so the
+     * device and the projector's map range are set up on the first image instead of at
+     * startup: a run that never reads one keeps the plain CPU path untouched. */
+    if (!ds4_gpu_init()) {
+        if (error && error_cap) snprintf(error, error_cap, "the vision encoder needs a working GPU");
+        return 0;
+    }
+    {
+        static int mapped = 0;
+        if (!mapped) {
+            if (!ds4_gpu_set_aux_model_map_range(vm->map, vm->size, vm->tensor_data_pos,
+                                                 vm->size - vm->tensor_data_pos)) {
+                if (error && error_cap) snprintf(error, error_cap, "failed to map the vision encoder");
+                return 0;
+            }
+            mapped = 1;
+        }
+    }
     if (!ds4_image_preprocess_qwen4(patches, image, min_tokens, max_tokens, error, error_cap)) return 0;
     const uint64_t n = patches->patch_count;
     float *pos = malloc((size_t)n * w->n_embd * sizeof(float));
@@ -84137,18 +84155,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #else
         /* The encoder is a GPU kernel, but the model it feeds does not have to live
          * there: the projector is under a gigabyte and reaches the device through the
-         * auxiliary map range. A machine whose VRAM cannot hold the text model can
-         * still read images, so bring the backend up here and leave placement alone. */
-        if (opt->backend == DS4_BACKEND_CPU) {
-            if (!ds4_gpu_init()) {
-                fprintf(stderr,
-                        "ds4: --vision needs a working GPU; the encoder runs as a kernel\n");
-                free(e);
-                *out = NULL;
-                return 1;
-            }
-        } else if (opt->backend != DS4_BACKEND_METAL &&
-                   opt->backend != DS4_BACKEND_CUDA) {
+         * auxiliary map range, so a machine whose VRAM cannot hold the text model can
+         * still read images. The device is brought up on the first image rather than
+         * here, so a run that never sees one keeps the plain CPU path untouched. */
+        if (opt->backend != DS4_BACKEND_CPU &&
+            opt->backend != DS4_BACKEND_METAL &&
+            opt->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
                     "ds4: vision requires --metal, --cuda, or --rocm\n");
             free(e);
@@ -85524,23 +85536,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
-    } else if (e->vision_ready) {
-        /* The text model stays on the CPU while the encoder runs as a GPU kernel, so the
-         * projector's weights still have to be mapped into the device here. Without this
-         * the kernel read unmapped memory and every image came back as a run of digits. */
-        e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
-            e->vision_model.map,
-            e->vision_model.size,
-            e->vision_model.tensor_data_pos,
-            e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
-        if (!e->vision_map_ready) {
-            fprintf(stderr, "ds4: %s failed to map the vision encoder\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        fprintf(stderr, "ds4: vision encoder mapped for a CPU-resident model\n");
     }
 #else
     if (graph_backend) {

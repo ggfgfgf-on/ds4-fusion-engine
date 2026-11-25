@@ -1593,17 +1593,32 @@ __global__ void vis_softmax(float *S, unsigned N, float scale) {
  *
  * and the score buffer's column-major N x N form is the row-major form the
  * softmax kernel reads. */
+/* The score buffer, allocated once per process.
+ *
+ * It is 340 MB at 2304 patches, and paying for it inside the first image's
+ * attention put 192 ms of cudaMalloc and cuBLAS start-up into that image's wall
+ * clock. ds4_gpu_qwen4_vision_prepare() allocates it at engine start instead. */
+static float *g_vis_score = NULL;
+static uint64_t g_vis_score_cap = 0;
+static int vis_score_buffer(float **out, uint64_t need) {
+    if (g_vis_score_cap < need) {
+        if (g_vis_score) { cudaFree(g_vis_score); g_vis_score = NULL; }
+        if (cudaMalloc(&g_vis_score, need * sizeof(float)) != cudaSuccess) {
+            g_vis_score_cap = 0;
+            return 0;
+        }
+        g_vis_score_cap = need;
+    }
+    *out = g_vis_score;
+    return 1;
+}
+
 static int vis_attention_blas(float *out, const float *q, const float *k, const float *v,
                               unsigned N, unsigned H, unsigned D) {
     const uint64_t n2 = (uint64_t)N * N;
-    static float *S = NULL;
-    static uint64_t S_cap = 0;
     const uint64_t need = n2 * (uint64_t)H;
-    if (S_cap < need) {
-        if (S) { cudaFree(S); S = NULL; }
-        if (cudaMalloc(&S, need * sizeof(float)) != cudaSuccess) { S_cap = 0; return 0; }
-        S_cap = need;
-    }
+    float *S = NULL;
+    if (!vis_score_buffer(&S, need)) return 0;
     cublasHandle_t bh = cuda_cublas_for_tier(0);
     const float one = 1.0f, zero = 0.0f;
     const float scale = 1.0f / sqrtf((float)D);
@@ -1611,10 +1626,12 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
     cudaEvent_t s0 = NULL, s1 = NULL;
     if (split) { cudaEventCreate(&s0); cudaEventCreate(&s1); cudaEventRecord(s0, cuda_decode_stream()); }
     for (unsigned h = 0; h < H; h++) {
-        if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
-                                   &one, k + (uint64_t)h * D, (int)(H * D),
-                                   q + (uint64_t)h * D, (int)(H * D), &zero,
-                                   S + (uint64_t)h * n2, (int)N), "vision QK")) return 0;
+        if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
+                                    &one, k + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                    q + (uint64_t)h * D, CUDA_R_32F, (int)(H * D), &zero,
+                                    S + (uint64_t)h * n2, CUDA_R_32F, (int)N,
+                                    CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+                      "vision QK")) return 0;
     }
     if (!launched()) return 0;
     double t_qk = 0.0, t_sm = 0.0;
@@ -1627,10 +1644,12 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
                  float ms = 0.0f; cudaEventElapsedTime(&ms, s0, s1); t_sm = ms;
                  cudaEventRecord(s0, cuda_decode_stream()); }
     for (unsigned h = 0; h < H; h++) {
-        if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
-                                   &one, v + (uint64_t)h * D, (int)(H * D),
-                                   S + (uint64_t)h * n2, (int)N, &zero,
-                                   out + (uint64_t)h * D, (int)(H * D)), "vision AV")) return 0;
+        if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
+                                    &one, v + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                    S + (uint64_t)h * n2, CUDA_R_32F, (int)N, &zero,
+                                    out + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                    CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+                      "vision AV")) return 0;
     }
     const int okd = launched();
     if (split) {
@@ -2265,6 +2284,17 @@ __global__ void vision_pack_half(__half *dst, const float *src, uint64_t n) {
  * already F16 and its tolerance is TF32, so that split doubles the GEMM work and
  * adds two extra passes over the activations for precision it does not need: the
  * encoder measured 1.4 TFLOPS against a 15 TFLOPS part because of it. */
+extern "C" int ds4_gpu_qwen4_vision_prepare(uint32_t patches, uint32_t heads) {
+    using namespace qwen4_cuda;
+    if (!patches || !heads) return 0;
+    float *S = NULL;
+    const uint64_t need = (uint64_t)patches * patches * heads;
+    if (!vis_score_buffer(&S, need)) return 0;
+    /* Touch the device once so the first image does not pay cuBLAS start-up. */
+    vis_softmax<<<1, 32, 0, cuda_decode_stream()>>>(S, 1u, 1.0f);
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_vision_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                                               const void *map, uint64_t size, uint64_t off,
                                               uint32_t type, uint32_t T, uint32_t K, uint32_t M) {

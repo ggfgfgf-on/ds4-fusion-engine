@@ -84411,6 +84411,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
             qwen4_vision_weights_bind(&e->qwen4_vision_weights, &e->vision_model);
             config_expect_u32("vision projection_dim", e->qwen4_vision_weights.n_out, DS4_N_EMBD);
             e->vision_kind = DS4_VISION_QWEN4;
+            /* Reserve the attention score buffer here rather than inside the first
+             * image: 340 MB of cudaMalloc plus cuBLAS start-up measured 192 ms, and it
+             * landed on whichever request happened to arrive first. */
+            if (e->qwen4_vision_weights.n_pos_side && e->qwen4_vision_weights.n_head) {
+                const uint64_t patches = (uint64_t)e->qwen4_vision_weights.n_pos_side *
+                                         e->qwen4_vision_weights.n_pos_side;
+                if (patches <= 65536) {
+                    (void)ds4_gpu_qwen4_vision_prepare((uint32_t)patches,
+                                                       e->qwen4_vision_weights.n_head);
+                }
+            }
         } else {
             deepseek4_vision_weights_bind(
                     &e->deepseek4_vision_weights, &e->vision_model);

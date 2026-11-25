@@ -1593,6 +1593,56 @@ __global__ void vis_softmax(float *S, unsigned N, float scale) {
  *
  * and the score buffer's column-major N x N form is the row-major form the
  * softmax kernel reads. */
+/* [token][head][dim] <-> [head][token][dim].
+ *
+ * The batched attention GEMMs are only worth calling when each head's matrix is
+ * compact: with the natural interleaved layout the leading dimension is H*D while
+ * the matrix is D wide, and cuBLAS answers that with a strided kernel that measured
+ * slower than the sixteen separate calls it replaced. Repacking costs three tens of
+ * megabytes of traffic against the hundreds the GEMMs move. */
+__global__ void vis_pack_heads(float *dst, const float *src, unsigned N, unsigned H, unsigned D) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)N * H * D;
+    if (i >= n) return;
+    const unsigned d = (unsigned)(i % D);
+    const uint64_t r = i / D;
+    const unsigned h = (unsigned)(r % H);
+    const unsigned t = (unsigned)(r / H);
+    dst[((uint64_t)h * N + t) * D + d] = src[i];
+}
+
+__global__ void vis_unpack_heads(float *dst, const float *src, unsigned N, unsigned H, unsigned D) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)N * H * D;
+    if (i >= n) return;
+    const unsigned d = (unsigned)(i % D);
+    const uint64_t r = i / D;
+    const unsigned h = (unsigned)(r % H);
+    const unsigned t = (unsigned)(r / H);
+    dst[i] = src[((uint64_t)h * N + t) * D + d];
+}
+
+/* Packed q/k/v/out scratch for one encoder pass. */
+static float *g_vis_pack[4];
+static uint64_t g_vis_pack_cap;
+static int vis_pack_buffer(float **out, unsigned N, unsigned H, unsigned D) {
+    const uint64_t need = (uint64_t)N * H * D;
+    if (g_vis_pack_cap < need) {
+        for (int i = 0; i < 4; i++) {
+            if (g_vis_pack[i]) { cudaFree(g_vis_pack[i]); g_vis_pack[i] = NULL; }
+        }
+        for (int i = 0; i < 4; i++) {
+            if (cudaMalloc(&g_vis_pack[i], need * sizeof(float)) != cudaSuccess) {
+                g_vis_pack_cap = 0;
+                return 0;
+            }
+        }
+        g_vis_pack_cap = need;
+    }
+    for (int i = 0; i < 4; i++) out[i] = g_vis_pack[i];
+    return 1;
+}
+
 /* The score buffer, allocated once per process.
  *
  * It is 340 MB at 2304 patches, and paying for it inside the first image's
@@ -1625,13 +1675,45 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
     const bool split = getenv("DS4_VISION_ATTN_SPLIT") != NULL;
     cudaEvent_t s0 = NULL, s1 = NULL;
     if (split) { cudaEventCreate(&s0); cudaEventCreate(&s1); cudaEventRecord(s0, cuda_decode_stream()); }
-    for (unsigned h = 0; h < H; h++) {
-        if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
-                                    &one, k + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
-                                    q + (uint64_t)h * D, CUDA_R_32F, (int)(H * D), &zero,
-                                    S + (uint64_t)h * n2, CUDA_R_32F, (int)N,
-                                    CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
-                      "vision QK")) return 0;
+    /* Compact per-head copies first, then one batched call per product.
+     *
+     * Sixteen separate calls were faster than a strided batch because the natural
+     * interleaved layout leaves the leading dimension at H*D for a D-wide matrix.
+     * Packing turns each head into a genuinely contiguous N x D matrix, after which
+     * the batch is the shape cuBLAS is built for. The pack is 32 MB of traffic
+     * against the 340 MB the scores alone move. */
+    float *pq = NULL, *pk = NULL, *pv = NULL, *po = NULL;
+    const uint64_t nfloat = (uint64_t)N * H * D;
+    const uint32_t pack_blocks = (uint32_t)((nfloat + 255u) / 256u);
+    {
+        float *packed[4];
+        if (!vis_pack_buffer(packed, N, H, D)) {
+            pq = pk = pv = po = NULL;
+        } else {
+            pq = packed[0]; pk = packed[1]; pv = packed[2]; po = packed[3];
+        }
+    }
+    if (pq && pk && pv && po) {
+        vis_pack_heads<<<pack_blocks, 256, 0, cuda_decode_stream()>>>(pq, q, N, H, D);
+        vis_pack_heads<<<pack_blocks, 256, 0, cuda_decode_stream()>>>(pk, k, N, H, D);
+        vis_pack_heads<<<pack_blocks, 256, 0, cuda_decode_stream()>>>(pv, v, N, H, D);
+        if (!launched()) return 0;
+        if (!cublas_ok(cublasGemmStridedBatchedEx(bh, CUBLAS_OP_T, CUBLAS_OP_N,
+                                                  (int)N, (int)N, (int)D, &one,
+                                                  pk, CUDA_R_32F, (int)D, (long long)((uint64_t)N * D),
+                                                  pq, CUDA_R_32F, (int)D, (long long)((uint64_t)N * D),
+                                                  &zero, S, CUDA_R_32F, (int)N, (long long)n2,
+                                                  (int)H, CUBLAS_COMPUTE_32F_FAST_TF32,
+                                                  CUBLAS_GEMM_DEFAULT), "vision QK packed")) return 0;
+    } else {
+        for (unsigned h = 0; h < H; h++) {
+            if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
+                                        &one, k + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                        q + (uint64_t)h * D, CUDA_R_32F, (int)(H * D), &zero,
+                                        S + (uint64_t)h * n2, CUDA_R_32F, (int)N,
+                                        CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+                          "vision QK")) return 0;
+        }
     }
     if (!launched()) return 0;
     double t_qk = 0.0, t_sm = 0.0;
@@ -1643,13 +1725,24 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
     if (split) { cudaEventRecord(s1, cuda_decode_stream()); cudaEventSynchronize(s1);
                  float ms = 0.0f; cudaEventElapsedTime(&ms, s0, s1); t_sm = ms;
                  cudaEventRecord(s0, cuda_decode_stream()); }
-    for (unsigned h = 0; h < H; h++) {
-        if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
-                                    &one, v + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
-                                    S + (uint64_t)h * n2, CUDA_R_32F, (int)N, &zero,
-                                    out + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
-                                    CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
-                      "vision AV")) return 0;
+    if (po) {
+        if (!cublas_ok(cublasGemmStridedBatchedEx(bh, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                  (int)D, (int)N, (int)N, &one,
+                                                  pv, CUDA_R_32F, (int)D, (long long)((uint64_t)N * D),
+                                                  S, CUDA_R_32F, (int)N, (long long)n2,
+                                                  &zero, po, CUDA_R_32F, (int)D, (long long)((uint64_t)N * D),
+                                                  (int)H, CUBLAS_COMPUTE_32F_FAST_TF32,
+                                                  CUBLAS_GEMM_DEFAULT), "vision AV packed")) return 0;
+        vis_unpack_heads<<<pack_blocks, 256, 0, cuda_decode_stream()>>>(out, po, N, H, D);
+    } else {
+        for (unsigned h = 0; h < H; h++) {
+            if (!cublas_ok(cublasGemmEx(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
+                                        &one, v + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                        S + (uint64_t)h * n2, CUDA_R_32F, (int)N, &zero,
+                                        out + (uint64_t)h * D, CUDA_R_32F, (int)(H * D),
+                                        CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+                          "vision AV")) return 0;
+        }
     }
     const int okd = launched();
     if (split) {

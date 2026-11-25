@@ -15231,7 +15231,11 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
-            "\"reasoning_effort\"]}",
+            "\"reasoning_effort\"],"
+            "\"effort\":{\"supported_levels\":["
+            "\"none\",\"minimal\",\"low\",\"medium\","
+            "\"high\",\"xhigh\",\"max\"],"
+            "\"default_level\":\"high\"}}",
         ctx,
         has_vision ? ",\"image\"" : "",
         ctx,

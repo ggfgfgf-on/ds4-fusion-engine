@@ -14071,6 +14071,10 @@ decode_again:
         if (greedy_tool_syntax) {
             temperature = 0.0f;
         }
+        /* Greedy decoding cannot consume a draft (its speculative entry does a plain
+         * single-token eval on the CPU path), so do not pay for one: measured as a
+         * fourteen percent loss at temperature zero for nothing in return. */
+        ds4_engine_set_spec_consume(s->engine, temperature > 0.0f);
         const int eos_token = ds4_token_eos(s->engine);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
@@ -14094,6 +14098,10 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
+        if (getenv("DS4_SPEC_TRACE"))
+            fprintf(stderr, "[spectrace] batched=%d draft_tokens=%d disabled=%d\n",
+                    s->batched_mode, ds4_engine_mtp_draft_tokens(s->engine),
+                    getenv("DS4_MTP_SPEC_DISABLE") != NULL);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)

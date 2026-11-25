@@ -68664,6 +68664,19 @@ static bool qwen35_mtp_spec_on(void) {
     return on != 0;
 }
 
+/* Whether the sampler in charge can consume a draft at all.
+ *
+ * Greedy decoding routes to the argmax speculative entry, whose CPU branch does a
+ * plain single-token eval and never looks at the draft. Paying for the draft walk
+ * there measured as a fourteen percent loss for nothing. The server sets this from
+ * the temperature it is about to sample with. */
+static int g_spec_consume = 1;
+
+void ds4_engine_set_spec_consume(ds4_engine *e, int on) {
+    (void)e;
+    g_spec_consume = on ? 1 : 0;
+}
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
@@ -79347,7 +79360,7 @@ static void qwen35_cpu_forward_batch(
      * costs more than the speculation it enables - 1633 of a 2501 millisecond round at
      * 8716 tokens - and it was paid on every batch forward, plain decode included,
      * because the gate only looked at the global switch. */
-    if (n_tok > 0 && qwen35_mtp_spec_on() &&
+    if (n_tok > 0 && qwen35_mtp_spec_on() && g_spec_consume &&
         qwen35_spec_worth(pos0 + n_tok)) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));
@@ -80278,7 +80291,7 @@ static void qwen35_cpu_forward_token(
      * decode takes - it runs one token at a time through here, so the draft was being
      * paid once per token rather than once per round. */
     if (getenv("DS4_QWEN35_MTP_TEST") ||
-        (qwen35_mtp_spec_on() && qwen35_spec_worth(pos + 1u))) {
+        (qwen35_mtp_spec_on() && g_spec_consume && qwen35_spec_worth(pos + 1u))) {
         /* no carried draft token */
         static float prev_h[8192];
         static bool have_prev_h = false;
@@ -100558,6 +100571,9 @@ static int ds4_session_eval_speculative_argmax_impl(
         bool ignore_eos, ds4_think_mode think_mode,
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
+    if (getenv("DS4_SPEC_TRACE"))
+        fprintf(stderr, "[spectrace] entered ARGMAX variant (cpu=%d)\n",
+                ds4_session_is_cpu(s) ? 1 : 0);
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
@@ -101464,6 +101480,17 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             const int V = (int)DS4_N_VOCAB;
             const int t1 = ds4_session_argmax(s);
             const int d = s->qwen35_mtp_draft;
+            if (getenv("DS4_SPEC_TRACE")) {
+                /* The draft is paid on every forward; only a match here can ever return
+                 * more than one token. Printing the hit rate is what tells a thin draft
+                 * from a broken one. */
+                static long seen, hit;
+                seen++;
+                if (t1 >= 0 && d >= 0 && t1 == d) hit++;
+                if (seen % 4 == 0)
+                    fprintf(stderr, "[spectrace] draft_hit=%ld/%ld (%.0f%%)\n",
+                            hit, seen, 100.0 * (double)hit / (double)seen);
+            }
             if (t1 >= 0 && t1 != eos_token && d >= 0 && t1 == d) {
                 /* Batched verify over [t1] + the chained drafts. The batch
                  * advances every token in one weight pass; the per-position

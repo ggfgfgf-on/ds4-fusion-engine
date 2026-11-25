@@ -1531,6 +1531,100 @@ __global__ void vis_attention(float *out, const float *q, const float *k, const 
     for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) out[qb+lane+j*32] = acc[j]/denom;
 }
 
+/* Row softmax for the batched vision attention.
+ *
+ * One block per row (one query token of one head); the scores carry the 1/sqrt(D)
+ * scale here so the GEMM that produced them stays a plain product. */
+__device__ __forceinline__ float vis_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float vis_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__global__ void vis_softmax(float *S, unsigned N, float scale) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warps = blockDim.x >> 5;
+    float *s = S + (uint64_t)row * N;
+    __shared__ float sm[32];
+    float m = -INFINITY;
+    for (uint32_t i = tid; i < N; i += blockDim.x) m = fmaxf(m, s[i] * scale);
+    m = vis_warp_max(m);
+    if ((tid & 31u) == 0u) sm[tid >> 5] = m;
+    __syncthreads();
+    if (tid < 32u) {
+        float v = tid < warps ? sm[tid] : -INFINITY;
+        v = vis_warp_max(v);
+        if (tid == 0u) sm[0] = v;
+    }
+    __syncthreads();
+    m = sm[0];
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < N; i += blockDim.x) {
+        const float e = expf(s[i] * scale - m);
+        s[i] = e;
+        sum += e;
+    }
+    sum = vis_warp_sum(sum);
+    if ((tid & 31u) == 0u) sm[tid >> 5] = sum;
+    __syncthreads();
+    if (tid < 32u) {
+        float v = tid < warps ? sm[tid] : 0.0f;
+        v = vis_warp_sum(v);
+        if (tid == 0u) sm[0] = v;
+    }
+    __syncthreads();
+    const float inv = 1.0f / sm[0];
+    for (uint32_t i = tid; i < N; i += blockDim.x) s[i] *= inv;
+}
+
+/* Vision attention as three batched cuBLAS calls instead of one block per
+ * (token, head) walking the whole transcript.
+ *
+ * Layout note: q, k and v are [token][head][dim] row-major, so for a fixed head
+ * each is an N x D row-major matrix with row stride H*D - which is exactly a
+ * D x N column-major matrix with leading dimension H*D, the form cuBLAS wants.
+ * That makes every product below a plain GEMM with no repacking:
+ *
+ *   scores (column-major N x N) = K^T Q          op(A)=T, op(B)=N
+ *   out^T  (column-major D x N) = V^T scores^T   op(A)=N, op(B)=N
+ *
+ * and the score buffer's column-major N x N form is the row-major form the
+ * softmax kernel reads. */
+static int vis_attention_blas(float *out, const float *q, const float *k, const float *v,
+                              unsigned N, unsigned H, unsigned D) {
+    const uint64_t n2 = (uint64_t)N * N;
+    static float *S = NULL;
+    static uint64_t S_cap = 0;
+    const uint64_t need = n2 * (uint64_t)H;
+    if (S_cap < need) {
+        if (S) { cudaFree(S); S = NULL; }
+        if (cudaMalloc(&S, need * sizeof(float)) != cudaSuccess) { S_cap = 0; return 0; }
+        S_cap = need;
+    }
+    cublasHandle_t bh = cuda_cublas_for_tier(0);
+    const float one = 1.0f, zero = 0.0f;
+    const float scale = 1.0f / sqrtf((float)D);
+    for (unsigned h = 0; h < H; h++) {
+        if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
+                                   &one, k + (uint64_t)h * D, (int)(H * D),
+                                   q + (uint64_t)h * D, (int)(H * D), &zero,
+                                   S + (uint64_t)h * n2, (int)N), "vision QK")) return 0;
+    }
+    if (!launched()) return 0;
+    vis_softmax<<<(unsigned)((uint64_t)H * N), 256, 0, cuda_decode_stream()>>>(S, N, scale);
+    if (!launched()) return 0;
+    for (unsigned h = 0; h < H; h++) {
+        if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
+                                   &one, v + (uint64_t)h * D, (int)(H * D),
+                                   S + (uint64_t)h * n2, (int)N, &zero,
+                                   out + (uint64_t)h * D, (int)(H * D)), "vision AV")) return 0;
+    }
+    return launched();
+}
+
 __global__ void vis_add(float *x, const float *add, const float *bias, unsigned N, unsigned E, unsigned mode) {
     const uint64_t i = (uint64_t)blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= (uint64_t)N*E) return;
@@ -2334,6 +2428,16 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
             src ? (const float *)src->ptr : NULL,bias,rows,width,mode);
         return launched();
     };
+    /* Stage timing for the encoder: the layer loop mixes cuBLAS GEMMs with the
+     * hand-written attention, and knowing which one holds the wall clock is the
+     * difference between optimising the right kernel and guessing. */
+    const bool vprof = getenv("DS4_QWEN4_VISION_PROF") != NULL;
+    double tp_attn = 0.0;
+    cudaEvent_t ev_a = NULL, ev_b = NULL;
+    if (vprof) { cudaEventCreate(&ev_a); cudaEventCreate(&ev_b); }
+    auto ms_between = [&](cudaEvent_t a, cudaEvent_t b) {
+        float ms = 0.0f; cudaEventElapsedTime(&ms, a, b); return (double)ms;
+    };
     do {
         if (!ok) break;
         ok = ds4_gpu_tensor_write(patch,0,patches,(uint64_t)N*IP*4) &&
@@ -2344,13 +2448,30 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
         if (!ok || !pb) { ok = false; break; }
         vis_patch<<<((uint64_t)N*E+255)/256,256,0,cuda_decode_stream()>>>(ptr(x),ptr(a0),ptr(a1),pb,ptr(pos),N,E);
         ok = launched();
-        for (unsigned l = 0; ok && l < DS4_QWEN4_VISION_LAYERS; l++) {
+        /* Stage timing for the encoder: the layer loop mixes cuBLAS GEMMs with the
+     * hand-written attention, and knowing which one holds the wall clock is the
+     * difference between optimising the right kernel and guessing. */
+    for (unsigned l = 0; ok && l < DS4_QWEN4_VISION_LAYERS; l++) {
             const auto &lw = w->layer[l];
             ok = norm(tmp,x,lw.ln1_w,lw.ln1_b) && mm(qkv,tmp,lw.qkv_w,lw.qkv_type,N,E,3*E);
             const float *qb = wf(lw.qkv_b,3*E);
             if (!ok || !qb) { ok = false; break; }
             vis_qkv<<<N,256,0,cuda_decode_stream()>>>(ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
-            vis_attention<<<dim3(N,H),32,0,cuda_decode_stream()>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
+            if (vprof) cudaEventRecord(ev_a, cuda_decode_stream());
+        /* Batched GEMMs when the score buffer fits (340 MB at 2304 patches), the
+         * hand-written kernel otherwise. 811 ms against a projected few tens of
+         * milliseconds over 27 layers made this the encoder's dominant cost. */
+        {
+            static int use_blas = -1;
+            if (use_blas < 0) use_blas = getenv("DS4_VISION_ATTN_NO_BLAS") == NULL ? 1 : 0;
+            const uint64_t score_bytes = (uint64_t)N * N * H * sizeof(float);
+            if (use_blas && score_bytes <= (uint64_t)1536 * 1024 * 1024) {
+                if (!vis_attention_blas(ptr(attn), ptr(q), ptr(k), ptr(v), N, H, D)) { ok = false; break; }
+            } else {
+                vis_attention<<<dim3(N,H),32,0,cuda_decode_stream()>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
+            }
+        }
+        if (vprof) { cudaEventRecord(ev_b, cuda_decode_stream()); cudaEventSynchronize(ev_b); tp_attn += ms_between(ev_a, ev_b); }
             ok = launched() && mm(tmp,attn,lw.out_w,lw.out_type,N,E,E) && add(x,tmp,lw.out_b,N,E,2) &&
                  norm(tmp,x,lw.ln2_w,lw.ln2_b) && mm(ffn,tmp,lw.up_w,lw.up_type,N,E,FF) &&
                  add(ffn,NULL,lw.up_b,N,FF,0) && mm(tmp,ffn,lw.down_w,lw.down_type,N,FF,E) &&
@@ -2361,6 +2482,11 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
              add(res,NULL,w->mm2_b,merged,O,2);
     } while (false);
     if (active && !ds4_gpu_end_commands()) ok = false;
+    if (vprof) {
+        fprintf(stderr, "[vprof] layers=%u patches=%u attention=%.1f ms\n",
+                (unsigned)DS4_QWEN4_VISION_LAYERS, (unsigned)N, tp_attn);
+        cudaEventDestroy(ev_a); cudaEventDestroy(ev_b);
+    }
     if (ok) ok = ds4_gpu_tensor_read(res,0,out,(uint64_t)merged*O*4);
     for (auto it = buffers.rbegin(); it != buffers.rend(); ++it) ds4_gpu_tensor_free(*it);
     return ok;

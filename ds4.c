@@ -1868,8 +1868,58 @@ static void *xmalloc(size_t size) {
     return p;
 }
 
-static char *ds4_strdup(const char *s) {
-    size_t n = strlen(s);
+/* Large-page allocation for the hot activation buffers.
+ *
+ * The weights and the KV tiers already live on two-megabyte pages, but the buffers
+ * the forward pass walks every layer do not: at a few hundred prompt tokens the
+ * twelve scratch buffers, the recurrent state and the attention scores come to well
+ * over a hundred megabytes of hot memory, which on four-kilobyte pages is tens of
+ * thousands of TLB entries per pass.
+ *
+ * Returns NULL when the privilege or the reservation is unavailable; every caller
+ * falls back to xmalloc, so a machine without SeLockMemoryPrivilege behaves exactly
+ * as before. */
+static void *ds4_large_pages_enabled_flag = NULL;
+static void *xmalloc_pages(size_t size) {
+#if defined(_WIN32)
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = 0;
+        HANDLE tok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp;
+            LUID luid;
+            if (LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Luid = luid;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                if (AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL) &&
+                    GetLastError() == ERROR_SUCCESS) {
+                    enabled = 1;
+                }
+            }
+            CloseHandle(tok);
+        }
+        if (enabled) {
+            fprintf(stderr, "ds4: activation buffers on %llu KiB pages\n",
+                    (unsigned long long)(GetLargePageMinimum() / 1024u));
+        }
+    }
+    if (enabled) {
+        const size_t page = (size_t)GetLargePageMinimum();
+        const size_t rounded = (size + page - 1u) / page * page;
+        void *p = VirtualAlloc(NULL, rounded, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+                              PAGE_READWRITE);
+        if (p) return p;
+    }
+#else
+    (void)size;
+#endif
+    (void)ds4_large_pages_enabled_flag;
+    return NULL;
+}
+
+static char *ds4_strdup(const char *s) {    size_t n = strlen(s);
     char *p = xmalloc(n + 1);
     memcpy(p, s, n + 1);
     return p;
@@ -87780,18 +87830,31 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 (uint64_t)ctx_size,                  /* score */
             };
             for (int b = 0; b < 12; b++)
-                s->qwen35_cpu_buf[b] = xmalloc(buf_sizes[b] * sizeof(float));
+                {
+            /* Hot scratch: every layer walks these, so they get large pages when the
+             * privilege is available and plain pages otherwise. */
+            const size_t want = (size_t)buf_sizes[b] * sizeof(float);
+            void *pg = xmalloc_pages(want);
+            s->qwen35_cpu_buf[b] = pg ? pg : xmalloc(want);
+        }
             s->qwen35_cpu_q8 = xmalloc(((DS4_N_FF_DENSE + QK_K - 1) / QK_K) *
                                        sizeof(block_q8_K));
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 if (ds4_qwen4_layer_is_linear(il)) {
-                    s->qwen35_cpu_conv_hist[il] = xcalloc(
-                            (size_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM,
-                            sizeof(float));
-                    s->qwen35_cpu_ssm_state[il] = xcalloc(
-                            (size_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
-                                    DS4_N_LIN_HEAD_DIM,
-                            sizeof(float));
+                    /* Read and written for every token of every linear layer - a
+                     * hundred megabytes per decode step - so the recurrence prefers
+                     * large pages as well. */
+                    {
+                        const size_t conv_n = (size_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
+                        const size_t ssm_n = (size_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                             DS4_N_LIN_HEAD_DIM;
+                        void *pc = xmalloc_pages(conv_n * sizeof(float));
+                        void *psn = xmalloc_pages(ssm_n * sizeof(float));
+                        s->qwen35_cpu_conv_hist[il] =
+                            pc ? memset(pc, 0, conv_n * sizeof(float)) : xcalloc(conv_n, sizeof(float));
+                        s->qwen35_cpu_ssm_state[il] =
+                            psn ? memset(psn, 0, ssm_n * sizeof(float)) : xcalloc(ssm_n, sizeof(float));
+                    }
                 } else {
                 {
                     /* Large pages, like the weights.

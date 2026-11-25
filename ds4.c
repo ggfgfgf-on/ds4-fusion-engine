@@ -78951,6 +78951,42 @@ static void qwen35_cpu_forward_batch(
     float *gate  = z;   /* the attention gate view (C >= H*HD) */
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
 
+    if (pos0 == 0) {
+        /* A sequence that starts at position zero must begin from a zeroed recurrence.
+         * The GDN layers accumulate a running state that no KV position can rewind, so a
+         * slot that already ran a conversation handed its carried-over state to the next
+         * one: measured at 786432/786432 non-zero values before this reset, which made
+         * replies repeat the previous exchange or stop on their first token. A
+         * continuation always prefills past zero, so it keeps its state untouched. */
+        const size_t ssm_bytes = (size_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                                 DS4_N_LIN_HEAD_DIM * sizeof(float);
+        const size_t conv_bytes = (size_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM *
+                                  sizeof(float);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (s->qwen35_cpu_ssm_state[il]) memset(s->qwen35_cpu_ssm_state[il], 0, ssm_bytes);
+            if (s->qwen35_cpu_conv_hist[il]) memset(s->qwen35_cpu_conv_hist[il], 0, conv_bytes);
+        }
+    }
+    if (pos0 == 0 && getenv("DS4_QWEN35_STATE_DBG")) {
+        /* Diagnostic only: prints the recurrence magnitude at a sequence start so the
+         * reset above can be verified rather than assumed. */
+        const float *st = s->qwen35_cpu_ssm_state[0];
+        if (st) {
+            const uint64_t n = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM *
+                               DS4_N_LIN_HEAD_DIM;
+            uint64_t nz = 0;
+            double acc = 0.0;
+            for (uint64_t i = 0; i < n; i++) {
+                const double v = st[i];
+                acc += v * v;
+                if (v != 0.0f) nz++;
+            }
+            fprintf(stderr, "[state] pos0=0 ssm_nz=%llu/%llu rms=%.8f\n",
+                    (unsigned long long)nz, (unsigned long long)n,
+                    sqrt(acc / (double)n));
+        }
+    }
+
     for (uint32_t t = 0; t < n_tok; t++) {
         qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], xb + (uint64_t)t * E);
         /* A vision span replaces its placeholder tokens' embeddings with the encoder's

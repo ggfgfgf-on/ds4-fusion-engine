@@ -78933,8 +78933,27 @@ static void qwen35_cpu_forward_batch(
     float *gate  = z;   /* the attention gate view (C >= H*HD) */
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
 
-    for (uint32_t t = 0; t < n_tok; t++)
+    for (uint32_t t = 0; t < n_tok; t++) {
         qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], xb + (uint64_t)t * E);
+        /* A vision span replaces its placeholder tokens' embeddings with the encoder's
+         * rows. The GPU graph does this inside its own upload path, so a CPU prefill that
+         * skipped it left <|image_pad|> reading as an ordinary token: the prompt carried
+         * the right number of image positions and the model still answered that no image
+         * was attached. */
+        if (s->sync_images && s->sync_image_count) {
+            const uint32_t pos = pos0 + t;
+            for (size_t im = 0; im < s->sync_image_count; im++) {
+                const ds4_vision_span *span = &s->sync_images[im];
+                if (!span->embedding.data) continue;
+                if (pos < span->token_start ||
+                    pos - span->token_start >= span->embedding.token_count) continue;
+                memcpy(xb + (uint64_t)t * E,
+                       span->embedding.data + (uint64_t)(pos - span->token_start) * E,
+                       (size_t)E * sizeof(float));
+                break;
+            }
+        }
+    }
 
     for (uint32_t il = 0; il < n_trunk; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -84110,19 +84129,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (opt->vision_path && opt->vision_path[0]) {
-        if (opt->backend != DS4_BACKEND_METAL &&
-            opt->backend != DS4_BACKEND_CUDA) {
-            fprintf(stderr,
-                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
-            free(e);
-            *out = NULL;
-            return 1;
-        }
 #ifdef DS4_NO_GPU
         fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
         free(e);
         *out = NULL;
         return 1;
+#else
+        /* The encoder is a GPU kernel, but the model it feeds does not have to live
+         * there: the projector is under a gigabyte and reaches the device through the
+         * auxiliary map range. A machine whose VRAM cannot hold the text model can
+         * still read images, so bring the backend up here and leave placement alone. */
+        if (opt->backend == DS4_BACKEND_CPU) {
+            if (!ds4_gpu_init()) {
+                fprintf(stderr,
+                        "ds4: --vision needs a working GPU; the encoder runs as a kernel\n");
+                free(e);
+                *out = NULL;
+                return 1;
+            }
+        } else if (opt->backend != DS4_BACKEND_METAL &&
+                   opt->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: vision requires --metal, --cuda, or --rocm\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
 #endif
         if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
             gpu_cfg->n_gpus > 1) {
@@ -85492,6 +85524,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+    } else if (e->vision_ready) {
+        /* The text model stays on the CPU while the encoder runs as a GPU kernel, so the
+         * projector's weights still have to be mapped into the device here. Without this
+         * the kernel read unmapped memory and every image came back as a run of digits. */
+        e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
+            e->vision_model.map,
+            e->vision_model.size,
+            e->vision_model.tensor_data_pos,
+            e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
+        if (!e->vision_map_ready) {
+            fprintf(stderr, "ds4: %s failed to map the vision encoder\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "ds4: vision encoder mapped for a CPU-resident model\n");
     }
 #else
     if (graph_backend) {

@@ -11765,7 +11765,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     }
 
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
-        slot->live_text_len <= plen &&
+        slot->live_text_len < plen &&
         byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
     {
         pr.kind = REUSE_MEMORY_TEXT;

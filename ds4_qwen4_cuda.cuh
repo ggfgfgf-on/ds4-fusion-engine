@@ -1607,6 +1607,9 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
     cublasHandle_t bh = cuda_cublas_for_tier(0);
     const float one = 1.0f, zero = 0.0f;
     const float scale = 1.0f / sqrtf((float)D);
+    const bool split = getenv("DS4_VISION_ATTN_SPLIT") != NULL;
+    cudaEvent_t s0 = NULL, s1 = NULL;
+    if (split) { cudaEventCreate(&s0); cudaEventCreate(&s1); cudaEventRecord(s0, cuda_decode_stream()); }
     for (unsigned h = 0; h < H; h++) {
         if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)N, (int)D,
                                    &one, k + (uint64_t)h * D, (int)(H * D),
@@ -1614,15 +1617,77 @@ static int vis_attention_blas(float *out, const float *q, const float *k, const 
                                    S + (uint64_t)h * n2, (int)N), "vision QK")) return 0;
     }
     if (!launched()) return 0;
+    double t_qk = 0.0, t_sm = 0.0;
+    if (split) { cudaEventRecord(s1, cuda_decode_stream()); cudaEventSynchronize(s1);
+                 float ms = 0.0f; cudaEventElapsedTime(&ms, s0, s1); t_qk = ms;
+                 cudaEventRecord(s0, cuda_decode_stream()); }
     vis_softmax<<<(unsigned)((uint64_t)H * N), 256, 0, cuda_decode_stream()>>>(S, N, scale);
     if (!launched()) return 0;
+    if (split) { cudaEventRecord(s1, cuda_decode_stream()); cudaEventSynchronize(s1);
+                 float ms = 0.0f; cudaEventElapsedTime(&ms, s0, s1); t_sm = ms;
+                 cudaEventRecord(s0, cuda_decode_stream()); }
     for (unsigned h = 0; h < H; h++) {
         if (!cublas_ok(cublasSgemm(bh, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)N, (int)N,
                                    &one, v + (uint64_t)h * D, (int)(H * D),
                                    S + (uint64_t)h * n2, (int)N, &zero,
                                    out + (uint64_t)h * D, (int)(H * D)), "vision AV")) return 0;
     }
-    return launched();
+    const int okd = launched();
+    if (split) {
+        cudaEventRecord(s1, cuda_decode_stream()); cudaEventSynchronize(s1);
+        float ms = 0.0f; cudaEventElapsedTime(&ms, s0, s1);
+        fprintf(stderr, "[vsplit] N=%u H=%u D=%u  QK=%.1f ms  softmax=%.1f ms  AV=%.1f ms\n",
+                N, H, D, t_qk, t_sm, (double)ms);
+        cudaEventDestroy(s0); cudaEventDestroy(s1);
+    }
+    return okd;
+}
+
+/* Streaming (flash-style) vision attention: one warp per query token, online
+ * softmax, no score matrix.
+ *
+ * The block-reduction kernel needed a block-wide sync per key position; this one
+ * keeps running max and denominator in registers, so a key costs one warp shuffle
+ * reduction and nothing else. Warps of a block walk the same key rows at the same
+ * time, which is what the L2 cache serves best.
+ *
+ * D is 72 here, so a lane holds at most three q/o elements. */
+__global__ void vis_attention_warp(float *out, const float *q, const float *k, const float *v,
+                                   unsigned N, unsigned H, unsigned D) {
+    const unsigned warps = blockDim.x >> 5;
+    const unsigned qidx = blockIdx.x * warps + (threadIdx.x >> 5);
+    if (qidx >= N) return;
+    const unsigned h = blockIdx.y;
+    const unsigned lane = threadIdx.x & 31u;
+    const uint64_t stride = (uint64_t)H * D;
+    const float *qh = q + (uint64_t)qidx * stride + (uint64_t)h * D;
+    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f;
+    if (lane < D) q0 = qh[lane];
+    if (lane + 32u < D) q1 = qh[lane + 32u];
+    if (lane + 64u < D) q2 = qh[lane + 64u];
+    float m = -INFINITY, l = 0.0f, o0 = 0.0f, o1 = 0.0f, o2 = 0.0f;
+    const float scale = rsqrtf((float)D);
+    for (unsigned j = 0; j < N; j++) {
+        const float *kh = k + (uint64_t)j * stride + (uint64_t)h * D;
+        float dot = 0.0f;
+        if (lane < D) dot += q0 * kh[lane];
+        if (lane + 32u < D) dot += q1 * kh[lane + 32u];
+        if (lane + 64u < D) dot += q2 * kh[lane + 64u];
+        dot = vis_warp_sum(dot) * scale;
+        const float nm = fmaxf(m, dot);
+        const float old = expf(m - nm), w = expf(dot - nm);
+        l = l * old + w;
+        const float *vh = v + (uint64_t)j * stride + (uint64_t)h * D;
+        if (lane < D) o0 = o0 * old + w * vh[lane];
+        if (lane + 32u < D) o1 = o1 * old + w * vh[lane + 32u];
+        if (lane + 64u < D) o2 = o2 * old + w * vh[lane + 64u];
+        m = nm;
+    }
+    float *oh = out + (uint64_t)qidx * stride + (uint64_t)h * D;
+    const float inv = 1.0f / l;
+    if (lane < D) oh[lane] = o0 * inv;
+    if (lane + 32u < D) oh[lane + 32u] = o1 * inv;
+    if (lane + 64u < D) oh[lane + 64u] = o2 * inv;
 }
 
 __global__ void vis_add(float *x, const float *add, const float *bias, unsigned N, unsigned E, unsigned mode) {
@@ -2187,6 +2252,42 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
                            type, 1, T, 1, 1, K, M, 0, false);
 }
 
+/* float -> half, for the vision path's single-pass projection. */
+__global__ void vision_pack_half(__half *dst, const float *src, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half_rn(src[i]);
+}
+
+/* One F16 activation copy and one TF32 GEMM.
+ *
+ * The trunk's projection splits the activation into a leading and a residual half
+ * so two GEMMs can approximate FP32 accuracy. The vision tower's weights are
+ * already F16 and its tolerance is TF32, so that split doubles the GEMM work and
+ * adds two extra passes over the activations for precision it does not need: the
+ * encoder measured 1.4 TFLOPS against a 15 TFLOPS part because of it. */
+extern "C" int ds4_gpu_qwen4_vision_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                              const void *map, uint64_t size, uint64_t off,
+                                              uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
+    using namespace qwen4_cuda;
+    if (type != 1 || !g_cublas_ready || T < 32)
+        return ds4_gpu_qwen4_dense_mm_tensor(out, x, map, size, off, type, T, K, M);
+    const uint64_t rb = row_bytes(1, K);
+    const char *w = weight(map, size, off, rb * M);
+    if (!rb || !w || !tensor(x, (uint64_t)T * K * 4) || !tensor(out, (uint64_t)T * M * 4)) return 0;
+    __half *xh = (__half *)cuda_tmp_alloc((uint64_t)T * K * 2, "vision F16 activation");
+    if (!xh) return 0;
+    const uint64_t n = (uint64_t)T * K;
+    vision_pack_half<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(xh, (const float *)x->ptr, n);
+    if (!launched()) return 0;
+    const float one = 1.0f, zero = 0.0f;
+    if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0), CUBLAS_OP_T, CUBLAS_OP_N,
+                                (int)M, (int)T, (int)K, &one, w, CUDA_R_16F, (int)K,
+                                xh, CUDA_R_16F, (int)K, &zero, (float *)out->ptr, CUDA_R_32F,
+                                (int)M, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT),
+                   "vision TF32 projection")) return 0;
+    return launched();
+}
+
 extern "C" int ds4_gpu_qwen4_dense_mm_prefill_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
     return ds4_gpu_qwen4_dense_mm_tensor(out, x, map, size, off, type, T, K, M);
@@ -2410,9 +2511,8 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     for (const auto b : buffers) if (!b) ok = false;
     auto ptr = [](ds4_gpu_tensor *t) { return (float *)t->ptr; };
     auto wf = [&](uint64_t off, unsigned n) { return (const float *)weight(map,size,off,(uint64_t)n*4); };
-    auto mm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t off, unsigned type,
-                  unsigned rows, unsigned K, unsigned M) {
-        return ds4_gpu_qwen4_dense_mm_tensor(dst,src,map,size,off,type,rows,K,M);
+    auto mm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t off, unsigned type,                  unsigned rows, unsigned K, unsigned M) {
+        return ds4_gpu_qwen4_vision_mm_tensor(dst,src,map,size,off,type,rows,K,M);
     };
     auto norm = [&](ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t wo, uint64_t bo) {
         const float *wgt = wf(wo,E), *bias = wf(bo,E);
@@ -2433,6 +2533,8 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
      * difference between optimising the right kernel and guessing. */
     const bool vprof = getenv("DS4_QWEN4_VISION_PROF") != NULL;
     double tp_attn = 0.0;
+    struct timespec tv0, tv1;
+    if (vprof) clock_gettime(CLOCK_MONOTONIC, &tv0);
     cudaEvent_t ev_a = NULL, ev_b = NULL;
     if (vprof) { cudaEventCreate(&ev_a); cudaEventCreate(&ev_b); }
     auto ms_between = [&](cudaEvent_t a, cudaEvent_t b) {
@@ -2458,14 +2560,22 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
             if (!ok || !qb) { ok = false; break; }
             vis_qkv<<<N,256,0,cuda_decode_stream()>>>(ptr(q),ptr(k),ptr(v),ptr(qkv),qb,H,D,grid_w);
             if (vprof) cudaEventRecord(ev_a, cuda_decode_stream());
-        /* Batched GEMMs when the score buffer fits (340 MB at 2304 patches), the
-         * hand-written kernel otherwise. 811 ms against a projected few tens of
-         * milliseconds over 27 layers made this the encoder's dominant cost. */
+        /* Three implementations, best first: the streaming warp kernel (no score
+         * matrix at all), the batched GEMMs, and the original block-reduction
+         * kernel as the floor. DS4_VISION_ATTN=0|1|3 picks one explicitly. */
         {
-            static int use_blas = -1;
-            if (use_blas < 0) use_blas = getenv("DS4_VISION_ATTN_NO_BLAS") == NULL ? 1 : 0;
+            static int mode = -1;
+            if (mode < 0) {
+                const char *e = getenv("DS4_VISION_ATTN");
+                mode = (e && e[0] == '0') ? 0 : (e && e[0] == '3') ? 3 : 1;
+                if (getenv("DS4_VISION_ATTN_NO_BLAS")) mode = 0;
+            }
             const uint64_t score_bytes = (uint64_t)N * N * H * sizeof(float);
-            if (use_blas && score_bytes <= (uint64_t)1536 * 1024 * 1024) {
+            if (mode == 3) {
+                const unsigned warps = 8u;
+                vis_attention_warp<<<dim3((N + warps - 1u) / warps, H), warps * 32u, 0,
+                                     cuda_decode_stream()>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
+            } else if (mode == 1 && score_bytes <= (uint64_t)1536 * 1024 * 1024) {
                 if (!vis_attention_blas(ptr(attn), ptr(q), ptr(k), ptr(v), N, H, D)) { ok = false; break; }
             } else {
                 vis_attention<<<dim3(N,H),32,0,cuda_decode_stream()>>>(ptr(attn),ptr(q),ptr(k),ptr(v),N,H,D);
@@ -2483,8 +2593,11 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     } while (false);
     if (active && !ds4_gpu_end_commands()) ok = false;
     if (vprof) {
-        fprintf(stderr, "[vprof] layers=%u patches=%u attention=%.1f ms\n",
-                (unsigned)DS4_QWEN4_VISION_LAYERS, (unsigned)N, tp_attn);
+        clock_gettime(CLOCK_MONOTONIC, &tv1);
+        const double total_ms = (double)(tv1.tv_sec - tv0.tv_sec) * 1e3 +
+                                (double)(tv1.tv_nsec - tv0.tv_nsec) / 1e6;
+        fprintf(stderr, "[vprof] layers=%u patches=%u attention=%.1f ms  encode_total=%.1f ms\n",
+                (unsigned)DS4_QWEN4_VISION_LAYERS, (unsigned)N, tp_attn, total_ms);
         cudaEventDestroy(ev_a); cudaEventDestroy(ev_b);
     }
     if (ok) ok = ds4_gpu_tensor_read(res,0,out,(uint64_t)merged*O*4);

@@ -68664,19 +68664,6 @@ static bool qwen35_mtp_spec_on(void) {
     return on != 0;
 }
 
-/* Whether the sampler in charge can consume a draft at all.
- *
- * Greedy decoding routes to the argmax speculative entry, whose CPU branch does a
- * plain single-token eval and never looks at the draft. Paying for the draft walk
- * there measured as a fourteen percent loss for nothing. The server sets this from
- * the temperature it is about to sample with. */
-static int g_spec_consume = 1;
-
-void ds4_engine_set_spec_consume(ds4_engine *e, int on) {
-    (void)e;
-    g_spec_consume = on ? 1 : 0;
-}
-
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 &&
@@ -79360,7 +79347,7 @@ static void qwen35_cpu_forward_batch(
      * costs more than the speculation it enables - 1633 of a 2501 millisecond round at
      * 8716 tokens - and it was paid on every batch forward, plain decode included,
      * because the gate only looked at the global switch. */
-    if (n_tok > 0 && qwen35_mtp_spec_on() && g_spec_consume &&
+    if (n_tok > 0 && qwen35_mtp_spec_on() &&
         qwen35_spec_worth(pos0 + n_tok)) {
         float *draft = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         float *hb = xmalloc((size_t)E * sizeof(float));
@@ -80291,7 +80278,7 @@ static void qwen35_cpu_forward_token(
      * decode takes - it runs one token at a time through here, so the draft was being
      * paid once per token rather than once per round. */
     if (getenv("DS4_QWEN35_MTP_TEST") ||
-        (qwen35_mtp_spec_on() && g_spec_consume && qwen35_spec_worth(pos + 1u))) {
+        (qwen35_mtp_spec_on() && qwen35_spec_worth(pos + 1u))) {
         /* no carried draft token */
         static float prev_h[8192];
         static bool have_prev_h = false;
@@ -100595,6 +100582,29 @@ static int ds4_session_eval_speculative_argmax_impl(
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
+        /* Greedy keeps the batched verify too.
+         *
+         * The sampling entry decides its first token by argmax and accepts a chain
+         * position only when the target's argmax there equals the drafted id, so the
+         * verify itself is deterministic - only the temperature of whatever runs
+         * afterwards differs. This branch used to do one plain forward per token
+         * instead, which cost greedy decoding the entire speculative win: measured
+         * at 3.01 tokens a second against 3.33 with the chain in play.
+         */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35 && s->qwen35_mtp_draft_valid &&
+            qwen35_mtp_spec_on() &&
+            qwen35_spec_worth((uint32_t)s->checkpoint.len) && accepted_cap > 1) {
+            if (getenv("DS4_SPEC_TRACE")) {
+                const int am = ds4_session_argmax(s);
+                fprintf(stderr, "[spectrace] first_token=%d session_argmax=%d draft=%d same=%d\n",
+                        first_token, am, s->qwen35_mtp_draft, (first_token == am));
+            }
+            uint64_t rng = 0x9e3779b97f4a7c15ull;   /* the verify never draws from it */
+            const int n = ds4_session_eval_speculative(
+                s, first_token, max_tokens, eos_token, 1e-6f, 0, 1.0f, 0.0f, &rng,
+                accepted, accepted_cap, err, errlen);
+            if (n > 0) return n;
+        }
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;

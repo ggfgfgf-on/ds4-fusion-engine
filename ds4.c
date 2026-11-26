@@ -78121,12 +78121,73 @@ static double qwen35_now_ms(void) {
 #define QPH_T0(t)   const double t = g_ph_on ? qwen35_now_ms() : 0.0
 #define QPH_ACC(f, t) do { if (g_ph_on) g_ph.f += qwen35_now_ms() - (t); } while (0)
 
+extern int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
+                                const float *host_act, uint32_t T, float *host_out);
+
+/* One branch here covers the whole prefill: every projection in every layer reaches
+ * the weights through this function.
+ *
+ * The GPU path dequantises Q4_K to F16 on the device and multiplies with cuBLAS,
+ * which measured 36.6 TFLOPS end to end against this path's 4.4. It is off unless
+ * DS4_GPU_PREFILL is set, because it moves the trunk's arithmetic to a different
+ * implementation and the output has to be compared token by token before it can be
+ * trusted. */
+static int g_gpu_prefill = -1;
+static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
+    if (g_gpu_prefill < 0) {
+        g_gpu_prefill = getenv("DS4_GPU_PREFILL") != NULL ? 1 : 0;
+        if (g_gpu_prefill && !ds4_gpu_init()) g_gpu_prefill = 0;
+        if (g_gpu_prefill) {
+            /* The weights sit on two-megabyte Windows pages, which are already
+             * non-pageable; registering them lets the driver transfer straight out of
+             * them rather than staging through a pinned bounce buffer. */
+            extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
+            if (m && m->lp_base && m->size)
+                (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
+            else if (m && m->map && m->size)
+                (void)ds4_gpu_q4k_stream_pin((void *)m->map, (size_t)m->size);
+        }
+    }
+    return g_gpu_prefill;
+}
+
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
         const float *x, float *out, uint64_t n_tok, bool exact) {
     if (n_tok == 0) return;
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
+    }
+    if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+        const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
+        if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            const void *wdata = tensor_data(m, w);
+            if (wdata) {
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                const int done = ds4_gpu_q4k_stream_mm(wdata, (uint32_t)in_dim,
+                                                       (uint32_t)rows, x,
+                                                       (uint32_t)n_tok, out);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                if (done) {
+                    static long offloaded = 0;
+                    static double total_ms = 0.0;
+                    static double bytes = 0.0;
+                    offloaded++;
+                    total_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                                (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+                    bytes += (double)rows * (double)in_dim * 144.0 / 256.0;
+                    if (offloaded == 1 || (offloaded % 200) == 0)
+                        fprintf(stderr,
+                                "ds4: [gpuoff] %ld calls, %.0f ms total, %.1f ms/call, "
+                                "%.2f GiB uploaded (%.1f GB/s)\n",
+                                offloaded, total_ms, total_ms / (double)offloaded,
+                                bytes / 1073741824.0,
+                                bytes / (total_ms * 1e6));
+                    return;
+                }
+            }
+        }
     }
     struct timespec mv0, mv1;
     clock_gettime(CLOCK_MONOTONIC, &mv0);

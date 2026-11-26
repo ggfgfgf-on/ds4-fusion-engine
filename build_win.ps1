@@ -196,13 +196,16 @@ if ($Cuda) {
         '-Xcompiler', '/Zc:preprocessor',
         '-I.', '-Iwin_compat', '-Icuda/mmq', "-I$CudaToolkit\include"
     )
-    function Compile-Cu($src, $outName) {
+    function Compile-Cu($src, $outName, [string[]]$extraFlags = @()) {
         $out = Join-Path $ObjDir $outName
-        & $nvcc @NvFlags -c $src -o $out 2>&1 | ForEach-Object { "$_" }
+        & $nvcc @NvFlags @extraFlags -c $src -o $out 2>&1 | ForEach-Object { "$_" }
         if ($LASTEXITCODE -ne 0) { throw "nvcc failed on $src" }
         "  [ok] $outName"
     }
     Compile-Cu 'ds4_cuda.cu' 'ds4_cuda.obj'
+# The streaming Q4_K projection lives outside ds4_cuda.cu so it stays testable on
+# its own; the engine build passes the flag that suppresses its harness main().
+Compile-Cu 'cuda\qwen4\q4k_stream.cu' 'q4k_stream.obj' @('-DQ4K_STREAM_NO_MAIN')
     $mmqFiles = @('ds4_ggml_stubs.cu','ds4_mmq.cu','ds4_mmq_d2r.cu','quantize.cu','mmid.cu','mmvq.cu','ds4_repack.cu')
     $mmqObjs = @()
     foreach ($f in $mmqFiles) {
@@ -211,7 +214,7 @@ if ($Cuda) {
         $mmqObjs += $name
     }
 
-    $cores = @('ds4.obj','ds4_image.obj','ds4_distributed.obj','ds4_tp.obj','ds4_ssd.obj','ds4_cuda.obj','ds4_layer_pack.obj','ds4_engram.obj') + $mmqObjs + @('win_compat.obj', 'win_compat_regex.obj')
+    $cores = @('ds4.obj','q4k_stream.obj','ds4_image.obj','ds4_distributed.obj','ds4_tp.obj','ds4_ssd.obj','ds4_cuda.obj','ds4_layer_pack.obj','ds4_engram.obj') + $mmqObjs + @('win_compat.obj', 'win_compat_regex.obj')
 
     $cudart = "$CudaToolkit\lib\x64\cudart.lib"
     $cublas = "$CudaToolkit\lib\x64\cublas.lib"

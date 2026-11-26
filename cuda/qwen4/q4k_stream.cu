@@ -212,6 +212,37 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
     return 1;
 }
 
+/* ---- entry point for the engine ------------------------------------------ */
+
+/* Ask the driver to treat the engine's weight buffer as host-mapped, so uploads
+ * run at PCIe speed instead of pageable-copy speed. Returns 1 when the region is
+ * registered (or was already), 0 otherwise. */
+extern "C" int ds4_gpu_q4k_stream_pin(void *base, size_t size) {
+    if (!base || !size) return 0;
+    const cudaError_t e = cudaHostRegister(base, size, cudaHostRegisterPortable);
+    if (e == cudaSuccess) {
+        fprintf(stderr, "q4k_stream: pinned %.2f GiB for uploads\n", (double)size / 1073741824.0);
+        return 1;
+    }
+    if (e == cudaErrorHostMemoryAlreadyRegistered) {
+        fprintf(stderr, "q4k_stream: weights were already pinned\n");
+        return 1;
+    }
+    fprintf(stderr, "q4k_stream: pinning %.2f GiB failed: %s\n",
+            (double)size / 1073741824.0, cudaGetErrorString(e));
+    return 0;
+}
+
+extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
+                                     const float *host_act, uint32_t T, float *host_out) {
+    static q4k_stream s;
+    static int ready = -1;
+    if (ready < 0) ready = q4k_stream_open(&s) ? 1 : 0;
+    if (!ready) return 0;
+    return q4k_stream_gemm(&s, (const unsigned char *)host_q4k, K, M, host_act, T,
+                           host_out, NULL);
+}
+
 /* ---- CPU reference ------------------------------------------------------- */
 
 static float half_bits_to_float(unsigned short h) {
@@ -277,6 +308,7 @@ static void make_q4k(unsigned char *dst, unsigned K, unsigned M, unsigned seed) 
     }
 }
 
+#ifndef Q4K_STREAM_NO_MAIN
 int main(void) {
     /* Correctness first, on a shape a double-precision CPU reference can do. */
     const unsigned cK = 512, cM = 64, cT = 8;
@@ -355,3 +387,4 @@ int main(void) {
     free(cq4); free(cx); free(cy);
     return ok ? 0 : 1;
 }
+#endif  /* Q4K_STREAM_NO_MAIN */

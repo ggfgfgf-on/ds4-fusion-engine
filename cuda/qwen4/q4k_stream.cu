@@ -359,7 +359,18 @@ extern "C" const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k,
     if (g_res_n >= Q4K_RESIDENT_SLOTS) return NULL;
     unsigned char *dev = NULL;
     if (cudaMalloc(&dev, bytes) != cudaSuccess) return NULL;
-    if (cudaMemcpy(dev, host_q4k, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    /* Asynchronous when a private stream exists: the first use of a projection would
+     * otherwise block its caller for the whole upload, and the caller is a pool thread -
+     * thirty-five megabytes at the staged rate is four milliseconds of the pool sitting
+     * idle. Subsequent kernels are queued on the same stream, so they still read the
+     * weights after the copy has landed. */
+    if (g_stream_async) {
+        if (cudaMemcpyAsync(dev, host_q4k, bytes, cudaMemcpyHostToDevice,
+                            g_stream_async) != cudaSuccess) {
+            cudaFree(dev);
+            return NULL;
+        }
+    } else if (cudaMemcpy(dev, host_q4k, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaFree(dev);
         return NULL;
     }

@@ -79326,6 +79326,15 @@ static void qwen35_cpu_forward_batch(
     }
 
     for (uint32_t il = start_layer; il < n_trunk; il++) {
+        /* Section timers for the whole layer body: the engine's phase ledger leaves the
+         * matvec time out, which is the bulk of it, so a prefill's five unexplained
+         * seconds cannot be attributed with it. These four cover everything the loop
+         * does and cost two clock reads each. */
+        struct timespec lt0, lt1;
+        static double t_attn_gdn = 0.0, t_ffn = 0.0, t_norm = 0.0, t_reduced = 0.0;
+        static long t_layers = 0, t_device_ffn = 0;
+        const int ltimer = qwen35_gpu_prefill_wanted(m) || getenv("DS4_LAYER_TIME") != NULL;
+        clock_gettime(CLOCK_MONOTONIC, &lt0);
         const ds4_layer_weights *l = &w->layer[il];
         QPH_T0(ph_rms);
         qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->attn_norm), E, n_tok, eps);
@@ -79542,6 +79551,12 @@ static void qwen35_cpu_forward_batch(
                     qwen35_dbg_l2(ff_a, NT * FF), qwen35_dbg_l2(ff_b, NT * FF)); \
         } } while (0)
         FFN_CHK("post-norm");
+        if (ltimer) {
+            clock_gettime(CLOCK_MONOTONIC, &lt1);
+            t_attn_gdn += (double)(lt1.tv_sec - lt0.tv_sec) * 1e3 +
+                          (double)(lt1.tv_nsec - lt0.tv_nsec) / 1e6;
+            clock_gettime(CLOCK_MONOTONIC, &lt0);
+        }
         const bool ffn_exact = getenv("DS4_QWEN35_FFN_EXACT") != NULL;
         /* The whole block on the device when its three matrices are resident.
          *
@@ -79628,6 +79643,17 @@ static void qwen35_cpu_forward_batch(
         FFN_CHK("down");
         }
 #undef FFN_CHK
+        if (ltimer) {
+            clock_gettime(CLOCK_MONOTONIC, &lt1);
+            t_ffn += (double)(lt1.tv_sec - lt0.tv_sec) * 1e3 +
+                     (double)(lt1.tv_nsec - lt0.tv_nsec) / 1e6;
+            t_layers++;
+            if (ffn_on_device) t_device_ffn++;
+            if ((t_layers % 20) == 0)
+                fprintf(stderr,
+                        "ds4: [ltime] %ld layers | attention+gdn %.0f ms | ffn %.0f ms "
+                        "| device blocks %ld\n", t_layers, t_attn_gdn, t_ffn, t_device_ffn);
+        }
         for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {
             for (uint32_t t = 0; t < n_tok; t++)

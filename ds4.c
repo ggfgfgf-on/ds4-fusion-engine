@@ -78134,16 +78134,40 @@ extern int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
  * trusted. */
 static int g_gpu_prefill = -1;
 static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
-    (void)m;
-    /* The host registration and the device buffer sizing happen at session start
-     * (see the CPU prefill state setup); doing them here put a context creation and a
-     * 15.66 GiB registration inside the first prefill, which was half a second of it. */
     if (g_gpu_prefill < 0) {
         g_gpu_prefill = getenv("DS4_GPU_PREFILL") != NULL ? 1 : 0;
         if (g_gpu_prefill && !ds4_gpu_init()) g_gpu_prefill = 0;
+        if (g_gpu_prefill) {
+            /* The weights sit on two-megabyte Windows pages, which are already
+             * non-pageable; registering them lets the driver transfer straight out of
+             * them rather than staging through a pinned bounce buffer. */
+            extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
+            extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
+            if (m && m->lp_base && m->size)
+                (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
+            else if (m && m->map && m->size)
+                (void)ds4_gpu_q4k_stream_pin((void *)m->map, (size_t)m->size);
+            /* Size the buffers for the largest projection up front: the first real
+             * call otherwise paid half a second of context setup inside the prefill. */
+            if (!ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE, (uint32_t)DS4_N_FF_DENSE,
+                                         4096u))
+                g_gpu_prefill = 0;
+        }
     }
     return g_gpu_prefill;
 }
+
+static void qwen35_cpu_matvec_batch(
+        const ds4_model *m, const ds4_tensor *w,
+        const float *x, float *out, uint64_t n_tok, bool exact);
+
+extern int ds4_gpu_q4k_stream_submit(const void *host_q4k, uint32_t K, uint32_t M,
+                                     const float *host_act, uint32_t T, float *host_out);
+extern int ds4_gpu_q4k_stream_wait(void);
+extern int ds4_gpu_q4k_stream_submit2(const void *host_a, const void *host_b, uint32_t K,
+                                      uint32_t Ma, uint32_t Mb, const float *host_act,
+                                      uint32_t T, float *host_out_a, float *host_out_b);
+extern int ds4_gpu_q4k_stream_wait2(void);
 
 static void qwen35_cpu_matvec_batch(
         const ds4_model *m, const ds4_tensor *w,
@@ -78152,23 +78176,75 @@ static void qwen35_cpu_matvec_batch(
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
-    /* `exact` no longer gates this. It selects the CPU's highest-precision path for
-     * the tensors where accuracy matters most, but the GPU path dequantises the same
-     * Q4_K weights to F16 and multiplies in FP32 accumulation, which is not a
-     * downgrade of the same kind - and leaving the gate on sent only about eight
-     * percent of a prefill's projections to the device, which is why the first
-     * measurements showed no gain at all. */
-    /* Only the feed-forward projections go to the device.
+    /* Split the tokens between the device and the host.
      *
-     * Sending every projection measured slower than the plain CPU path: two hundred
-     * small transfers covered twelve percent of the arithmetic, and the host-side
-     * traffic and thread-pool churn they caused cost more than they saved. The FFN
-     * projections carry about eighty-five percent of a layer's work in three calls
-     * each, which is where a transfer is actually paid back. */
-    if (w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+     * A projection is token-independent, so half of the batch can be issued to the
+     * device asynchronously while the host computes the other half with this very
+     * function. Issuing the whole batch to the device and waiting for it only replaces
+     * host work with device work - which is why it measured slower than the host path
+     * - whereas overlapping the two is where the gain is.
+     *
+     * The host half is the recursive call below with exact forced on, so it takes the
+     * plain path and never re-enters this branch. */
+    static int in_split = 0;   /* the host half must not re-enter this branch */
+    if (!exact && !in_split && w->type == DS4_TENSOR_Q4_K && n_tok >= 64u &&
+        qwen35_gpu_prefill_wanted(m)) {
         const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
-        const int big = (rows >= 12000ull) || (in_dim >= 12000ull);
-        if (big && in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+        if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            const void *wdata = tensor_data(m, w);
+            const uint32_t gpu_tok = (uint32_t)(n_tok / 2u);
+            if (wdata && gpu_tok >= 32u &&
+                ds4_gpu_q4k_stream_submit(wdata, (uint32_t)in_dim, (uint32_t)rows, x,
+                                          gpu_tok, out)) {
+                /* the host half, while the device works on the first half; the flag
+                 * keeps it off this branch without forcing the slow exact path */
+                struct timespec h0, h1, w0, w1;
+                clock_gettime(CLOCK_MONOTONIC, &h0);
+                in_split = 1;
+                qwen35_cpu_matvec_batch(m, w, x + (uint64_t)gpu_tok * in_dim,
+                                        out + (uint64_t)gpu_tok * rows,
+                                        n_tok - gpu_tok, exact);
+                in_split = 0;
+                clock_gettime(CLOCK_MONOTONIC, &h1);
+                const double host_ms = (double)(h1.tv_sec - h0.tv_sec) * 1e3 +
+                                       (double)(h1.tv_nsec - h0.tv_nsec) / 1e6;
+                static double host_total = 0.0;
+                static long passes = 0;
+                host_total += host_ms;
+                passes++;
+                if (passes <= 3 || (passes % 100) == 0)
+                    fprintf(stderr,
+                            "ds4: [gpusplit] %ld passes, host half %.2f ms avg "
+                            "(this one %.2f ms), %u of %llu tokens\n",
+                            passes, host_total / (double)passes, host_ms, gpu_tok,
+                            (unsigned long long)n_tok);
+                static long overlapped = 0;
+                static double total_ms = 0.0;
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                const int done = ds4_gpu_q4k_stream_wait();
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                if (done) {
+                    overlapped++;
+                    total_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                                (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+                    if (overlapped <= 3 || (overlapped % 100) == 0)
+                        fprintf(stderr,
+                                "ds4: [gpuov] %ld overlapped passes, %.0f ms waiting, "
+                                "%.2f ms/pass, %u of %llu tokens on device\n",
+                                overlapped, total_ms, total_ms / (double)overlapped,
+                                gpu_tok, (unsigned long long)n_tok);
+                    return;
+                }
+                /* the device half did not finish: the host half is already written, so
+                 * fall through and let the normal path redo the whole batch. */
+                memset(out, 0, (size_t)n_tok * rows * sizeof(float));
+            }
+        }
+    }
+    if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+        const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
+        if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
             const void *wdata = tensor_data(m, w);
             if (wdata) {
                 struct timespec t0, t1;
@@ -78937,27 +79013,50 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
  * n_tok, which the call sites guarantee by construction. Returns false if any
  * job does not qualify, and then the caller falls back to the single-tensor
  * path - no partial work is done, so nothing is written twice. */
-extern int ds4_gpu_q4k_stream_mm2(const void *host_a, const void *host_b, uint32_t K,
-                                  uint32_t Ma, uint32_t Mb, const float *host_act,
-                                  uint32_t T, float *host_out_a, float *host_out_b);
-
 static bool qwen35_cpu_matvec_multi(
         const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
         uint64_t n, const float *x, uint64_t n_tok) {
-    /* The fused pair is where the arithmetic is: gate and up carry most of a layer's
-     * work and share one activation, so one round trip serves both. */
-    if (n == 2u && n_tok >= 32u &&
+    /* Split the fused pair the same way the single projections are split, because this
+     * is where the arithmetic actually is: gate and up carry most of a layer's work and
+     * share one activation, so one device submission covers two large products while
+     * the host half runs on the path below. */
+    static int in_multi_split = 0;
+    if (!in_multi_split && n == 2u && n_tok >= 64u && qwen35_gpu_prefill_wanted(m) &&
         ws[0] && ws[1] && ws[0]->type == DS4_TENSOR_Q4_K && ws[1]->type == DS4_TENSOR_Q4_K &&
         ws[0]->ndim >= 2 && ws[1]->ndim >= 2 && ws[0]->dim[0] == ws[1]->dim[0]) {
         const uint64_t K = ws[0]->dim[0], Ma = ws[0]->dim[1], Mb = ws[1]->dim[1];
-        if (qwen35_gpu_prefill_wanted(m) && K <= 0xFFFFFFFFull && Ma <= 0xFFFFFFFFull &&
-            Mb <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull && Ma && Mb) {
-            const void *wa = tensor_data(m, ws[0]);
-            const void *wb = tensor_data(m, ws[1]);
-            if (wa && wb && ds4_gpu_q4k_stream_mm2(wa, wb, (uint32_t)K, (uint32_t)Ma,
-                                                   (uint32_t)Mb, x, (uint32_t)n_tok,
-                                                   outs[0], outs[1]))
+        const uint32_t gpu_tok = (uint32_t)(n_tok / 2u);
+        const void *wa = tensor_data(m, ws[0]);
+        const void *wb = tensor_data(m, ws[1]);
+        if (wa && wb && Ma && Mb && gpu_tok >= 32u && K <= 0xFFFFFFFFull && Ma &&
+            Ma <= 0xFFFFFFFFull && Mb <= 0xFFFFFFFFull &&
+            ds4_gpu_q4k_stream_submit2(wa, wb, (uint32_t)K, (uint32_t)Ma, (uint32_t)Mb,
+                                       x, gpu_tok, outs[0], outs[1])) {
+            struct timespec h0, h1;
+            clock_gettime(CLOCK_MONOTONIC, &h0);
+            in_multi_split = 1;
+            float *tail_out[2] = {outs[0] + (uint64_t)gpu_tok * Ma,
+                                  outs[1] + (uint64_t)gpu_tok * Mb};
+            const float *tail_x = x + (uint64_t)gpu_tok * K;
+            const uint64_t tail_n = n_tok - gpu_tok;
+            qwen35_cpu_matvec_multi(m, ws, tail_out, 2u, tail_x, tail_n);
+            in_multi_split = 0;
+            clock_gettime(CLOCK_MONOTONIC, &h1);
+            const double host_ms = (double)(h1.tv_sec - h0.tv_sec) * 1e3 +
+                                   (double)(h1.tv_nsec - h0.tv_nsec) / 1e6;
+            static double host_total = 0.0;
+            static long passes = 0;
+            host_total += host_ms;
+            passes++;
+            if (ds4_gpu_q4k_stream_wait2()) {
+                if (passes <= 3 || (passes % 50) == 0)
+                    fprintf(stderr,
+                            "ds4: [gpusplit2] %ld pair passes, host half %.2f ms avg, "
+                            "%u of %llu tokens on device\n",
+                            passes, host_total / (double)passes, gpu_tok,
+                            (unsigned long long)n_tok);
                 return true;
+            }
         }
     }
     const int mdbg = getenv("DS4_QWEN35_MULTI_DBG") != NULL;
@@ -87936,19 +88035,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
             s->qwen35_cpu_q8 = xmalloc(((DS4_N_FF_DENSE + QK_K - 1) / QK_K) *
                                        sizeof(block_q8_K));
-            /* Create the device context here rather than on the first projection: doing
-             * it there put a context creation and five allocations inside the prefill
-             * they exist to accelerate, which measured as half a second of it.
-             *
-             * The weight buffer is deliberately NOT registered here. The CUDA backend
-             * registers the model mapping itself, with cudaHostRegisterMapped and
-             * read-only access; registering the same region first made that call fail
-             * and left a sticky "invalid argument" for every projection afterwards. */
-            if (getenv("DS4_GPU_PREFILL") != NULL && ds4_gpu_init()) {
-                extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
-                (void)ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE,
-                                              (uint32_t)DS4_N_FF_DENSE, 4096u);
-            }
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 if (ds4_qwen4_layer_is_linear(il)) {
                     /* Read and written for every token of every linear layer - a

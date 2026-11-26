@@ -80,7 +80,7 @@ typedef struct {
     float *dev_y;
     __half *dev_w2;      /* the second matrix of a fused pair */
     float *dev_y2;
-    size_t cap_q4, cap_w, cap_x, cap_xf, cap_y, cap_w2, cap_y2;
+    size_t cap_q4, cap_w, cap_w2, cap_x, cap_xf, cap_y, cap_y2;
     cudaEvent_t ev_start, ev_end;    /* created once: a pair per call cost ~2 ms */
 } q4k_stream;
 
@@ -112,8 +112,6 @@ static void q4k_stream_close(q4k_stream *s) {
     if (s->dev_x) cudaFree(s->dev_x);
     if (s->dev_xf) cudaFree(s->dev_xf);
     if (s->dev_y) cudaFree(s->dev_y);
-    if (s->dev_w2) cudaFree(s->dev_w2);
-    if (s->dev_y2) cudaFree(s->dev_y2);
     memset(s, 0, sizeof(*s));
 }
 
@@ -200,18 +198,7 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
         if (ce != cudaSuccess) fprintf(stderr, "q4k_stream: cuda says %s\n", cudaGetErrorString(ce));
         return 0;
     }
-    if (host_out) {
-        const cudaError_t rb = cudaMemcpy(host_out, s->dev_y, (size_t)T * M * 4,
-                                          cudaMemcpyDeviceToHost);
-        if (rb != cudaSuccess) {
-            fprintf(stderr,
-                    "q4k_stream: read-back of %.1f MB to %p failed: %s "
-                    "(dev_y %p, K=%u M=%u T=%u)\n",
-                    (double)((size_t)T * M * 4) / 1048576.0, (void *)host_out,
-                    cudaGetErrorString(rb), (void *)s->dev_y, K, M, T);
-            return 0;
-        }
-    }
+    if (host_out) cudaMemcpy(host_out, s->dev_y, (size_t)T * M * 4, cudaMemcpyDeviceToHost);
     if (out_stage_ms) {
         out_stage_ms[0] = t_up;
         out_stage_ms[1] = t_cvt;
@@ -247,19 +234,188 @@ extern "C" int ds4_gpu_q4k_stream_pin(void *base, size_t size) {
 extern "C" int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T) {
     static q4k_stream s;
     static int ready = -1;
+    static long refused = 0;
     if (ready < 0) {
         ready = q4k_stream_open(&s) ? 1 : 0;
         if (!ready) fprintf(stderr, "q4k_stream: context creation failed\n");
     }
-    (void)K;
-    (void)M;
-    (void)T;
-    /* Only the context is created here. Sizing every buffer for the largest
-     * projection allocated about 890 MB up front, and with the two data paths each
-     * keeping their own context the total ran past what the device had; the later
-     * allocations then failed and left a stale "invalid argument" behind for the next
-     * launch to trip over. The first real call allocates exactly what it needs. */
-    return ready;
+    if (!ready) return 0;
+    /* Size every buffer for the largest projection this model has, so the engine's
+     * alternating K (5120 and 6144) stops causing a free/malloc per call. */
+    const size_t q4 = (size_t)M * (K / 256u) * BLOCK_BYTES;
+    if (!grow((void **)&s.dev_q4, &s.cap_q4, q4)) { refused++; return 0; }
+    if (!grow((void **)&s.dev_w, &s.cap_w, (size_t)M * K * 2)) { refused++; return 0; }
+    if (!grow((void **)&s.dev_x, &s.cap_x, (size_t)T * K * 2)) { refused++; return 0; }
+    if (!grow((void **)&s.dev_xf, &s.cap_xf, (size_t)T * K * 4)) { refused++; return 0; }
+    if (!grow((void **)&s.dev_y, &s.cap_y, (size_t)T * M * 4)) { refused++; return 0; }
+    if (refused) fprintf(stderr, "q4k_stream: warm-up refused %ld buffer(s)\n", refused);
+    return 1;
+}
+
+/* Split-token overlap.
+ *
+ * A layer's feed-forward arithmetic is token-independent, so half of the tokens can
+ * go to the device while the host computes the other half with the path it already
+ * has. submit() issues the whole projection on a private stream and returns at once;
+ * the caller computes its own half, then calls wait() before using the result.
+ *
+ * The point is concurrency, not device throughput: measured alone a projection is
+ * about nine milliseconds against twelve on the host, but inserted serially it only
+ * replaces host work instead of overlapping it, and the prefill came out slower than
+ * the plain host path. */
+static cudaStream_t g_stream_async = NULL;
+static q4k_stream g_async_ctx;
+static int g_async_ready = -1;
+static float *g_pending_out = NULL;
+static size_t g_pending_bytes = 0;
+
+extern "C" int ds4_gpu_q4k_stream_submit(const void *host_q4k, uint32_t K, uint32_t M,
+                                         const float *host_act, uint32_t T,
+                                         float *host_out) {
+    if (g_async_ready < 0) {
+        g_async_ready = q4k_stream_open(&g_async_ctx) ? 1 : 0;
+        if (g_async_ready &&
+            cudaStreamCreateWithFlags(&g_stream_async, cudaStreamNonBlocking) != cudaSuccess) {
+            g_stream_async = NULL;
+            g_async_ready = 0;
+        }
+        if (!g_async_ready) fprintf(stderr, "q4k_stream: async context failed\n");
+    }
+    if (!g_async_ready || !K || !M || !T || (K % 256u) || !g_stream_async) return 0;
+    q4k_stream *s = &g_async_ctx;
+    const size_t q4_bytes = (size_t)M * (K / 256u) * BLOCK_BYTES;
+    const size_t xh = (size_t)T * K;
+    if (!grow((void **)&s->dev_q4, &s->cap_q4, q4_bytes)) return 0;
+    if (!grow((void **)&s->dev_w, &s->cap_w, (size_t)M * K * 2)) return 0;
+    if (!grow((void **)&s->dev_x, &s->cap_x, xh * 2)) return 0;
+    if (!grow((void **)&s->dev_xf, &s->cap_xf, xh * 4)) return 0;
+    if (!grow((void **)&s->dev_y, &s->cap_y, (size_t)T * M * 4)) return 0;
+    cudaMemcpyAsync(s->dev_q4, host_q4k, q4_bytes, cudaMemcpyHostToDevice, g_stream_async);
+    cudaMemcpyAsync(s->dev_xf, host_act, xh * 4, cudaMemcpyHostToDevice, g_stream_async);
+    f32_to_f16_kernel<<<(unsigned)((xh + 255) / 256), 256, 0, g_stream_async>>>(
+        s->dev_x, s->dev_xf, xh);
+    const unsigned long long nb = (unsigned long long)M * (K / 256u);
+    const unsigned warps = 8u;
+    q4k_to_f16_kernel<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u, 0,
+                        g_stream_async>>>(s->dev_w, s->dev_q4, nb);
+    const float one = 1.0f, zero = 0.0f;
+    cublasSetStream(s->cublas, g_stream_async);
+    cublasGemmEx(s->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)T, (int)K, &one,
+                 s->dev_w, CUDA_R_16F, (int)K, s->dev_x, CUDA_R_16F, (int)K, &zero,
+                 s->dev_y, CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT);
+    cublasSetStream(s->cublas, NULL);
+    g_pending_out = host_out;
+    g_pending_bytes = (size_t)T * M * 4;
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "q4k_stream: submit failed: %s\n", cudaGetErrorString(e));
+        return 0;
+    }
+    return 1;
+}
+
+/* Two projections in flight together: gate and up, which share one activation.
+ *
+ * Both are queued on the same private stream before either is awaited, so one wait
+ * covers the pair. Kept separate from submit/wait because a single pending slot cannot
+ * describe two results. */
+static float *g_pending2[2] = {NULL, NULL};
+static size_t g_pending2_bytes[2] = {0, 0};
+static float *g_async2_out_a = NULL;
+static float *g_async2_out_b = NULL;
+static size_t g_async2_bytes_a = 0;
+static size_t g_async2_bytes_b = 0;
+
+extern "C" int ds4_gpu_q4k_stream_submit2(const void *host_a, const void *host_b,
+                                          uint32_t K, uint32_t Ma, uint32_t Mb,
+                                          const float *host_act, uint32_t T,
+                                          float *host_out_a, float *host_out_b) {
+    if (g_async_ready < 0) {
+        /* reuse the same bootstrap as submit() */
+        const int ok = ds4_gpu_q4k_stream_submit(NULL, 0, 0, NULL, 0, NULL);
+        (void)ok;
+    }
+    if (!g_async_ready || !g_stream_async || !K || !Ma || !Mb || !T || (K % 256u)) return 0;
+    q4k_stream *s = &g_async_ctx;
+    const size_t qa = (size_t)Ma * (K / 256u) * BLOCK_BYTES;
+    const size_t qb = (size_t)Mb * (K / 256u) * BLOCK_BYTES;
+    const size_t xh = (size_t)T * K;
+    if (!grow((void **)&s->dev_q4, &s->cap_q4, qa + qb)) return 0;
+    if (!grow((void **)&s->dev_w, &s->cap_w, (size_t)(Ma > Mb ? Ma : Mb) * K * 2)) return 0;
+    if (!grow((void **)&s->dev_w2, &s->cap_w2, (size_t)Mb * K * 2)) return 0;
+    if (!grow((void **)&s->dev_x, &s->cap_x, xh * 2)) return 0;
+    if (!grow((void **)&s->dev_xf, &s->cap_xf, xh * 4)) return 0;
+    if (!grow((void **)&s->dev_y, &s->cap_y, (size_t)T * Ma * 4)) return 0;
+    if (!grow((void **)&s->dev_y2, &s->cap_y2, (size_t)T * Mb * 4)) return 0;
+
+    unsigned char *dq_a = s->dev_q4;
+    unsigned char *dq_b = s->dev_q4 + qa;
+    cudaMemcpyAsync(dq_a, host_a, qa, cudaMemcpyHostToDevice, g_stream_async);
+    cudaMemcpyAsync(dq_b, host_b, qb, cudaMemcpyHostToDevice, g_stream_async);
+    cudaMemcpyAsync(s->dev_xf, host_act, xh * 4, cudaMemcpyHostToDevice, g_stream_async);
+    f32_to_f16_kernel<<<(unsigned)((xh + 255) / 256), 256, 0, g_stream_async>>>(
+        s->dev_x, s->dev_xf, xh);
+    const unsigned warps = 8u;
+    const unsigned long long nb_a = (unsigned long long)Ma * (K / 256u);
+    const unsigned long long nb_b = (unsigned long long)Mb * (K / 256u);
+    q4k_to_f16_kernel<<<(unsigned)((nb_a + warps - 1u) / warps), warps * 32u, 0,
+                        g_stream_async>>>(s->dev_w, dq_a, nb_a);
+    q4k_to_f16_kernel<<<(unsigned)((nb_b + warps - 1u) / warps), warps * 32u, 0,
+                        g_stream_async>>>(s->dev_w2, dq_b, nb_b);
+    const float one = 1.0f, zero = 0.0f;
+    cublasSetStream(s->cublas, g_stream_async);
+    cublasGemmEx(s->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Ma, (int)T, (int)K, &one,
+                 s->dev_w, CUDA_R_16F, (int)K, s->dev_x, CUDA_R_16F, (int)K, &zero,
+                 s->dev_y, CUDA_R_32F, (int)Ma, CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT);
+    cublasGemmEx(s->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Mb, (int)T, (int)K, &one,
+                 s->dev_w2, CUDA_R_16F, (int)K, s->dev_x, CUDA_R_16F, (int)K, &zero,
+                 s->dev_y2, CUDA_R_32F, (int)Mb, CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT);
+    cublasSetStream(s->cublas, NULL);
+    g_async2_out_a = host_out_a;
+    g_async2_out_b = host_out_b;
+    g_async2_bytes_a = (size_t)T * Ma * 4;
+    g_async2_bytes_b = (size_t)T * Mb * 4;
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "q4k_stream: submit2 failed: %s\n", cudaGetErrorString(e));
+        return 0;
+    }
+    (void)g_pending2;
+    (void)g_pending2_bytes;
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_stream_wait2(void) {
+    if (!g_stream_async || !g_async2_out_a) return 0;
+    const cudaError_t e = cudaStreamSynchronize(g_stream_async);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "q4k_stream: async2 stream failed: %s\n", cudaGetErrorString(e));
+        g_async2_out_a = NULL;
+        return 0;
+    }
+    const cudaError_t a = cudaMemcpy(g_async2_out_a, g_async_ctx.dev_y, g_async2_bytes_a,
+                                     cudaMemcpyDeviceToHost);
+    const cudaError_t b = cudaMemcpy(g_async2_out_b, g_async_ctx.dev_y2, g_async2_bytes_b,
+                                     cudaMemcpyDeviceToHost);
+    g_async2_out_a = NULL;
+    return a == cudaSuccess && b == cudaSuccess;
+}
+
+extern "C" int ds4_gpu_q4k_stream_wait(void) {
+    if (!g_stream_async || !g_pending_out) return 0;
+    const cudaError_t e = cudaStreamSynchronize(g_stream_async);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "q4k_stream: async stream failed: %s\n", cudaGetErrorString(e));
+        g_pending_out = NULL;
+        return 0;
+    }
+    const cudaError_t c = cudaMemcpy(g_pending_out, g_async_ctx.dev_y, g_pending_bytes,
+                                     cudaMemcpyDeviceToHost);
+    g_pending_out = NULL;
+    return c == cudaSuccess;
 }
 
 extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
@@ -274,82 +430,9 @@ extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t 
     if (!ready) return 0;
     const int ok = q4k_stream_gemm(&s, (const unsigned char *)host_q4k, K, M, host_act, T,
                                    host_out, NULL);
-    if (!ok && fails++ < 3) {
-        size_t vfree = 0, vtotal = 0;
-        cudaMemGetInfo(&vfree, &vtotal);
-        const cudaError_t le = cudaGetLastError();
-        fprintf(stderr,
-                "q4k_stream: projection K=%u M=%u T=%u refused "
-                "(device %.0f MB free of %.0f MB, last error %s)\n",
-                K, M, T, (double)vfree / 1048576.0, (double)vtotal / 1048576.0,
-                cudaGetErrorString(le));
-    }
+    if (!ok && fails++ < 3)
+        fprintf(stderr, "q4k_stream: projection K=%u M=%u T=%u refused\n", K, M, T);
     return ok;
-}
-
-/* Two projections that share one activation, as the feed-forward gate and up do.
- *
- * Sharing the round trip is the point: the pair draws on the same input, so one
- * activation upload, two dequantisations, two products and one read-back replace two
- * complete round trips. In a prefill that turns roughly nine round trips per layer
- * into four. */
-extern "C" int ds4_gpu_q4k_stream_mm2(const void *host_a, const void *host_b,
-                                      uint32_t K, uint32_t Ma, uint32_t Mb,
-                                      const float *host_act, uint32_t T,
-                                      float *host_out_a, float *host_out_b) {
-    static q4k_stream s;
-    static int ready = -1;
-    if (ready < 0) {
-        ready = q4k_stream_open(&s) ? 1 : 0;
-        if (!ready) fprintf(stderr, "q4k_stream: context creation failed\n");
-    }
-    if (!ready || !K || !Ma || !Mb || !T || (K % 256u)) return 0;
-
-    const size_t qa = (size_t)Ma * (K / 256u) * BLOCK_BYTES;
-    const size_t qb = (size_t)Mb * (K / 256u) * BLOCK_BYTES;
-    const size_t xh = (size_t)T * K;
-    /* one activation buffer, one weight buffer sized for the larger projection,
-     * and a second weight buffer for the pair */
-    if (!grow((void **)&s.dev_q4, &s.cap_q4, qa + qb)) return 0;
-    if (!grow((void **)&s.dev_w, &s.cap_w, (size_t)(Ma > Mb ? Ma : Mb) * K * 2)) return 0;
-    if (!grow((void **)&s.dev_x, &s.cap_x, xh * 2)) return 0;
-    if (!grow((void **)&s.dev_xf, &s.cap_xf, xh * 4)) return 0;
-    /* Reused across calls: a cudaMalloc/cudaFree pair here synchronises the whole
-     * device, which cost more than the pair itself saved. */
-    if (!grow((void **)&s.dev_w2, &s.cap_w2, (size_t)Mb * K * 2)) return 0;
-    if (!grow((void **)&s.dev_y2, &s.cap_y2, (size_t)T * Mb * 4)) return 0;
-    __half *w2 = s.dev_w2;
-    float *y2 = s.dev_y2;
-
-    const float one = 1.0f, zero = 0.0f;
-    unsigned char *dq_a = s.dev_q4;
-    unsigned char *dq_b = s.dev_q4 + qa;
-    cudaMemcpy(dq_a, host_a, qa, cudaMemcpyHostToDevice);
-    cudaMemcpy(dq_b, host_b, qb, cudaMemcpyHostToDevice);
-    cudaMemcpy(s.dev_xf, host_act, xh * 4, cudaMemcpyHostToDevice);
-    f32_to_f16_kernel<<<(unsigned)((xh + 255) / 256), 256>>>(s.dev_x, s.dev_xf, xh);
-
-    const unsigned warps = 8u;
-    const unsigned long long nb_a = (unsigned long long)Ma * (K / 256u);
-    const unsigned long long nb_b = (unsigned long long)Mb * (K / 256u);
-    q4k_to_f16_kernel<<<(unsigned)((nb_a + warps - 1u) / warps), warps * 32u>>>(
-        s.dev_w, dq_a, nb_a);
-    q4k_to_f16_kernel<<<(unsigned)((nb_b + warps - 1u) / warps), warps * 32u>>>(
-        w2, dq_b, nb_b);
-
-    cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Ma, (int)T, (int)K, &one,
-                 s.dev_w, CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero,
-                 s.dev_y, CUDA_R_32F, (int)Ma, CUBLAS_COMPUTE_32F_FAST_TF32,
-                 CUBLAS_GEMM_DEFAULT);
-    cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Mb, (int)T, (int)K, &one,
-                 w2, CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero,
-                 y2, CUDA_R_32F, (int)Mb, CUBLAS_COMPUTE_32F_FAST_TF32,
-                 CUBLAS_GEMM_DEFAULT);
-    const int ok = cudaMemcpy(host_out_a, s.dev_y, (size_t)T * Ma * 4,
-                              cudaMemcpyDeviceToHost) == cudaSuccess;
-    const int ok2 = cudaMemcpy(host_out_b, y2, (size_t)T * Mb * 4,
-                               cudaMemcpyDeviceToHost) == cudaSuccess;
-    return ok && ok2;
 }
 
 /* ---- CPU reference ------------------------------------------------------- */

@@ -96,6 +96,13 @@ static int grow(void **p, size_t *cap, size_t need) {
 
 static int q4k_stream_open(q4k_stream *s) {
     memset(s, 0, sizeof(*s));
+    /* Let the driver's threads block instead of spinning.
+     *
+     * A prefill already saturates every physical core, and a spinning driver thread
+     * takes one of them, which showed up as the whole prefill running about ten
+     * percent slower with the device path enabled than without it on the same binary.
+     * Blocking synchronisation hands that core back. */
+    (void)cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
     if (cublasCreate(&s->cublas) != CUBLAS_STATUS_SUCCESS) return 0;
     if (cudaEventCreate(&s->ev_start) != cudaSuccess) { cublasDestroy(s->cublas); return 0; }
     if (cudaEventCreate(&s->ev_end) != cudaSuccess) { cudaEventDestroy(s->ev_start); cublasDestroy(s->cublas); return 0; }

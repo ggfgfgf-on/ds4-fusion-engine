@@ -79029,33 +79029,48 @@ static bool qwen35_cpu_matvec_multi(
         const void *wa = tensor_data(m, ws[0]);
         const void *wb = tensor_data(m, ws[1]);
         if (wa && wb && Ma && Mb && gpu_tok >= 32u && K <= 0xFFFFFFFFull && Ma &&
-            Ma <= 0xFFFFFFFFull && Mb <= 0xFFFFFFFFull &&
-            ds4_gpu_q4k_stream_submit2(wa, wb, (uint32_t)K, (uint32_t)Ma, (uint32_t)Mb,
-                                       x, gpu_tok, outs[0], outs[1])) {
-            struct timespec h0, h1;
-            clock_gettime(CLOCK_MONOTONIC, &h0);
-            in_multi_split = 1;
-            float *tail_out[2] = {outs[0] + (uint64_t)gpu_tok * Ma,
-                                  outs[1] + (uint64_t)gpu_tok * Mb};
-            const float *tail_x = x + (uint64_t)gpu_tok * K;
-            const uint64_t tail_n = n_tok - gpu_tok;
-            qwen35_cpu_matvec_multi(m, ws, tail_out, 2u, tail_x, tail_n);
-            in_multi_split = 0;
-            clock_gettime(CLOCK_MONOTONIC, &h1);
-            const double host_ms = (double)(h1.tv_sec - h0.tv_sec) * 1e3 +
-                                   (double)(h1.tv_nsec - h0.tv_nsec) / 1e6;
-            static double host_total = 0.0;
-            static long passes = 0;
-            host_total += host_ms;
-            passes++;
-            if (ds4_gpu_q4k_stream_wait2()) {
-                if (passes <= 3 || (passes % 50) == 0)
-                    fprintf(stderr,
-                            "ds4: [gpusplit2] %ld pair passes, host half %.2f ms avg, "
-                            "%u of %llu tokens on device\n",
-                            passes, host_total / (double)passes, gpu_tok,
-                            (unsigned long long)n_tok);
-                return true;
+            Ma <= 0xFFFFFFFFull && Mb <= 0xFFFFFFFFull) {
+            static double submit_total = 0.0, wait_total = 0.0, host_total = 0.0;
+            static long pair_passes = 0;
+            struct timespec s0, s1, h0, h1, w0, w1;
+            clock_gettime(CLOCK_MONOTONIC, &s0);
+            const int submitted = ds4_gpu_q4k_stream_submit2(
+                wa, wb, (uint32_t)K, (uint32_t)Ma, (uint32_t)Mb, x, gpu_tok, outs[0],
+                outs[1]);
+            clock_gettime(CLOCK_MONOTONIC, &s1);
+            submit_total += (double)(s1.tv_sec - s0.tv_sec) * 1e3 +
+                            (double)(s1.tv_nsec - s0.tv_nsec) / 1e6;
+            if (submitted) {
+                clock_gettime(CLOCK_MONOTONIC, &h0);
+                in_multi_split = 1;
+                float *tail_out[2] = {outs[0] + (uint64_t)gpu_tok * Ma,
+                                      outs[1] + (uint64_t)gpu_tok * Mb};
+                const float *tail_x = x + (uint64_t)gpu_tok * K;
+                const uint64_t tail_n = n_tok - gpu_tok;
+                qwen35_cpu_matvec_multi(m, ws, tail_out, 2u, tail_x, tail_n);
+                in_multi_split = 0;
+                clock_gettime(CLOCK_MONOTONIC, &h1);
+                const double host_ms = (double)(h1.tv_sec - h0.tv_sec) * 1e3 +
+                                       (double)(h1.tv_nsec - h0.tv_nsec) / 1e6;
+                clock_gettime(CLOCK_MONOTONIC, &w0);
+                const int waited = ds4_gpu_q4k_stream_wait2();
+                clock_gettime(CLOCK_MONOTONIC, &w1);
+                const double this_wait = (double)(w1.tv_sec - w0.tv_sec) * 1e3 +
+                                         (double)(w1.tv_nsec - w0.tv_nsec) / 1e6;
+                wait_total += this_wait;
+                host_total += host_ms;
+                pair_passes++;
+                if (waited) {
+                    if (pair_passes <= 2 || (pair_passes % 50) == 0)
+                        fprintf(stderr,
+                                "ds4: [gpusplit2] %ld passes | submit %.2f | host %.2f | "
+                                "wait %.2f ms | %u of %llu tokens\n",
+                                pair_passes, submit_total / (double)pair_passes,
+                                host_total / (double)pair_passes,
+                                wait_total / (double)pair_passes, gpu_tok,
+                                (unsigned long long)n_tok);
+                    return true;
+                }
             }
         }
     }

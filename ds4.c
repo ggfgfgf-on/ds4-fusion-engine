@@ -78146,7 +78146,7 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
             /* Leave room for the scratch the products need, then spend the rest on
              * resident weights: every byte that lives on the device is a byte the host
              * does not have to read again. */
-            ds4_gpu_q4k_resident_budget(4ull * 1024ull * 1024ull * 1024ull);
+            ds4_gpu_q4k_resident_budget(5ull * 1024ull * 1024ull * 1024ull);
             extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
             if (m && m->lp_base && m->size)
                 (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
@@ -79061,6 +79061,7 @@ static bool qwen35_cpu_matvec_multi(
         const uint32_t gpu_tok = (uint32_t)(n_tok / 2u);
         const void *wa = tensor_data(m, ws[0]);
         const void *wb = tensor_data(m, ws[1]);
+
         if (wa && wb && Ma && Mb && gpu_tok >= 32u && K <= 0xFFFFFFFFull && Ma &&
             Ma <= 0xFFFFFFFFull && Mb <= 0xFFFFFFFFull) {
             static double submit_total = 0.0, wait_total = 0.0, host_total = 0.0;

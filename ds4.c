@@ -78192,9 +78192,12 @@ static void qwen35_cpu_matvec_batch(
      * The host half is the recursive call below with exact forced on, so it takes the
      * plain path and never re-enters this branch. */
     static int in_split = 0;   /* the host half must not re-enter this branch */
+    static int proj_on = -1;
+    if (proj_on < 0) proj_on = getenv("DS4_GPU_NO_PROJ") == NULL ? 1 : 0;
     static int split_on = -1;
     if (split_on < 0) split_on = getenv("DS4_GPU_NOSPLIT") == NULL ? 1 : 0;
-    if (!exact && !in_split && split_on && w->type == DS4_TENSOR_Q4_K && n_tok >= 64u &&
+    if (proj_on && !exact && !in_split && split_on && w->type == DS4_TENSOR_Q4_K &&
+        n_tok >= 64u &&
         qwen35_gpu_prefill_wanted(m)) {
         const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
         if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
@@ -78251,7 +78254,8 @@ static void qwen35_cpu_matvec_batch(
     }
     /* A projection whose weights are resident skips the host entirely: no host read of
      * those bytes, no upload, only the activations cross the bus. */
-    if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+    if (proj_on && !exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u &&
+        qwen35_gpu_prefill_wanted(m)) {
         extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k, uint64_t bytes);
         extern int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4, uint32_t K,
                                                   uint32_t M, const float *host_act,
@@ -79566,13 +79570,38 @@ static void qwen35_cpu_forward_batch(
             const void *da = ua ? ds4_gpu_q4k_resident(l->ffn_down->abs_offset,
                                                        tensor_data(m, l->ffn_down),
                                                        l->ffn_down->bytes) : NULL;
-            if (ga && ua && da &&
-                ds4_gpu_q4k_ffn_block(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk)) {
+            if (!(ga && ua && da)) {
+                static int why = 0;
+                extern uint64_t ds4_gpu_q4k_resident_bytes(void);
+                extern int ds4_gpu_q4k_resident_count(void);
+                if (why++ < 4)
+                    fprintf(stderr,
+                            "ds4: [gpu_ffn] resident miss il=%u (ga=%d ua=%d da=%d, "
+                            "held %.2f GiB in %d tensors)\n", il, ga != NULL, ua != NULL,
+                            da != NULL,
+                            (double)ds4_gpu_q4k_resident_bytes() / 1073741824.0,
+                            ds4_gpu_q4k_resident_count());
+            }
+            if (ga && ua && da) {
+                struct timespec b0, b1;
+                clock_gettime(CLOCK_MONOTONIC, &b0);
+                const int done =
+                    ds4_gpu_q4k_ffn_block(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk);
+                clock_gettime(CLOCK_MONOTONIC, &b1);
                 static long blocks = 0;
-                blocks++;
-                if (blocks <= 2 || (blocks % 50) == 0)
-                    fprintf(stderr, "ds4: [gpu_ffn] %ld blocks on device\n", blocks);
-                ffn_on_device = 1;
+                static double block_ms = 0.0;
+                if (done) {
+                    blocks++;
+                    block_ms += (double)(b1.tv_sec - b0.tv_sec) * 1e3 +
+                                (double)(b1.tv_nsec - b0.tv_nsec) / 1e6;
+                    if (blocks <= 2 || (blocks % 25) == 0)
+                        fprintf(stderr,
+                                "ds4: [gpu_ffn] %ld blocks, %.2f ms each "
+                                "(%.0f GFLOPS)\n", blocks, block_ms / (double)blocks,
+                                (2.0 * (double)NT * ffn_k * ffn_ff * 3.0) /
+                                    (block_ms / (double)blocks * 1e6));
+                    ffn_on_device = 1;
+                }
             }
         }
         if (!ffn_on_device) {

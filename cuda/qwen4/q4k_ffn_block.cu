@@ -151,12 +151,27 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
     if (!n_tok || !K || !FF || (K % 256u) || (FF % 256u)) return 0;
     const size_t n_x = (size_t)n_tok * K;
     const size_t n_f = (size_t)n_tok * FF;
-    if (!fgrow((void **)&g_ffn.xh, &g_ffn.cap_xh, n_x * 2)) return 0;
-    if (!fgrow((void **)&g_ffn.wf, &g_ffn.cap_wf, (size_t)FF * K * 2)) return 0;
-    if (!fgrow((void **)&g_ffn.af, &g_ffn.cap_af, n_f * 2)) return 0;
-    if (!fgrow((void **)&g_ffn.g, &g_ffn.cap_g, n_f * 4)) return 0;
-    if (!fgrow((void **)&g_ffn.u, &g_ffn.cap_u, n_f * 4)) return 0;
-    if (!fgrow((void **)&g_ffn.y, &g_ffn.cap_y, n_x * 4)) return 0;
+    {
+        static int reported = 0;
+        const size_t want_x = n_x * 2, want_w = (size_t)(FF > K ? FF : K) * K * 2,
+                     want_f = n_f * 4;
+        int ok = fgrow((void **)&g_ffn.xh, &g_ffn.cap_xh, want_x) &&
+                 fgrow((void **)&g_ffn.wf, &g_ffn.cap_wf, want_w) &&
+                 fgrow((void **)&g_ffn.af, &g_ffn.cap_af, n_f * 2) &&
+                 fgrow((void **)&g_ffn.g, &g_ffn.cap_g, want_f) &&
+                 fgrow((void **)&g_ffn.u, &g_ffn.cap_u, want_f) &&
+                 fgrow((void **)&g_ffn.y, &g_ffn.cap_y, n_x * 4);
+        if (!ok && reported++ < 3) {
+            size_t vf = 0, vt = 0;
+            cudaMemGetInfo(&vf, &vt);
+            fprintf(stderr,
+                    "q4k_ffn: cannot allocate (T=%u K=%u FF=%u need %.0f+%.0f+%.0f MB, "
+                    "device %.0f MB free)\n", n_tok, K, FF,
+                    (double)want_x / 1048576.0, (double)want_w / 1048576.0,
+                    (double)(n_f * 4 * 2 + n_f * 2) / 1048576.0, (double)vf / 1048576.0);
+        }
+        if (!ok) return 0;
+    }
 
     {
         /* the host state is float; convert it into halves for the products */
@@ -166,9 +181,21 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
         ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, tmp, n_x);
         cudaFree(tmp);
     }
-    if (!ffn_mm(g_ffn.wf, gate_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) return 0;
-    if (!ffn_mm(g_ffn.wf, up_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL)) return 0;
-    ffn_silu_mul<<<(unsigned)((n_f + 255) / 256), 256>>>(g_ffn.af, g_ffn.g, g_ffn.u, n_f);
-    if (!ffn_mm(g_ffn.wf, down_q4, K, FF, NULL, n_tok, g_ffn.af, g_ffn.y, NULL)) return 0;
+    {
+        static int stage_reported = 0;
+        if (!ffn_mm(g_ffn.wf, gate_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) {
+            if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: gate product failed\n");
+            return 0;
+        }
+        if (!ffn_mm(g_ffn.wf, up_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL)) {
+            if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: up product failed\n");
+            return 0;
+        }
+        ffn_silu_mul<<<(unsigned)((n_f + 255) / 256), 256>>>(g_ffn.af, g_ffn.g, g_ffn.u, n_f);
+        if (!ffn_mm(g_ffn.wf, down_q4, K, FF, NULL, n_tok, g_ffn.af, g_ffn.y, NULL)) {
+            if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: down product failed\n");
+            return 0;
+        }
+    }
     return cudaMemcpy(host_out, g_ffn.y, n_x * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
 }

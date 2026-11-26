@@ -78134,25 +78134,13 @@ extern int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
  * trusted. */
 static int g_gpu_prefill = -1;
 static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
+    (void)m;
+    /* The host registration and the device buffer sizing happen at session start
+     * (see the CPU prefill state setup); doing them here put a context creation and a
+     * 15.66 GiB registration inside the first prefill, which was half a second of it. */
     if (g_gpu_prefill < 0) {
         g_gpu_prefill = getenv("DS4_GPU_PREFILL") != NULL ? 1 : 0;
         if (g_gpu_prefill && !ds4_gpu_init()) g_gpu_prefill = 0;
-        if (g_gpu_prefill) {
-            /* The weights sit on two-megabyte Windows pages, which are already
-             * non-pageable; registering them lets the driver transfer straight out of
-             * them rather than staging through a pinned bounce buffer. */
-            extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
-            extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
-            if (m && m->lp_base && m->size)
-                (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
-            else if (m && m->map && m->size)
-                (void)ds4_gpu_q4k_stream_pin((void *)m->map, (size_t)m->size);
-            /* Size the buffers for the largest projection up front: the first real
-             * call otherwise paid half a second of context setup inside the prefill. */
-            if (!ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE, (uint32_t)DS4_N_FF_DENSE,
-                                         4096u))
-                g_gpu_prefill = 0;
-        }
     }
     return g_gpu_prefill;
 }
@@ -78164,9 +78152,23 @@ static void qwen35_cpu_matvec_batch(
     if (w->type != DS4_TENSOR_Q4_K && w->type != DS4_TENSOR_Q6_K) {
         ds4_die("qwen35 batched matvec: unexpected tensor type");
     }
-    if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+    /* `exact` no longer gates this. It selects the CPU's highest-precision path for
+     * the tensors where accuracy matters most, but the GPU path dequantises the same
+     * Q4_K weights to F16 and multiplies in FP32 accumulation, which is not a
+     * downgrade of the same kind - and leaving the gate on sent only about eight
+     * percent of a prefill's projections to the device, which is why the first
+     * measurements showed no gain at all. */
+    /* Only the feed-forward projections go to the device.
+     *
+     * Sending every projection measured slower than the plain CPU path: two hundred
+     * small transfers covered twelve percent of the arithmetic, and the host-side
+     * traffic and thread-pool churn they caused cost more than they saved. The FFN
+     * projections carry about eighty-five percent of a layer's work in three calls
+     * each, which is where a transfer is actually paid back. */
+    if (w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
         const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
-        if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+        const int big = (rows >= 12000ull) || (in_dim >= 12000ull);
+        if (big && in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
             const void *wdata = tensor_data(m, w);
             if (wdata) {
                 struct timespec t0, t1;
@@ -87914,6 +87916,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
             s->qwen35_cpu_q8 = xmalloc(((DS4_N_FF_DENSE + QK_K - 1) / QK_K) *
                                        sizeof(block_q8_K));
+            /* Register the weight buffer and size the device buffers here rather than
+             * on the first projection: doing it there put a context creation, a 15.66
+             * GiB host registration and five allocations inside the prefill they exist
+             * to accelerate, which measured as half a second of it. */
+            if (getenv("DS4_GPU_PREFILL") != NULL && ds4_gpu_init()) {
+                extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
+                extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
+                if (e->model.lp_base && e->model.size)
+                    (void)ds4_gpu_q4k_stream_pin(e->model.lp_base, (size_t)e->model.size);
+                else if (e->model.map && e->model.size)
+                    (void)ds4_gpu_q4k_stream_pin((void *)e->model.map, (size_t)e->model.size);
+                (void)ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE,
+                                              (uint32_t)DS4_N_FF_DENSE, 4096u);
+            }
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 if (ds4_qwen4_layer_is_linear(il)) {
                     /* Read and written for every token of every linear layer - a

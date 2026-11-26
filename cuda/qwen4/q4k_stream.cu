@@ -236,22 +236,19 @@ extern "C" int ds4_gpu_q4k_stream_pin(void *base, size_t size) {
 extern "C" int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T) {
     static q4k_stream s;
     static int ready = -1;
-    static long refused = 0;
     if (ready < 0) {
         ready = q4k_stream_open(&s) ? 1 : 0;
         if (!ready) fprintf(stderr, "q4k_stream: context creation failed\n");
     }
-    if (!ready) return 0;
-    /* Size every buffer for the largest projection this model has, so the engine's
-     * alternating K (5120 and 6144) stops causing a free/malloc per call. */
-    const size_t q4 = (size_t)M * (K / 256u) * BLOCK_BYTES;
-    if (!grow((void **)&s.dev_q4, &s.cap_q4, q4)) { refused++; return 0; }
-    if (!grow((void **)&s.dev_w, &s.cap_w, (size_t)M * K * 2)) { refused++; return 0; }
-    if (!grow((void **)&s.dev_x, &s.cap_x, (size_t)T * K * 2)) { refused++; return 0; }
-    if (!grow((void **)&s.dev_xf, &s.cap_xf, (size_t)T * K * 4)) { refused++; return 0; }
-    if (!grow((void **)&s.dev_y, &s.cap_y, (size_t)T * M * 4)) { refused++; return 0; }
-    if (refused) fprintf(stderr, "q4k_stream: warm-up refused %ld buffer(s)\n", refused);
-    return 1;
+    (void)K;
+    (void)M;
+    (void)T;
+    /* Only the context is created here. Sizing every buffer for the largest
+     * projection allocated about 890 MB up front, and with the two data paths each
+     * keeping their own context the total ran past what the device had; the later
+     * allocations then failed and left a stale "invalid argument" behind for the next
+     * launch to trip over. The first real call allocates exactly what it needs. */
+    return ready;
 }
 
 extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
@@ -266,8 +263,16 @@ extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t 
     if (!ready) return 0;
     const int ok = q4k_stream_gemm(&s, (const unsigned char *)host_q4k, K, M, host_act, T,
                                    host_out, NULL);
-    if (!ok && fails++ < 3)
-        fprintf(stderr, "q4k_stream: projection K=%u M=%u T=%u refused\n", K, M, T);
+    if (!ok && fails++ < 3) {
+        size_t vfree = 0, vtotal = 0;
+        cudaMemGetInfo(&vfree, &vtotal);
+        const cudaError_t le = cudaGetLastError();
+        fprintf(stderr,
+                "q4k_stream: projection K=%u M=%u T=%u refused "
+                "(device %.0f MB free of %.0f MB, last error %s)\n",
+                K, M, T, (double)vfree / 1048576.0, (double)vtotal / 1048576.0,
+                cudaGetErrorString(le));
+    }
     return ok;
 }
 

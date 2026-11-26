@@ -78142,6 +78142,11 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
              * non-pageable; registering them lets the driver transfer straight out of
              * them rather than staging through a pinned bounce buffer. */
             extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
+            extern void ds4_gpu_q4k_resident_budget(uint64_t bytes);
+            /* Leave room for the scratch the products need, then spend the rest on
+             * resident weights: every byte that lives on the device is a byte the host
+             * does not have to read again. */
+            ds4_gpu_q4k_resident_budget(4ull * 1024ull * 1024ull * 1024ull);
             extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
             if (m && m->lp_base && m->size)
                 (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
@@ -78239,6 +78244,34 @@ static void qwen35_cpu_matvec_batch(
                 /* the device half did not finish: the host half is already written, so
                  * fall through and let the normal path redo the whole batch. */
                 memset(out, 0, (size_t)n_tok * rows * sizeof(float));
+            }
+        }
+    }
+    /* A projection whose weights are resident skips the host entirely: no host read of
+     * those bytes, no upload, only the activations cross the bus. */
+    if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+        extern const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes);
+        extern int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4, uint32_t K,
+                                                  uint32_t M, const float *host_act,
+                                                  uint32_t T, float *host_out);
+        const uint64_t in_dim0 = w->dim[0], rows0 = w->ndim >= 2 ? w->dim[1] : 1u;
+        if (in_dim0 <= 0xFFFFFFFFull && rows0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            const void *hostw = tensor_data(m, w);
+            if (hostw) {
+                const void *devw = ds4_gpu_q4k_resident(hostw, w->bytes);
+                if (devw && ds4_gpu_q4k_stream_mm_resident(devw, (uint32_t)in_dim0,
+                                                           (uint32_t)rows0, x,
+                                                           (uint32_t)n_tok, out)) {
+                    static long resident_calls = 0;
+                    resident_calls++;
+                    if (resident_calls <= 3 || (resident_calls % 100) == 0)
+                        fprintf(stderr,
+                                "ds4: [gpures] %ld projections from resident weights "
+                                "(K=%llu M=%llu T=%llu)\n", resident_calls,
+                                (unsigned long long)in_dim0, (unsigned long long)rows0,
+                                (unsigned long long)n_tok);
+                    return;
+                }
             }
         }
     }

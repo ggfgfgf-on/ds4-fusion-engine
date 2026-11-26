@@ -276,6 +276,95 @@ static int g_async_ready = -1;
 static float *g_pending_out = NULL;
 static size_t g_pending_bytes = 0;
 
+/* Resident weights: keep a projection's Q4_K bytes in device memory once.
+ *
+ * Every other entry point here uploads the weights for each projection and drops them,
+ * which means the host reads the same bytes for its own copy of the work and the device
+ * reads them again over the bus - the traffic doubles and that is what ate the gain in
+ * the split experiment. A resident projection removes the host read entirely: the host
+ * never touches those weights again, and only activations cross the bus.
+ *
+ * The cache is keyed by the host pointer and bounded by a byte budget, since the model
+ * is 15.66 GB and the device has 6.7. */
+typedef struct {
+    const void *key;
+    unsigned char *dev;
+    uint64_t bytes;
+    uint64_t used;
+} q4k_resident_entry;
+
+#define Q4K_RESIDENT_SLOTS 512
+static q4k_resident_entry g_res[Q4K_RESIDENT_SLOTS];
+static int g_res_n = 0;
+static uint64_t g_res_bytes = 0;
+static uint64_t g_res_budget = 0;
+
+extern "C" void ds4_gpu_q4k_resident_budget(uint64_t bytes) {
+    g_res_budget = bytes;
+}
+
+/* Returns the device copy of the weights, uploading them the first time. NULL when the
+ * budget is exhausted, which tells the caller to fall back. */
+extern "C" const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes) {
+    for (int i = 0; i < g_res_n; i++)
+        if (g_res[i].key == host_q4k) return g_res[i].dev;
+    if (!g_res_budget || bytes == 0) return NULL;
+    if (g_res_bytes + bytes > g_res_budget) return NULL;
+    if (g_res_n >= Q4K_RESIDENT_SLOTS) return NULL;
+    unsigned char *dev = NULL;
+    if (cudaMalloc(&dev, bytes) != cudaSuccess) return NULL;
+    if (cudaMemcpy(dev, host_q4k, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev);
+        return NULL;
+    }
+    g_res[g_res_n].key = host_q4k;
+    g_res[g_res_n].dev = dev;
+    g_res[g_res_n].bytes = bytes;
+    g_res[g_res_n].used = 1;
+    g_res_n++;
+    g_res_bytes += bytes;
+    return dev;
+}
+
+/* The product for a projection whose weights already live on the device: dequantise
+ * from there and multiply, with no host traffic for the weights at all. */
+extern "C" int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4_host, uint32_t K,
+                                              uint32_t M, const float *host_act,
+                                              uint32_t T, float *host_out) {
+    static q4k_stream s;
+    static int ready = -1;
+    if (ready < 0) {
+        ready = q4k_stream_open(&s) ? 1 : 0;
+        if (!ready) fprintf(stderr, "q4k_stream: context creation failed\n");
+    }
+    if (!ready || !K || !M || !T || (K % 256u)) return 0;
+    const size_t xh = (size_t)T * K;
+    if (!grow((void **)&s.dev_w, &s.cap_w, (size_t)M * K * 2)) return 0;
+    if (!grow((void **)&s.dev_x, &s.cap_x, xh * 2)) return 0;
+    if (!grow((void **)&s.dev_xf, &s.cap_xf, xh * 4)) return 0;
+    if (!grow((void **)&s.dev_y, &s.cap_y, (size_t)T * M * 4)) return 0;
+    cudaMemcpy(s.dev_xf, host_act, xh * 4, cudaMemcpyHostToDevice);
+    f32_to_f16_kernel<<<(unsigned)((xh + 255) / 256), 256>>>(s.dev_x, s.dev_xf, xh);
+    const unsigned long long nb = (unsigned long long)M * (K / 256u);
+    const unsigned warps = 8u;
+    q4k_to_f16_kernel<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
+        s.dev_w, (const unsigned char *)dev_q4_host, nb);
+    const float one = 1.0f, zero = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+        s.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)T, (int)K, &one, s.dev_w,
+        CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero, s.dev_y, CUDA_R_32F,
+        (int)M, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    if (host_out) {
+        if (cudaMemcpy(host_out, s.dev_y, (size_t)T * M * 4, cudaMemcpyDeviceToHost)
+            != cudaSuccess) return 0;
+    }
+    return 1;
+}
+
+extern "C" uint64_t ds4_gpu_q4k_resident_bytes(void) { return g_res_bytes; }
+extern "C" int ds4_gpu_q4k_resident_count(void) { return g_res_n; }
+
 extern "C" int ds4_gpu_q4k_stream_submit(const void *host_q4k, uint32_t K, uint32_t M,
                                          const float *host_act, uint32_t T,
                                          float *host_out) {

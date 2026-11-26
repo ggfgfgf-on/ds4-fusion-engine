@@ -1037,6 +1037,14 @@ int ds4_gpu_q4k_stream_submit2(const void *host_a, const void *host_b, uint32_t 
                                float *host_out_a, float *host_out_b);
 int ds4_gpu_q4k_stream_wait2(void);
 
+/* Weights kept resident on the device, so the host never reads them again. */
+void ds4_gpu_q4k_resident_budget(uint64_t bytes);
+const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes);
+uint64_t ds4_gpu_q4k_resident_bytes(void);
+int ds4_gpu_q4k_resident_count(void);
+int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4, uint32_t K, uint32_t M,
+                                   const float *host_act, uint32_t T, float *host_out);
+
 int ds4_gpu_q4k_stream_submit(const void *host_q4k, uint32_t K, uint32_t M,
                               const float *host_act, uint32_t T, float *host_out);
 int ds4_gpu_q4k_stream_wait(void);

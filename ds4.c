@@ -78937,9 +78937,29 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
  * n_tok, which the call sites guarantee by construction. Returns false if any
  * job does not qualify, and then the caller falls back to the single-tensor
  * path - no partial work is done, so nothing is written twice. */
+extern int ds4_gpu_q4k_stream_mm2(const void *host_a, const void *host_b, uint32_t K,
+                                  uint32_t Ma, uint32_t Mb, const float *host_act,
+                                  uint32_t T, float *host_out_a, float *host_out_b);
+
 static bool qwen35_cpu_matvec_multi(
         const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
         uint64_t n, const float *x, uint64_t n_tok) {
+    /* The fused pair is where the arithmetic is: gate and up carry most of a layer's
+     * work and share one activation, so one round trip serves both. */
+    if (n == 2u && n_tok >= 32u &&
+        ws[0] && ws[1] && ws[0]->type == DS4_TENSOR_Q4_K && ws[1]->type == DS4_TENSOR_Q4_K &&
+        ws[0]->ndim >= 2 && ws[1]->ndim >= 2 && ws[0]->dim[0] == ws[1]->dim[0]) {
+        const uint64_t K = ws[0]->dim[0], Ma = ws[0]->dim[1], Mb = ws[1]->dim[1];
+        if (qwen35_gpu_prefill_wanted(m) && K <= 0xFFFFFFFFull && Ma <= 0xFFFFFFFFull &&
+            Mb <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull && Ma && Mb) {
+            const void *wa = tensor_data(m, ws[0]);
+            const void *wb = tensor_data(m, ws[1]);
+            if (wa && wb && ds4_gpu_q4k_stream_mm2(wa, wb, (uint32_t)K, (uint32_t)Ma,
+                                                   (uint32_t)Mb, x, (uint32_t)n_tok,
+                                                   outs[0], outs[1]))
+                return true;
+        }
+    }
     const int mdbg = getenv("DS4_QWEN35_MULTI_DBG") != NULL;
     if (n == 0 || n > 4u) { if (mdbg) fprintf(stderr, "[multi] n out of range\n"); return false; }
     qwen35_mv_multi_ctx c;

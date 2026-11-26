@@ -1031,6 +1031,11 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Two Q4_K projections sharing one activation, in a single round trip. */
+int ds4_gpu_q4k_stream_mm2(const void *host_a, const void *host_b, uint32_t K,
+                           uint32_t Ma, uint32_t Mb, const float *host_act, uint32_t T,
+                           float *host_out_a, float *host_out_b);
+
 int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

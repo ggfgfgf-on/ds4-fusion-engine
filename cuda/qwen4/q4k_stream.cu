@@ -78,7 +78,9 @@ typedef struct {
     __half *dev_x;
     float *dev_xf;      /* activations arrive as float and are converted on device */
     float *dev_y;
-    size_t cap_q4, cap_w, cap_x, cap_xf, cap_y;
+    __half *dev_w2;      /* the second matrix of a fused pair */
+    float *dev_y2;
+    size_t cap_q4, cap_w, cap_x, cap_xf, cap_y, cap_w2, cap_y2;
     cudaEvent_t ev_start, ev_end;    /* created once: a pair per call cost ~2 ms */
 } q4k_stream;
 
@@ -110,6 +112,8 @@ static void q4k_stream_close(q4k_stream *s) {
     if (s->dev_x) cudaFree(s->dev_x);
     if (s->dev_xf) cudaFree(s->dev_xf);
     if (s->dev_y) cudaFree(s->dev_y);
+    if (s->dev_w2) cudaFree(s->dev_w2);
+    if (s->dev_y2) cudaFree(s->dev_y2);
     memset(s, 0, sizeof(*s));
 }
 
@@ -265,6 +269,71 @@ extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t 
     if (!ok && fails++ < 3)
         fprintf(stderr, "q4k_stream: projection K=%u M=%u T=%u refused\n", K, M, T);
     return ok;
+}
+
+/* Two projections that share one activation, as the feed-forward gate and up do.
+ *
+ * Sharing the round trip is the point: the pair draws on the same input, so one
+ * activation upload, two dequantisations, two products and one read-back replace two
+ * complete round trips. In a prefill that turns roughly nine round trips per layer
+ * into four. */
+extern "C" int ds4_gpu_q4k_stream_mm2(const void *host_a, const void *host_b,
+                                      uint32_t K, uint32_t Ma, uint32_t Mb,
+                                      const float *host_act, uint32_t T,
+                                      float *host_out_a, float *host_out_b) {
+    static q4k_stream s;
+    static int ready = -1;
+    if (ready < 0) {
+        ready = q4k_stream_open(&s) ? 1 : 0;
+        if (!ready) fprintf(stderr, "q4k_stream: context creation failed\n");
+    }
+    if (!ready || !K || !Ma || !Mb || !T || (K % 256u)) return 0;
+
+    const size_t qa = (size_t)Ma * (K / 256u) * BLOCK_BYTES;
+    const size_t qb = (size_t)Mb * (K / 256u) * BLOCK_BYTES;
+    const size_t xh = (size_t)T * K;
+    /* one activation buffer, one weight buffer sized for the larger projection,
+     * and a second weight buffer for the pair */
+    if (!grow((void **)&s.dev_q4, &s.cap_q4, qa + qb)) return 0;
+    if (!grow((void **)&s.dev_w, &s.cap_w, (size_t)(Ma > Mb ? Ma : Mb) * K * 2)) return 0;
+    if (!grow((void **)&s.dev_x, &s.cap_x, xh * 2)) return 0;
+    if (!grow((void **)&s.dev_xf, &s.cap_xf, xh * 4)) return 0;
+    /* Reused across calls: a cudaMalloc/cudaFree pair here synchronises the whole
+     * device, which cost more than the pair itself saved. */
+    if (!grow((void **)&s.dev_w2, &s.cap_w2, (size_t)Mb * K * 2)) return 0;
+    if (!grow((void **)&s.dev_y2, &s.cap_y2, (size_t)T * Mb * 4)) return 0;
+    __half *w2 = s.dev_w2;
+    float *y2 = s.dev_y2;
+
+    const float one = 1.0f, zero = 0.0f;
+    unsigned char *dq_a = s.dev_q4;
+    unsigned char *dq_b = s.dev_q4 + qa;
+    cudaMemcpy(dq_a, host_a, qa, cudaMemcpyHostToDevice);
+    cudaMemcpy(dq_b, host_b, qb, cudaMemcpyHostToDevice);
+    cudaMemcpy(s.dev_xf, host_act, xh * 4, cudaMemcpyHostToDevice);
+    f32_to_f16_kernel<<<(unsigned)((xh + 255) / 256), 256>>>(s.dev_x, s.dev_xf, xh);
+
+    const unsigned warps = 8u;
+    const unsigned long long nb_a = (unsigned long long)Ma * (K / 256u);
+    const unsigned long long nb_b = (unsigned long long)Mb * (K / 256u);
+    q4k_to_f16_kernel<<<(unsigned)((nb_a + warps - 1u) / warps), warps * 32u>>>(
+        s.dev_w, dq_a, nb_a);
+    q4k_to_f16_kernel<<<(unsigned)((nb_b + warps - 1u) / warps), warps * 32u>>>(
+        w2, dq_b, nb_b);
+
+    cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Ma, (int)T, (int)K, &one,
+                 s.dev_w, CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero,
+                 s.dev_y, CUDA_R_32F, (int)Ma, CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT);
+    cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)Mb, (int)T, (int)K, &one,
+                 w2, CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero,
+                 y2, CUDA_R_32F, (int)Mb, CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT);
+    const int ok = cudaMemcpy(host_out_a, s.dev_y, (size_t)T * Ma * 4,
+                              cudaMemcpyDeviceToHost) == cudaSuccess;
+    const int ok2 = cudaMemcpy(host_out_b, y2, (size_t)T * Mb * 4,
+                               cudaMemcpyDeviceToHost) == cudaSuccess;
+    return ok && ok2;
 }
 
 /* ---- CPU reference ------------------------------------------------------- */

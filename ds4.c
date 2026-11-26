@@ -79539,6 +79539,43 @@ static void qwen35_cpu_forward_batch(
         } } while (0)
         FFN_CHK("post-norm");
         const bool ffn_exact = getenv("DS4_QWEN35_FFN_EXACT") != NULL;
+        /* The whole block on the device when its three matrices are resident.
+         *
+         * This is the unit that matters: gate, up, silu and down together are about
+         * eighty-five percent of a layer and need nothing from the host in between, so
+         * one submission and one return replace three separate projections. The result
+         * lands in blk, exactly where the host path leaves it. */
+        int ffn_on_device = 0;
+        if (qwen35_gpu_prefill_wanted(m) && l->ffn_gate && l->ffn_up && l->ffn_down &&
+            l->ffn_gate->type == DS4_TENSOR_Q4_K && l->ffn_up->type == DS4_TENSOR_Q4_K &&
+            l->ffn_down->type == DS4_TENSOR_Q4_K && NT >= 32u) {
+            extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k,
+                                                    uint64_t bytes);
+            extern int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
+                                             const void *down_q4, const float *host_x,
+                                             uint32_t n_tok, uint32_t K, uint32_t FF,
+                                             float *host_out);
+            const uint32_t ffn_k = (uint32_t)l->ffn_gate->dim[0];
+            const uint32_t ffn_ff = (uint32_t)l->ffn_gate->dim[1];
+            const void *ga = ds4_gpu_q4k_resident(l->ffn_gate->abs_offset,
+                                                  tensor_data(m, l->ffn_gate),
+                                                  l->ffn_gate->bytes);
+            const void *ua = ga ? ds4_gpu_q4k_resident(l->ffn_up->abs_offset,
+                                                       tensor_data(m, l->ffn_up),
+                                                       l->ffn_up->bytes) : NULL;
+            const void *da = ua ? ds4_gpu_q4k_resident(l->ffn_down->abs_offset,
+                                                       tensor_data(m, l->ffn_down),
+                                                       l->ffn_down->bytes) : NULL;
+            if (ga && ua && da &&
+                ds4_gpu_q4k_ffn_block(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk)) {
+                static long blocks = 0;
+                blocks++;
+                if (blocks <= 2 || (blocks % 50) == 0)
+                    fprintf(stderr, "ds4: [gpu_ffn] %ld blocks on device\n", blocks);
+                ffn_on_device = 1;
+            }
+        }
+        if (!ffn_on_device) {
         {
             const ds4_tensor *ws[2] = { l->ffn_gate, l->ffn_up };
             float *os[2] = { ff_a, ff_b };
@@ -79560,6 +79597,7 @@ static void qwen35_cpu_forward_batch(
         FFN_CHK("silu");
         qwen35_cpu_matvec_batch(m, l->ffn_down, ff_b, blk, NT, ffn_exact);
         FFN_CHK("down");
+        }
 #undef FFN_CHK
         for (uint64_t i = 0; i < NT * E; i++) xb[i] += blk[i];
         if (getenv("DS4_QWEN35_GDN_DBG") && il == 0) {

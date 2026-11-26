@@ -81,8 +81,40 @@ typedef struct {
     __half *dev_w2;      /* the second matrix of a fused pair */
     float *dev_y2;
     size_t cap_q4, cap_w, cap_w2, cap_x, cap_xf, cap_y, cap_y2;
+    float *pin_stage;    /* pinned landing buffer for results */
+    size_t cap_pin;
     cudaEvent_t ev_start, ev_end;    /* created once: a pair per call cost ~2 ms */
 } q4k_stream;
+
+/* Results land in pinned memory and are copied from there.
+ *
+ * A device-to-host copy into an ordinary allocation runs at two or three gigabytes a
+ * second because the driver has to pin the destination first; a projection's result is
+ * fifteen megabytes, which cost five to seven milliseconds and swallowed the gain of
+ * keeping its weights resident. Pinned memory takes the copy at bus speed. */
+static int grow_pinned(q4k_stream *s, size_t need) {
+    if (s->cap_pin >= need) return 1;
+    if (s->pin_stage) { cudaFreeHost(s->pin_stage); s->pin_stage = NULL; }
+    s->cap_pin = 0;
+    if (cudaHostAlloc((void **)&s->pin_stage, need, cudaHostAllocDefault) != cudaSuccess) {
+        s->pin_stage = NULL;
+        return 0;
+    }
+    s->cap_pin = need;
+    return 1;
+}
+
+static int fetch_result(q4k_stream *s, float *host_out, const float *dev_src,
+                        size_t bytes) {
+    if (!host_out) return 1;
+    if (!grow_pinned(s, bytes)) {
+        return cudaMemcpy(host_out, dev_src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    if (cudaMemcpy(s->pin_stage, dev_src, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+        return 0;
+    memcpy(host_out, s->pin_stage, bytes);
+    return 1;
+}
 
 static int grow(void **p, size_t *cap, size_t need) {
     if (*cap >= need) return 1;
@@ -111,6 +143,7 @@ static int q4k_stream_open(q4k_stream *s) {
 }
 
 static void q4k_stream_close(q4k_stream *s) {
+    if (s->pin_stage) cudaFreeHost(s->pin_stage);
     if (s->ev_start) cudaEventDestroy(s->ev_start);
     if (s->ev_end) cudaEventDestroy(s->ev_end);
     if (s->cublas) cublasDestroy(s->cublas);
@@ -287,7 +320,10 @@ static size_t g_pending_bytes = 0;
  * The cache is keyed by the host pointer and bounded by a byte budget, since the model
  * is 15.66 GB and the device has 6.7. */
 typedef struct {
-    const void *key;
+    /* The tensor's file offset, not a host pointer: tensor_data() returns one address
+     * while the large-page cache holds the tensor and another when it does not, so a
+     * pointer is not a stable identity and every call missed. */
+    uint64_t key;
     unsigned char *dev;
     uint64_t bytes;
     uint64_t used;
@@ -305,11 +341,21 @@ extern "C" void ds4_gpu_q4k_resident_budget(uint64_t bytes) {
 
 /* Returns the device copy of the weights, uploading them the first time. NULL when the
  * budget is exhausted, which tells the caller to fall back. */
-extern "C" const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes) {
+extern "C" const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k,
+                                            uint64_t bytes) {
+    static long hits = 0, uploads = 0, refused = 0;
     for (int i = 0; i < g_res_n; i++)
-        if (g_res[i].key == host_q4k) return g_res[i].dev;
+        if (g_res[i].key == key) {
+            hits++;
+            if (hits <= 3 || (hits % 100) == 0)
+                fprintf(stderr,
+                        "q4k_stream: residents | %ld hits %ld uploads %ld refused | "
+                        "%.2f GiB held\n", hits, uploads, refused,
+                        (double)g_res_bytes / 1073741824.0);
+            return g_res[i].dev;
+        }
     if (!g_res_budget || bytes == 0) return NULL;
-    if (g_res_bytes + bytes > g_res_budget) return NULL;
+    if (g_res_bytes + bytes > g_res_budget) { refused++; return NULL; }
     if (g_res_n >= Q4K_RESIDENT_SLOTS) return NULL;
     unsigned char *dev = NULL;
     if (cudaMalloc(&dev, bytes) != cudaSuccess) return NULL;
@@ -317,12 +363,13 @@ extern "C" const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes
         cudaFree(dev);
         return NULL;
     }
-    g_res[g_res_n].key = host_q4k;
+    g_res[g_res_n].key = key;
     g_res[g_res_n].dev = dev;
     g_res[g_res_n].bytes = bytes;
     g_res[g_res_n].used = 1;
     g_res_n++;
     g_res_bytes += bytes;
+    uploads++;
     return dev;
 }
 
@@ -355,10 +402,7 @@ extern "C" int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4_host, uint32_t 
         CUDA_R_16F, (int)K, s.dev_x, CUDA_R_16F, (int)K, &zero, s.dev_y, CUDA_R_32F,
         (int)M, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) return 0;
-    if (host_out) {
-        if (cudaMemcpy(host_out, s.dev_y, (size_t)T * M * 4, cudaMemcpyDeviceToHost)
-            != cudaSuccess) return 0;
-    }
+    if (host_out && !fetch_result(&s, host_out, s.dev_y, (size_t)T * M * 4)) return 0;
     return 1;
 }
 
@@ -492,12 +536,12 @@ extern "C" int ds4_gpu_q4k_stream_wait2(void) {
         g_async2_out_a = NULL;
         return 0;
     }
-    const cudaError_t a = cudaMemcpy(g_async2_out_a, g_async_ctx.dev_y, g_async2_bytes_a,
-                                     cudaMemcpyDeviceToHost);
-    const cudaError_t b = cudaMemcpy(g_async2_out_b, g_async_ctx.dev_y2, g_async2_bytes_b,
-                                     cudaMemcpyDeviceToHost);
+    const int a = fetch_result(&g_async_ctx, g_async2_out_a, g_async_ctx.dev_y,
+                               g_async2_bytes_a);
+    const int b = fetch_result(&g_async_ctx, g_async2_out_b, g_async_ctx.dev_y2,
+                               g_async2_bytes_b);
     g_async2_out_a = NULL;
-    return a == cudaSuccess && b == cudaSuccess;
+    return a && b;
 }
 
 extern "C" int ds4_gpu_q4k_stream_wait(void) {
@@ -508,10 +552,10 @@ extern "C" int ds4_gpu_q4k_stream_wait(void) {
         g_pending_out = NULL;
         return 0;
     }
-    const cudaError_t c = cudaMemcpy(g_pending_out, g_async_ctx.dev_y, g_pending_bytes,
-                                     cudaMemcpyDeviceToHost);
+    const int c = fetch_result(&g_async_ctx, g_pending_out, g_async_ctx.dev_y,
+                               g_pending_bytes);
     g_pending_out = NULL;
-    return c == cudaSuccess;
+    return c;
 }
 
 extern "C" int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,

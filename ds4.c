@@ -78192,7 +78192,9 @@ static void qwen35_cpu_matvec_batch(
      * The host half is the recursive call below with exact forced on, so it takes the
      * plain path and never re-enters this branch. */
     static int in_split = 0;   /* the host half must not re-enter this branch */
-    if (!exact && !in_split && w->type == DS4_TENSOR_Q4_K && n_tok >= 64u &&
+    static int split_on = -1;
+    if (split_on < 0) split_on = getenv("DS4_GPU_NOSPLIT") == NULL ? 1 : 0;
+    if (!exact && !in_split && split_on && w->type == DS4_TENSOR_Q4_K && n_tok >= 64u &&
         qwen35_gpu_prefill_wanted(m)) {
         const uint64_t in_dim = w->dim[0], rows = w->ndim >= 2 ? w->dim[1] : 1u;
         if (in_dim <= 0xFFFFFFFFull && rows <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
@@ -78250,7 +78252,7 @@ static void qwen35_cpu_matvec_batch(
     /* A projection whose weights are resident skips the host entirely: no host read of
      * those bytes, no upload, only the activations cross the bus. */
     if (!exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
-        extern const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes);
+        extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k, uint64_t bytes);
         extern int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4, uint32_t K,
                                                   uint32_t M, const float *host_act,
                                                   uint32_t T, float *host_out);
@@ -78258,7 +78260,7 @@ static void qwen35_cpu_matvec_batch(
         if (in_dim0 <= 0xFFFFFFFFull && rows0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
             const void *hostw = tensor_data(m, w);
             if (hostw) {
-                const void *devw = ds4_gpu_q4k_resident(hostw, w->bytes);
+                const void *devw = ds4_gpu_q4k_resident(w->abs_offset, hostw, w->bytes);
                 if (devw && ds4_gpu_q4k_stream_mm_resident(devw, (uint32_t)in_dim0,
                                                            (uint32_t)rows0, x,
                                                            (uint32_t)n_tok, out)) {
@@ -79054,7 +79056,10 @@ static bool qwen35_cpu_matvec_multi(
      * share one activation, so one device submission covers two large products while
      * the host half runs on the path below. */
     static int in_multi_split = 0;
-    if (!in_multi_split && n == 2u && n_tok >= 64u && qwen35_gpu_prefill_wanted(m) &&
+    static int msplit_on = -1;
+    if (msplit_on < 0) msplit_on = getenv("DS4_GPU_NOSPLIT") == NULL ? 1 : 0;
+    if (msplit_on && !in_multi_split && n == 2u && n_tok >= 64u &&
+        qwen35_gpu_prefill_wanted(m) &&
         ws[0] && ws[1] && ws[0]->type == DS4_TENSOR_Q4_K && ws[1]->type == DS4_TENSOR_Q4_K &&
         ws[0]->ndim >= 2 && ws[1]->ndim >= 2 && ws[0]->dim[0] == ws[1]->dim[0]) {
         const uint64_t K = ws[0]->dim[0], Ma = ws[0]->dim[1], Mb = ws[1]->dim[1];

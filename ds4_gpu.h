@@ -1039,7 +1039,7 @@ int ds4_gpu_q4k_stream_wait2(void);
 
 /* Weights kept resident on the device, so the host never reads them again. */
 void ds4_gpu_q4k_resident_budget(uint64_t bytes);
-const void *ds4_gpu_q4k_resident(const void *host_q4k, uint64_t bytes);
+const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k, uint64_t bytes);
 uint64_t ds4_gpu_q4k_resident_bytes(void);
 int ds4_gpu_q4k_resident_count(void);
 int ds4_gpu_q4k_stream_mm_resident(const void *dev_q4, uint32_t K, uint32_t M,

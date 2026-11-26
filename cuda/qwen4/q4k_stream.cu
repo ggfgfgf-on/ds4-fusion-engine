@@ -200,7 +200,18 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
         if (ce != cudaSuccess) fprintf(stderr, "q4k_stream: cuda says %s\n", cudaGetErrorString(ce));
         return 0;
     }
-    if (host_out) cudaMemcpy(host_out, s->dev_y, (size_t)T * M * 4, cudaMemcpyDeviceToHost);
+    if (host_out) {
+        const cudaError_t rb = cudaMemcpy(host_out, s->dev_y, (size_t)T * M * 4,
+                                          cudaMemcpyDeviceToHost);
+        if (rb != cudaSuccess) {
+            fprintf(stderr,
+                    "q4k_stream: read-back of %.1f MB to %p failed: %s "
+                    "(dev_y %p, K=%u M=%u T=%u)\n",
+                    (double)((size_t)T * M * 4) / 1048576.0, (void *)host_out,
+                    cudaGetErrorString(rb), (void *)s->dev_y, K, M, T);
+            return 0;
+        }
+    }
     if (out_stage_ms) {
         out_stage_ms[0] = t_up;
         out_stage_ms[1] = t_cvt;

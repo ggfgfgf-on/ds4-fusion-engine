@@ -87936,17 +87936,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
             s->qwen35_cpu_q8 = xmalloc(((DS4_N_FF_DENSE + QK_K - 1) / QK_K) *
                                        sizeof(block_q8_K));
-            /* Register the weight buffer and size the device buffers here rather than
-             * on the first projection: doing it there put a context creation, a 15.66
-             * GiB host registration and five allocations inside the prefill they exist
-             * to accelerate, which measured as half a second of it. */
+            /* Create the device context here rather than on the first projection: doing
+             * it there put a context creation and five allocations inside the prefill
+             * they exist to accelerate, which measured as half a second of it.
+             *
+             * The weight buffer is deliberately NOT registered here. The CUDA backend
+             * registers the model mapping itself, with cudaHostRegisterMapped and
+             * read-only access; registering the same region first made that call fail
+             * and left a sticky "invalid argument" for every projection afterwards. */
             if (getenv("DS4_GPU_PREFILL") != NULL && ds4_gpu_init()) {
-                extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
                 extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
-                if (e->model.lp_base && e->model.size)
-                    (void)ds4_gpu_q4k_stream_pin(e->model.lp_base, (size_t)e->model.size);
-                else if (e->model.map && e->model.size)
-                    (void)ds4_gpu_q4k_stream_pin((void *)e->model.map, (size_t)e->model.size);
                 (void)ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE,
                                               (uint32_t)DS4_N_FF_DENSE, 4096u);
             }

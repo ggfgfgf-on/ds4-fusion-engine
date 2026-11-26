@@ -79201,9 +79201,18 @@ static void qwen35_compact_head_logits(const ds4_weights *w, const float *x,
 static void qwen35_compact_head_heal(const ds4_model *m, const ds4_weights *w,
                                      int tok);
 
+/* Runs the trunk from h_in at start_layer, or from the token embeddings when h_in is
+ * NULL and start_layer is 0.
+ *
+ * The two extra parameters are what a hybrid needs: the layers whose weights are
+ * resident on the device run there, produce the hidden state, and hand it over; the
+ * host then continues from the next layer. Everything crossing between the two is that
+ * state - six megabytes for a batch of three hundred tokens - rather than the weights,
+ * which is the whole point of keeping them resident. */
 static void qwen35_cpu_forward_batch(
         float *logits_all, const ds4_model *m, const ds4_weights *w,
-        ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0) {
+        ds4_session *s, const int *tokens, uint32_t n_tok, uint32_t pos0,
+        const float *h_in, uint32_t start_layer) {
     const uint32_t E = DS4_N_EMBD;
     const uint32_t C = DS4_N_LIN_CONV_DIM;
     const uint32_t Hk = DS4_N_LIN_K_HEAD, Hv = DS4_N_LIN_V_HEAD, D = DS4_N_LIN_HEAD_DIM;
@@ -79287,7 +79296,10 @@ static void qwen35_cpu_forward_batch(
         }
     }
 
-    for (uint32_t t = 0; t < n_tok; t++) {
+    if (h_in) {
+        memcpy(xb, h_in, (size_t)n_tok * E * sizeof(float));
+    }
+    for (uint32_t t = 0; h_in == NULL && t < n_tok; t++) {
         qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], xb + (uint64_t)t * E);
         /* A vision span replaces its placeholder tokens' embeddings with the encoder's
          * rows. The GPU graph does this inside its own upload path, so a CPU prefill that
@@ -79309,7 +79321,7 @@ static void qwen35_cpu_forward_batch(
         }
     }
 
-    for (uint32_t il = 0; il < n_trunk; il++) {
+    for (uint32_t il = start_layer; il < n_trunk; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         QPH_T0(ph_rms);
         qwen35_rms_par(blk, xb, qwen4_ref_f32(m, l->attn_norm), E, n_tok, eps);
@@ -90978,7 +90990,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 const double ms0 = acc_ms;
                 const uint64_t c0 = acc_calls;
                 qwen35_cpu_forward_batch(lg_batch, &e->model, &e->weights, s, toks,
-                                         (uint32_t)nv, 0u);
+                                         (uint32_t)nv, 0u, NULL, 0u);
                 clock_gettime(CLOCK_MONOTONIC, &w1);
                 const double wall = (double)(w1.tv_sec - w0.tv_sec) * 1e3 +
                                     (double)(w1.tv_nsec - w0.tv_nsec) / 1e6;
@@ -91115,7 +91127,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                            (size_t)conv_f * sizeof(float));
                 }
                 qwen35_cpu_forward_batch(lg_batch, &e->model, &e->weights, s, toks,
-                                         (uint32_t)nv, (uint32_t)saved_len);
+                                         (uint32_t)nv, (uint32_t)saved_len, NULL, 0u);
                 for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
                     if (!s->qwen35_cpu_ssm_state[il]) continue;
                     memcpy(s->qwen35_cpu_ssm_state[il], save + (uint64_t)il * stride,
@@ -91223,7 +91235,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 if (base + n > prompt->len) n = prompt->len - base;
                 for (int k = 0; k < n; k++) buf[k] = prompt->v[base + k];
                 qwen35_cpu_forward_batch(lb, &e->model, &e->weights, s,
-                                         buf, (uint32_t)n, (uint32_t)base);
+                                         buf, (uint32_t)n, (uint32_t)base, NULL, 0u);
                 if (getenv("DS4_QWEN35_BATCH_DBG")) {
                     for (int k = 0; k < 1; k++) {
                         const float *row = lb + (size_t)k * DS4_N_VOCAB;
@@ -101898,7 +101910,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                 }
                 qwen35_cpu_forward_batch(lg, &e2->model, &e2->weights, s,
                                          toks, (uint32_t)nt,
-                                         (uint32_t)s->checkpoint.len);
+                                         (uint32_t)s->checkpoint.len, NULL, 0u);
                 clock_gettime(CLOCK_MONOTONIC, &v1);
                 d_verify = (double)(v1.tv_sec - v2.tv_sec) * 1e3 +
                            (double)(v1.tv_nsec - v2.tv_nsec) / 1e6;
@@ -102073,7 +102085,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                         float *rl = xmalloc((size_t)na * (size_t)V * sizeof(float));
                         qwen35_cpu_forward_batch(rl, &e2->model, &e2->weights, s, toks,
                                                  (uint32_t)na,
-                                                 (uint32_t)s->checkpoint.len);
+                                                 (uint32_t)s->checkpoint.len, NULL, 0u);
                         for (int k = 0; k < na; k++)
                             token_vec_push(&s->checkpoint, toks[k]);
                         s->checkpoint_valid = true;

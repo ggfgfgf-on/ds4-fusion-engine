@@ -79,6 +79,7 @@ typedef struct {
     float *dev_xf;      /* activations arrive as float and are converted on device */
     float *dev_y;
     size_t cap_q4, cap_w, cap_x, cap_xf, cap_y;
+    cudaEvent_t ev_start, ev_end;    /* created once: a pair per call cost ~2 ms */
 } q4k_stream;
 
 static int grow(void **p, size_t *cap, size_t need) {
@@ -94,11 +95,15 @@ static int grow(void **p, size_t *cap, size_t need) {
 static int q4k_stream_open(q4k_stream *s) {
     memset(s, 0, sizeof(*s));
     if (cublasCreate(&s->cublas) != CUBLAS_STATUS_SUCCESS) return 0;
+    if (cudaEventCreate(&s->ev_start) != cudaSuccess) { cublasDestroy(s->cublas); return 0; }
+    if (cudaEventCreate(&s->ev_end) != cudaSuccess) { cudaEventDestroy(s->ev_start); cublasDestroy(s->cublas); return 0; }
     /* default math mode: the F16 operands do not need TF32 emulation */
     return 1;
 }
 
 static void q4k_stream_close(q4k_stream *s) {
+    if (s->ev_start) cudaEventDestroy(s->ev_start);
+    if (s->ev_end) cudaEventDestroy(s->ev_end);
     if (s->cublas) cublasDestroy(s->cublas);
     if (s->dev_q4) cudaFree(s->dev_q4);
     if (s->dev_w) cudaFree(s->dev_w);
@@ -124,9 +129,7 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
     if (!grow((void **)&s->dev_xf, &s->cap_xf, x_half * 4)) return 0;
     if (!grow((void **)&s->dev_y, &s->cap_y, (size_t)T * M * 4)) return 0;
 
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
+    cudaEvent_t e0 = s->ev_start, e1 = s->ev_end;
     const float one = 1.0f, zero = 0.0f;
     float t_up = 0.0f, t_cvt = 0.0f, t_deq = 0.0f, t_gemm = 0.0f;
     if (getenv("Q4K_STREAM_DBG"))
@@ -162,17 +165,13 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
                     cudaGetErrorString(kk));
             return 0;
         }
-        const cudaError_t ks = cudaDeviceSynchronize();
-        if (ks != cudaSuccess) {
-            fprintf(stderr, "q4k_stream: convert kernel failed: %s (n=%zu, grid=%u)\n",
-                    cudaGetErrorString(ks), x_half, (unsigned)((x_half + 255) / 256));
-            return 0;
-        }
+        /* No device-wide sync here: the convert kernel is ordered on the stream ahead
+         * of the dequantiser and the product, and the result is only read back at the
+         * end of the call. Forcing one here cost about two milliseconds per call
+         * across the thousand-odd calls a prefill makes. */
     }
     cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    cudaEventElapsedTime(&t_up, e0, e1);
-    if (cudaGetLastError() != cudaSuccess) { fprintf(stderr, "stage upload/convert faulted\n"); return 0; }
+    if (out_stage_ms) { cudaEventSynchronize(e1); cudaEventElapsedTime(&t_up, e0, e1); }
 
     const unsigned long long nblocks = (unsigned long long)M * (K / 256u);
     const unsigned warps = 8u;
@@ -180,9 +179,7 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
     cudaEventRecord(e0);
     q4k_to_f16_kernel<<<grid, warps * 32u>>>(s->dev_w, s->dev_q4, nblocks);
     cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    cudaEventElapsedTime(&t_deq, e0, e1);
-    if (cudaGetLastError() != cudaSuccess) { fprintf(stderr, "stage dequant faulted\n"); return 0; }
+    if (out_stage_ms) { cudaEventSynchronize(e1); cudaEventElapsedTime(&t_deq, e0, e1); }
 
     cudaEventRecord(e0);
     const cublasStatus_t st =
@@ -191,10 +188,7 @@ static int q4k_stream_gemm(q4k_stream *s, const unsigned char *host_q4k,
                      s->dev_y, CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
                      CUBLAS_GEMM_DEFAULT);
     cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    cudaEventElapsedTime(&t_gemm, e0, e1);
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
+    if (out_stage_ms) { cudaEventSynchronize(e1); cudaEventElapsedTime(&t_gemm, e0, e1); }
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "q4k_stream: cublas status %d (%s) for M=%u N=%u K=%u\n",
                 (int)st, cublasGetStatusString(st), M, T, K);

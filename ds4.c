@@ -78142,10 +78142,16 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
              * non-pageable; registering them lets the driver transfer straight out of
              * them rather than staging through a pinned bounce buffer. */
             extern int ds4_gpu_q4k_stream_pin(void *base, size_t size);
+            extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
             if (m && m->lp_base && m->size)
                 (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
             else if (m && m->map && m->size)
                 (void)ds4_gpu_q4k_stream_pin((void *)m->map, (size_t)m->size);
+            /* Size the buffers for the largest projection up front: the first real
+             * call otherwise paid half a second of context setup inside the prefill. */
+            if (!ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE, (uint32_t)DS4_N_FF_DENSE,
+                                         4096u))
+                g_gpu_prefill = 0;
         }
     }
     return g_gpu_prefill;
@@ -78177,7 +78183,7 @@ static void qwen35_cpu_matvec_batch(
                     total_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
                                 (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
                     bytes += (double)rows * (double)in_dim * 144.0 / 256.0;
-                    if (offloaded == 1 || (offloaded % 200) == 0)
+                    if (offloaded <= 3 || (offloaded % 100) == 0)
                         fprintf(stderr,
                                 "ds4: [gpuoff] %ld calls, %.0f ms total, %.1f ms/call, "
                                 "%.2f GiB uploaded (%.1f GB/s)\n",

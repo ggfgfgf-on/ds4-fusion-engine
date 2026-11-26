@@ -94,7 +94,8 @@ typedef struct {
     float *g;            /* gate product */
     float *u;            /* up product */
     float *y;            /* block output */
-    size_t cap_xh, cap_wf, cap_af, cap_g, cap_u, cap_y;
+    float *xf;           /* the host state, staged before conversion */
+    size_t cap_xh, cap_wf, cap_af, cap_g, cap_u, cap_y, cap_xf;
     int ready;
 } ffn_ctx;
 
@@ -173,14 +174,9 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
         if (!ok) return 0;
     }
 
-    {
-        /* the host state is float; convert it into halves for the products */
-        float *tmp = NULL;
-        if (cudaMalloc(&tmp, n_x * 4) != cudaSuccess) return 0;
-        cudaMemcpy(tmp, host_x, n_x * 4, cudaMemcpyHostToDevice);
-        ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, tmp, n_x);
-        cudaFree(tmp);
-    }
+    if (!fgrow((void **)&g_ffn.xf, &g_ffn.cap_xf, n_x * 4)) return 0;
+    cudaMemcpy(g_ffn.xf, host_x, n_x * 4, cudaMemcpyHostToDevice);
+    ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, n_x);
     {
         static int stage_reported = 0;
         if (!ffn_mm(g_ffn.wf, gate_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) {

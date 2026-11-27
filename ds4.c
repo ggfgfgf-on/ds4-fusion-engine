@@ -78135,7 +78135,11 @@ extern int ds4_gpu_q4k_stream_mm(const void *host_q4k, uint32_t K, uint32_t M,
 static int g_gpu_prefill = -1;
 static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
     if (g_gpu_prefill < 0) {
-        g_gpu_prefill = getenv("DS4_GPU_PREFILL") != NULL ? 1 : 0;
+        /* On by default: the streaming paths need no residency and were measured eleven to
+         * twenty percent ahead of the host alone. DS4_NO_GPU_PREFILL turns them off, and a
+         * failed initialisation leaves them off by itself, so a machine without a usable
+         * device runs exactly as it did. */
+        g_gpu_prefill = getenv("DS4_NO_GPU_PREFILL") == NULL ? 1 : 0;
         if (g_gpu_prefill && !ds4_gpu_init()) g_gpu_prefill = 0;
         if (g_gpu_prefill) {
             /* The weights sit on two-megabyte Windows pages, which are already
@@ -78149,9 +78153,9 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
             /* The six-bit path needs a couple of hundred megabytes of scratch of its own
              * and the weights it handles gain nothing from being resident, so the budget
              * can be handed back entirely while that path is being measured. */
-            ds4_gpu_q4k_resident_budget(getenv("DS4_GPU_NO_RESIDENT")
-                                            ? 0ull
-                                            : 5ull * 1024ull * 1024ull * 1024ull);
+            ds4_gpu_q4k_resident_budget(getenv("DS4_GPU_RESIDENT")
+                                            ? 5ull * 1024ull * 1024ull * 1024ull
+                                            : 0ull);
             {
                 /* Everything six-bit is four and four tenths gigabytes and fits; the
                  * four-bit cache and this one are never both large in a run that only
@@ -78216,7 +78220,7 @@ static void qwen35_cpu_matvec_batch(
     static int proj_on = -1;
     if (proj_on < 0) proj_on = getenv("DS4_GPU_NO_PROJ") == NULL ? 1 : 0;
     static int split_on = -1;
-    if (split_on < 0) split_on = getenv("DS4_GPU_NOSPLIT") == NULL ? 1 : 0;
+    if (split_on < 0) split_on = getenv("DS4_GPU_SPLIT") != NULL ? 1 : 0;
     if (proj_on && !exact && !in_split && split_on && w->type == DS4_TENSOR_Q4_K &&
         n_tok >= 64u &&
         qwen35_gpu_prefill_wanted(m)) {
@@ -78275,6 +78279,23 @@ static void qwen35_cpu_matvec_batch(
     }
     /* A projection whose weights are resident skips the host entirely: no host read of
      * those bytes, no upload, only the activations cross the bus. */
+    if (proj_on && !exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u &&
+        qwen35_gpu_prefill_wanted(m) && getenv("DS4_GPU_STREAM_Q4K")) {
+        extern int ds4_gpu_q4k_mm_stream(const void *host_q4k, uint32_t K, uint32_t M,
+                                        const float *host_act, uint32_t T, float *host_out);
+        const uint64_t in_dim0 = w->dim[0], rows0 = w->ndim >= 2 ? w->dim[1] : 1u;
+        if (in_dim0 <= 0xFFFFFFFFull && rows0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            const void *hw = tensor_data(m, w);
+            if (hw && ds4_gpu_q4k_mm_stream(hw, (uint32_t)in_dim0, (uint32_t)rows0, x,
+                                            (uint32_t)n_tok, out)) {
+                static long q4s = 0;
+                q4s++;
+                if ((q4s % 50) == 0)
+                    fprintf(stderr, "ds4: [gpu_q4s] %ld four-bit products streamed\n", q4s);
+                return;
+            }
+        }
+    }
     if (proj_on && !exact && w->type == DS4_TENSOR_Q4_K && n_tok >= 32u &&
         qwen35_gpu_prefill_wanted(m)) {
         extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k, uint64_t bytes);
@@ -79169,7 +79190,9 @@ static bool qwen35_cpu_matvec_multi(
      * the host half runs on the path below. */
     static int in_multi_split = 0;
     static int msplit_on = -1;
-    if (msplit_on < 0) msplit_on = getenv("DS4_GPU_NOSPLIT") == NULL ? 1 : 0;
+    /* Off unless asked for: splitting a projection between the device and the host
+     * measured behind the host path, because both halves read the same weights. */
+    if (msplit_on < 0) msplit_on = getenv("DS4_GPU_SPLIT") != NULL ? 1 : 0;
     if (msplit_on && !in_multi_split && n == 2u && n_tok >= 64u &&
         qwen35_gpu_prefill_wanted(m) &&
         ws[0] && ws[1] && ws[0]->type == DS4_TENSOR_Q4_K && ws[1]->type == DS4_TENSOR_Q4_K &&

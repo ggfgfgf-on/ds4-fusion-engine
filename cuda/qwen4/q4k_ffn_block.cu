@@ -193,6 +193,47 @@ extern "C" void ds4_gpu_q4k_ffn_times(double *dequant_ms, double *gemm_ms) {
 
 /* weights_on_host: the three pointers are packed Q4_K in host memory and are copied in
  * here; otherwise they are device pointers that are already resident. */
+/* One four-bit matrix, streamed: upload, unpack, multiply by cuBLAS, read back.
+ *
+ * The feed-forward block already does this for three matrices at a time; the attention
+ * projections are the other large four-bit consumers and take the same route. The
+ * transfer is a fifth of a millisecond per megabyte and the arithmetic in the product pays
+ * for it several times over, which is why this needs no residency.
+ */
+extern "C" int ds4_gpu_q4k_mm_stream(const void *host_q4k, uint32_t K, uint32_t M,
+                                     const float *host_act, uint32_t T, float *host_out) {
+    if (!ffn_open()) return 0;
+    if (!host_q4k || !host_act || !host_out || !K || !M || !T || (K % 256u)) return 0;
+    const size_t xbytes = (size_t)T * K;
+    const size_t qbytes = ((size_t)M * K / 256u) * Q6K_BLK_BYTES;
+    if (!fgrow((void **)&g_ffn.xh, &g_ffn.cap_xh, xbytes * 2)) return 0;
+    if (!fgrow((void **)&g_ffn.xf, &g_ffn.cap_xf, xbytes * 4)) return 0;
+    if (!fgrow((void **)&g_ffn.y, &g_ffn.cap_y, (size_t)T * M * 4)) return 0;
+    if (!fgrow((void **)&g_ffn.q4src, &g_ffn.cap_q4src, qbytes)) return 0;
+    if (!fgrow((void **)&g_ffn.wf, &g_ffn.cap_wf, (size_t)M * K * 2)) return 0;
+    cudaMemcpy(g_ffn.q4src, host_q4k, qbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_ffn.xf, host_act, xbytes * 4, cudaMemcpyHostToDevice);
+    ffn_f32_to_f16<<<(unsigned)((xbytes + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, xbytes);
+    const unsigned long long nb = (unsigned long long)M * (K / 256u);
+    const unsigned warps = 8u;
+    ffn_q4k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
+        g_ffn.wf, g_ffn.q4src, nb);
+    const float one = 1.0f, zero = 0.0f;
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+    const uint32_t tile = 5120u;
+    for (uint32_t r0 = 0; r0 < M && st == CUBLAS_STATUS_SUCCESS; r0 += tile) {
+        const uint32_t rows = (M - r0) < tile ? (M - r0) : tile;
+        st = cublasGemmEx(g_ffn.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)T,
+                          (int)K, &one, g_ffn.wf + (size_t)r0 * K, CUDA_R_16F, (int)K,
+                          g_ffn.xh, CUDA_R_16F, (int)K, &zero, g_ffn.y + r0,
+                          CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
+                          CUBLAS_GEMM_DEFAULT);
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    return cudaMemcpy(host_out, g_ffn.y, (size_t)T * M * 4, cudaMemcpyDeviceToHost) ==
+           cudaSuccess;
+}
+
 extern "C" int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
                                         const void *down_q4, const float *host_x,
                                         uint32_t n_tok, uint32_t K, uint32_t FF,

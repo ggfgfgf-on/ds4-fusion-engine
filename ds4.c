@@ -79681,10 +79681,10 @@ static void qwen35_cpu_forward_batch(
             l->ffn_down->type == DS4_TENSOR_Q4_K && NT >= 32u) {
             extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k,
                                                     uint64_t bytes);
-            extern int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
-                                             const void *down_q4, const float *host_x,
-                                             uint32_t n_tok, uint32_t K, uint32_t FF,
-                                             float *host_out);
+            extern int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
+                                                const void *down_q4, const float *host_x,
+                                                uint32_t n_tok, uint32_t K, uint32_t FF,
+                                                float *host_out, int weights_on_host);
             const uint32_t ffn_k = (uint32_t)l->ffn_gate->dim[0];
             const uint32_t ffn_ff = (uint32_t)l->ffn_gate->dim[1];
             const void *ga = ds4_gpu_q4k_resident(l->ffn_gate->abs_offset,
@@ -79696,7 +79696,16 @@ static void qwen35_cpu_forward_batch(
             const void *da = ua ? ds4_gpu_q4k_resident(l->ffn_down->abs_offset,
                                                        tensor_data(m, l->ffn_down),
                                                        l->ffn_down->bytes) : NULL;
-            if (!(ga && ua && da)) {
+            /* Streaming is what makes this pay, so a non-resident layer hands over the
+             * packed bytes and lets the device copy them in: a hundred and six megabytes
+             * of weights against thirty-three milliseconds of host arithmetic. */
+            const int streamed = (ga && ua && da) ? 0 : 1;
+            if (streamed) {
+                ga = tensor_data(m, l->ffn_gate);
+                ua = tensor_data(m, l->ffn_up);
+                da = tensor_data(m, l->ffn_down);
+            }
+            if (!(ga && ua && da) && !streamed) {
                 static int why = 0;
                 extern uint64_t ds4_gpu_q4k_resident_bytes(void);
                 extern int ds4_gpu_q4k_resident_count(void);
@@ -79712,7 +79721,8 @@ static void qwen35_cpu_forward_batch(
                 struct timespec b0, b1;
                 clock_gettime(CLOCK_MONOTONIC, &b0);
                 const int done =
-                    ds4_gpu_q4k_ffn_block(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk);
+                    ds4_gpu_q4k_ffn_block_ex(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk,
+                                               streamed);
                 clock_gettime(CLOCK_MONOTONIC, &b1);
                 static long blocks = 0;
                 static double block_ms = 0.0;

@@ -86,8 +86,12 @@ __global__ void ffn_silu_mul(__half *a, const float *gate, const float *up,
     a[i] = __float2half_rn(up[i] * s);
 }
 
+#define Q6K_BLK_BYTES 144u
+
 typedef struct {
     cublasHandle_t cublas;
+    unsigned char *q4src;    /* packed weights when they are streamed */
+    size_t cap_q4src;
     __half *xh;          /* activations, halves */
     __half *wf;          /* one dequantised weight at a time */
     __half *af;          /* silu(up*gate) halves */
@@ -187,10 +191,25 @@ extern "C" void ds4_gpu_q4k_ffn_times(double *dequant_ms, double *gemm_ms) {
     *gemm_ms = g_gemm_ms;
 }
 
+/* weights_on_host: the three pointers are packed Q4_K in host memory and are copied in
+ * here; otherwise they are device pointers that are already resident. */
+extern "C" int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
+                                        const void *down_q4, const float *host_x,
+                                        uint32_t n_tok, uint32_t K, uint32_t FF,
+                                        float *host_out, int weights_on_host);
+
 extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
                                      const void *down_q4, const float *host_x,
                                      uint32_t n_tok, uint32_t K, uint32_t FF,
                                      float *host_out) {
+    return ds4_gpu_q4k_ffn_block_ex(gate_q4, up_q4, down_q4, host_x, n_tok, K, FF,
+                                    host_out, 0);
+}
+
+extern "C" int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
+                                        const void *down_q4, const float *host_x,
+                                        uint32_t n_tok, uint32_t K, uint32_t FF,
+                                        float *host_out, int weights_on_host) {
     if (!ffn_open()) return 0;
     if (!gate_q4 || !up_q4 || !down_q4 || !host_x || !host_out) return 0;
     if (!n_tok || !K || !FF || (K % 256u) || (FF % 256u)) return 0;
@@ -226,16 +245,37 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
     ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, n_x);
     {
         static int stage_reported = 0;
-        if (!ffn_mm(g_ffn.wf, gate_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) {
+        const void *gw = gate_q4, *uw = up_q4, *dw = down_q4;
+    if (weights_on_host) {
+        /* one staging buffer reused for the three matrices, in the order they are used */
+        const size_t bytes = ((size_t)FF * K / 256u) * Q6K_BLK_BYTES;
+        if (!fgrow((void **)&g_ffn.q4src, &g_ffn.cap_q4src, bytes)) return 0;
+    }
+    if (weights_on_host) {
+        const size_t gb = ((size_t)FF * K / 256u) * Q6K_BLK_BYTES;
+        cudaMemcpy(g_ffn.q4src, gate_q4, gb, cudaMemcpyHostToDevice);
+        gw = g_ffn.q4src;
+    }
+    if (!ffn_mm(g_ffn.wf, gw, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) {
             if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: gate product failed\n");
             return 0;
         }
-        if (!ffn_mm(g_ffn.wf, up_q4, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL)) {
+        if (weights_on_host) {
+        const size_t ub = ((size_t)FF * K / 256u) * Q6K_BLK_BYTES;
+        cudaMemcpy(g_ffn.q4src, up_q4, ub, cudaMemcpyHostToDevice);
+        uw = g_ffn.q4src;
+    }
+    if (!ffn_mm(g_ffn.wf, uw, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL)) {
             if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: up product failed\n");
             return 0;
         }
         ffn_silu_mul<<<(unsigned)((n_f + 255) / 256), 256>>>(g_ffn.af, g_ffn.g, g_ffn.u, n_f);
-        if (!ffn_mm(g_ffn.wf, down_q4, K, FF, NULL, n_tok, g_ffn.af, g_ffn.y, NULL)) {
+        if (weights_on_host) {
+        const size_t db = ((size_t)K * FF / 256u) * Q6K_BLK_BYTES;
+        cudaMemcpy(g_ffn.q4src, down_q4, db, cudaMemcpyHostToDevice);
+        dw = g_ffn.q4src;
+    }
+    if (!ffn_mm(g_ffn.wf, dw, K, FF, NULL, n_tok, g_ffn.af, g_ffn.y, NULL)) {
             if (stage_reported++ < 3) fprintf(stderr, "q4k_ffn: down product failed\n");
             return 0;
         }

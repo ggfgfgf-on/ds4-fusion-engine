@@ -259,6 +259,103 @@ extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t 
 /* The activation is already halves on the device, which is the case inside the
  * feed-forward block: gate and up have been multiplied and silu applied, so the down
  * product only needs the weights moved. */
+/* The same product, pipelined over row tiles.
+ *
+ * Called one tensor at a time this is entirely serial: the weights are copied up, unpacked,
+ * multiplied and the result copied back, and the device idles through every one of those
+ * steps except the multiply. Measured against a chunk's worth of arithmetic the device was
+ * at eleven percent of its rate.
+ *
+ * Two streams and two buffer sets fix the ordering without changing the arithmetic: tile i
+ * is copied and unpacked on the transfer stream while tile i-1 is multiplied on the
+ * compute stream, and the multiply for tile i waits on the event the transfer for tile i
+ * records. Tiles are five thousand one hundred and twenty rows, the size the handle
+ * accepts.
+ */
+typedef struct {
+    cublasHandle_t cublas;
+    cudaStream_t tx, cx;
+    cudaEvent_t ev[2], done;
+    unsigned char *src[2];
+    __half *wbuf[2];
+    float *y;
+    size_t cap_src[2], cap_w[2], cap_y;
+    int ready;
+} q6k_pipe_ctx;
+
+static q6k_pipe_ctx g_pipe;
+
+extern "C" int ds4_gpu_q6k_mm_pipe(const void *host_q6, uint32_t K, uint32_t M,
+                                   const float *host_act, uint32_t T, float *host_out) {
+    if (!g_pipe.ready) {
+        if (cublasCreate(&g_pipe.cublas) != CUBLAS_STATUS_SUCCESS) return 0;
+        if (cudaStreamCreateWithFlags(&g_pipe.tx, cudaStreamNonBlocking) != cudaSuccess)
+            return 0;
+        if (cudaStreamCreateWithFlags(&g_pipe.cx, cudaStreamNonBlocking) != cudaSuccess)
+            return 0;
+        for (int i = 0; i < 2; i++)
+            if (cudaEventCreateWithFlags(&g_pipe.ev[i], cudaEventDisableTiming) !=
+                cudaSuccess)
+                return 0;
+        if (cudaEventCreateWithFlags(&g_pipe.done, cudaEventDisableTiming) != cudaSuccess)
+            return 0;
+        g_pipe.ready = 1;
+    }
+    if (!host_q6 || !host_act || !host_out || !K || !M || !T || (K % 256u)) return 0;
+
+    const uint32_t tile = 5120u;
+    const uint32_t ntile = (M + tile - 1u) / tile;
+    const size_t xh = (size_t)T * K;
+    if (!q6grow((void **)&g_pipe.y, &g_pipe.cap_y, (size_t)T * M * 4)) return 0;
+    for (int i = 0; i < 2; i++) {
+        if (!q6grow((void **)&g_pipe.src[i], &g_pipe.cap_src[i],
+                    (size_t)tile * (K / 256u) * Q6K_BYTES))
+            return 0;
+        if (!q6grow((void **)&g_pipe.wbuf[i], &g_pipe.cap_w[i], (size_t)tile * K * 2))
+            return 0;
+    }
+    __half *xh_dev = NULL;
+    if (cudaMalloc(&xh_dev, xh * 2) != cudaSuccess) return 0;
+    float *xh_f = NULL;
+    if (cudaMalloc(&xh_f, xh * 4) != cudaSuccess) { cudaFree(xh_dev); return 0; }
+    cudaMemcpy(xh_f, host_act, xh * 4, cudaMemcpyHostToDevice);
+    q6k_f32_to_f16<<<(unsigned)((xh + 255) / 256), 256, 0, g_pipe.tx>>>(xh_dev, xh_f, xh);
+    cudaFree(xh_f);
+
+    cublasSetStream(g_pipe.cublas, g_pipe.cx);
+    const float one = 1.0f, zero = 0.0f;
+    const size_t row_bytes = (size_t)(K / 256u) * Q6K_BYTES;
+    for (uint32_t i = 0; i < ntile; i++) {
+        const uint32_t r0 = i * tile;
+        const uint32_t rows = (M - r0) < tile ? (M - r0) : tile;
+        const int slot = (int)(i & 1u);
+        /* the transfer for this tile is issued as soon as its slot is free, which is when
+         * the multiply that used it has been queued */
+        cudaMemcpyAsync(g_pipe.src[slot], (const unsigned char *)host_q6 + r0 * row_bytes,
+                        (size_t)rows * row_bytes, cudaMemcpyHostToDevice, g_pipe.tx);
+        const unsigned long long nb = (unsigned long long)rows * (K / 256u);
+        const unsigned warps = 8u;
+        q6k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u, 0, g_pipe.tx>>>(
+            g_pipe.wbuf[slot], g_pipe.src[slot], nb);
+        cudaEventRecord(g_pipe.ev[slot], g_pipe.tx);
+        cudaStreamWaitEvent(g_pipe.cx, g_pipe.ev[slot], 0);
+        const cublasStatus_t st = cublasGemmEx(
+            g_pipe.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)T, (int)K, &one,
+            g_pipe.wbuf[slot], CUDA_R_16F, (int)K, xh_dev, CUDA_R_16F, (int)K, &zero,
+            g_pipe.y + r0, CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
+            CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            cudaFree(xh_dev);
+            return 0;
+        }
+    }
+    cublasSetStream(g_pipe.cublas, NULL);
+    cudaStreamSynchronize(g_pipe.cx);
+    cudaFree(xh_dev);
+    return cudaMemcpy(host_out, g_pipe.y, (size_t)T * M * 4, cudaMemcpyDeviceToHost) ==
+           cudaSuccess;
+}
+
 extern "C" int ds4_gpu_q6k_mm_from_device(const void *host_q6, uint32_t K, uint32_t M,
                                           const void *dev_act_f16, uint32_t T,
                                           float *host_out) {

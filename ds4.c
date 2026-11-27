@@ -78498,9 +78498,15 @@ static void qwen35_cpu_matvec_batch(
                                                uint32_t K, uint32_t M,
                                                const float *host_act, uint32_t T,
                                                float *host_out);
-                if (hq6 && ds4_gpu_q6k_mm_keyed(w->abs_offset, hq6, (uint32_t)in_dim0,
-                                                (uint32_t)rows0, x, (uint32_t)n_tok,
-                                                out)) {
+                extern int ds4_gpu_q6k_mm_pipe(const void *host_q6, uint32_t K,
+                                               uint32_t M, const float *host_act,
+                                               uint32_t T, float *host_out);
+                const int q6_ok = getenv("DS4_NO_Q6_PIPE")
+                    ? ds4_gpu_q6k_mm_keyed(w->abs_offset, hq6, (uint32_t)in_dim0,
+                                           (uint32_t)rows0, x, (uint32_t)n_tok, out)
+                    : ds4_gpu_q6k_mm_pipe(hq6, (uint32_t)in_dim0, (uint32_t)rows0, x,
+                                          (uint32_t)n_tok, out);
+                if (hq6 && q6_ok) {
                     ok++;
                     free(xq);
                     return;

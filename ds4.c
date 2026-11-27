@@ -79325,6 +79325,9 @@ static void qwen35_cpu_forward_batch(
         }
     }
 
+    const int ltimer_outer = getenv("DS4_LAYER_TIME") != NULL;
+    struct timespec ol0, ol1;
+    if (ltimer_outer) clock_gettime(CLOCK_MONOTONIC, &ol0);
     for (uint32_t il = start_layer; il < n_trunk; il++) {
         /* Section timers for the whole layer body: the engine's phase ledger leaves the
          * matvec time out, which is the bulk of it, so a prefill's five unexplained
@@ -79661,6 +79664,14 @@ static void qwen35_cpu_forward_batch(
                         t, qwen35_dbg_l2(xb + (uint64_t)t * E, E),
                         qwen35_dbg_l2(blk + (uint64_t)t * E, E));
         }
+    }
+    if (ltimer_outer) {
+        clock_gettime(CLOCK_MONOTONIC, &ol1);
+        static double t_loop = 0.0;
+        t_loop += (double)(ol1.tv_sec - ol0.tv_sec) * 1e3 +
+                  (double)(ol1.tv_nsec - ol0.tv_nsec) / 1e6;
+        fprintf(stderr, "ds4: [ltime3] layer loop total %.0f ms for %u layers\n",
+                t_loop, n_trunk - start_layer);
     }
     /* the output head per position.
      *

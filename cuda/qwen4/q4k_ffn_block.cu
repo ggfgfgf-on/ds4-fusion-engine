@@ -95,11 +95,24 @@ typedef struct {
     float *u;            /* up product */
     float *y;            /* block output */
     float *xf;           /* the host state, staged before conversion */
+    float *pin_in;       /* pinned landing and launch buffers */
+    float *pin_out;
+    size_t cap_pin_in, cap_pin_out;
     size_t cap_xh, cap_wf, cap_af, cap_g, cap_u, cap_y, cap_xf;
     int ready;
 } ffn_ctx;
 
 static ffn_ctx g_ffn;
+
+static int fpin(float **p, size_t *cap, size_t need) {
+    if (*cap >= need) return 1;
+    if (*p) cudaFreeHost(*p);
+    *p = NULL;
+    *cap = 0;
+    if (cudaHostAlloc((void **)p, need, cudaHostAllocDefault) != cudaSuccess) return 0;
+    *cap = need;
+    return 1;
+}
 
 static int fgrow(void **p, size_t *cap, size_t need) {
     if (*cap >= need) return 1;
@@ -120,27 +133,58 @@ static int ffn_open(void) {
 }
 
 /* One Q4_K matrix times the activation block, into out (or A of the next stage). */
+static double g_dq_ms, g_gemm_ms;
+
 static int ffn_mm(__half *w, const void *q4, unsigned rows, unsigned cols,
                   const __half *a, unsigned n_tok, const __half *a_override,
                   float *out_f32, __half *out_f16) {
     const unsigned long long nb = (unsigned long long)rows * (cols / 256u);
     const unsigned warps = 8u;
-    ffn_q4k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
-        w, (const unsigned char *)q4, nb);
+    {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        cudaEventRecord(e0);
+        ffn_q4k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
+            w, (const unsigned char *)q4, nb);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        g_dq_ms += ms;
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+    }
     if (cudaGetLastError() != cudaSuccess) return 0;
     const __half *src = a_override ? a_override : a;
     const float one = 1.0f, zero = 0.0f;
     if (out_f32) {
-        const cublasStatus_t st = cublasGemmEx(
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        cudaEventRecord(e0);
+        const cublasStatus_t st0 = cublasGemmEx(
             g_ffn.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)n_tok, (int)cols, &one,
             w, CUDA_R_16F, (int)cols, src, CUDA_R_16F, (int)cols, &zero, out_f32,
             CUDA_R_32F, (int)rows, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
-        return st == CUBLAS_STATUS_SUCCESS;
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        g_gemm_ms += ms;
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        return st0 == CUBLAS_STATUS_SUCCESS;
     }
     /* halves out for the next stage: accumulate into a float view is not possible, so
      * this intermediate is handled by the caller converting through floats. */
     (void)out_f16;
     return 0;
+}
+
+extern "C" void ds4_gpu_q4k_ffn_times(double *dequant_ms, double *gemm_ms) {
+    *dequant_ms = g_dq_ms;
+    *gemm_ms = g_gemm_ms;
 }
 
 extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
@@ -175,7 +219,10 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
     }
 
     if (!fgrow((void **)&g_ffn.xf, &g_ffn.cap_xf, n_x * 4)) return 0;
-    cudaMemcpy(g_ffn.xf, host_x, n_x * 4, cudaMemcpyHostToDevice);
+    if (!fpin(&g_ffn.pin_in, &g_ffn.cap_pin_in, n_x * 4)) return 0;
+    if (!fpin(&g_ffn.pin_out, &g_ffn.cap_pin_out, n_x * 4)) return 0;
+    memcpy(g_ffn.pin_in, host_x, n_x * 4);
+    cudaMemcpy(g_ffn.xf, g_ffn.pin_in, n_x * 4, cudaMemcpyHostToDevice);
     ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, n_x);
     {
         static int stage_reported = 0;
@@ -193,5 +240,8 @@ extern "C" int ds4_gpu_q4k_ffn_block(const void *gate_q4, const void *up_q4,
             return 0;
         }
     }
-    return cudaMemcpy(host_out, g_ffn.y, n_x * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (cudaMemcpy(g_ffn.pin_out, g_ffn.y, n_x * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+        return 0;
+    memcpy(host_out, g_ffn.pin_out, n_x * 4);
+    return 1;
 }

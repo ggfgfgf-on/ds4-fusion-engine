@@ -172,6 +172,12 @@ extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t 
         }
     }
 
+    static double t_upload = 0.0, t_dequant = 0.0, t_gemm = 0.0, t_down = 0.0;
+    static long calls = 0;
+    cudaEvent_t e0, e1, e2, e3, e4;
+    cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+    cudaEventCreate(&e3); cudaEventCreate(&e4);
+    cudaEventRecord(e0);
     const unsigned long long nb = (unsigned long long)M * (K / 256u);
     const unsigned warps = 8u;
     long hit = 0;
@@ -186,6 +192,7 @@ extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t 
     q6k_f32_to_f16<<<(unsigned)((xh + 255) / 256), 256>>>(g_q6.x, g_q6.xf, xh);
     q6k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
         g_q6.w, cached, nb);
+    cudaEventRecord(e1);
     {
         const cudaError_t de = cudaGetLastError();
         if (de != cudaSuccess) {
@@ -213,6 +220,7 @@ extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t 
                           CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
                           CUBLAS_GEMM_DEFAULT);
     }
+    cudaEventRecord(e2);
     if (st != CUBLAS_STATUS_SUCCESS) {
         static int reported = 0;
         if (reported++ < 3)
@@ -220,8 +228,27 @@ extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t 
                     (int)st, cudaGetErrorString(cudaGetLastError()));
         return 0;
     }
-    return cudaMemcpy(host_out, g_q6.y, (size_t)T * M * 4, cudaMemcpyDeviceToHost) ==
-           cudaSuccess;
+    cudaEventRecord(e3);
+    const cudaError_t rb =
+        cudaMemcpy(host_out, g_q6.y, (size_t)T * M * 4, cudaMemcpyDeviceToHost);
+    cudaEventRecord(e4);
+    cudaEventSynchronize(e4);
+    {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, e0, e1); t_upload += ms;
+        cudaEventElapsedTime(&ms, e1, e2); t_dequant += ms;
+        cudaEventElapsedTime(&ms, e2, e3); t_gemm += ms;
+        cudaEventElapsedTime(&ms, e3, e4); t_down += ms;
+        calls++;
+        if ((calls % 50) == 0)
+            fprintf(stderr,
+                    "q6k: %ld calls | upload %.0f | dequant %.0f | gemm %.0f | down %.0f ms "
+                    "(total %.0f ms)\n", calls, t_upload, t_dequant, t_gemm, t_down,
+                    t_upload + t_dequant + t_gemm + t_down);
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
+    cudaEventDestroy(e3); cudaEventDestroy(e4);
+    return rb == cudaSuccess;
 }
 
 #ifndef Q6K_NO_MAIN

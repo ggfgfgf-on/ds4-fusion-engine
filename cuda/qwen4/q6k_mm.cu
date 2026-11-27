@@ -56,6 +56,43 @@ __global__ void q6k_to_f16(__half *out, const unsigned char *in,
     *(uint4 *)(out + b * 256u + lane * 8u) = *(const uint4 *)h;
 }
 
+#define Q6K_CACHE_SLOTS 256
+typedef struct {
+    uint64_t key;
+    unsigned char *dev;
+    size_t bytes;
+} q6k_cache_entry;
+
+static q6k_cache_entry g_q6cache[Q6K_CACHE_SLOTS];
+static int g_q6cache_n = 0;
+static size_t g_q6cache_bytes = 0;
+static size_t g_q6cache_budget = 0;
+
+extern "C" void ds4_gpu_q6k_cache_budget(uint64_t bytes) { g_q6cache_budget = bytes; }
+
+static unsigned char *q6k_cached(uint64_t key, const void *host_q6, size_t bytes,
+                                 long *hit) {
+    *hit = 0;
+    for (int i = 0; i < g_q6cache_n; i++)
+        if (g_q6cache[i].key == key) { *hit = 1; return g_q6cache[i].dev; }
+    if (!g_q6cache_budget || g_q6cache_bytes + bytes > g_q6cache_budget) return NULL;
+    if (g_q6cache_n >= Q6K_CACHE_SLOTS) return NULL;
+    unsigned char *dev = NULL;
+    if (cudaMalloc((void **)&dev, bytes) != cudaSuccess) return NULL;
+    if (cudaMemcpy(dev, host_q6, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev);
+        return NULL;
+    }
+    g_q6cache[g_q6cache_n].key = key;
+    g_q6cache[g_q6cache_n].dev = dev;
+    g_q6cache[g_q6cache_n].bytes = bytes;
+    g_q6cache_n++;
+    g_q6cache_bytes += bytes;
+    return dev;
+}
+
+extern "C" size_t ds4_gpu_q6k_cache_held(void) { return g_q6cache_bytes; }
+
 typedef struct {
     cublasHandle_t cublas;
     unsigned char *q4src;    /* the packed weights, on the device */
@@ -85,8 +122,18 @@ static __global__ void q6k_f32_to_f16(__half *dst, const float *src,
     if (i < n) dst[i] = __float2half_rn(src[i]);
 }
 
+extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t K,
+                                    uint32_t M, const float *host_act, uint32_t T,
+                                    float *host_out);
+
 extern "C" int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
                               const float *host_act, uint32_t T, float *host_out) {
+    return ds4_gpu_q6k_mm_keyed(0, host_q6, K, M, host_act, T, host_out);
+}
+
+extern "C" int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6, uint32_t K,
+                                    uint32_t M, const float *host_act, uint32_t T,
+                                    float *host_out) {
     if (!g_q6.ready) {
         if (cublasCreate(&g_q6.cublas) != CUBLAS_STATUS_SUCCESS) return 0;
         /* No cublasSetMathMode call here: the four-bit module does not make one, and
@@ -127,11 +174,18 @@ extern "C" int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
 
     const unsigned long long nb = (unsigned long long)M * (K / 256u);
     const unsigned warps = 8u;
-    cudaMemcpy(g_q6.q4src, host_q6, qbytes, cudaMemcpyHostToDevice);
+    long hit = 0;
+    unsigned char *cached = key ? q6k_cached(key, host_q6, qbytes, &hit) : NULL;
+    if (cached) {
+        /* already on the device: nothing to copy for the weights */
+    } else {
+        cudaMemcpy(g_q6.q4src, host_q6, qbytes, cudaMemcpyHostToDevice);
+        cached = g_q6.q4src;
+    }
     cudaMemcpy(g_q6.xf, host_act, xh * 4, cudaMemcpyHostToDevice);
     q6k_f32_to_f16<<<(unsigned)((xh + 255) / 256), 256>>>(g_q6.x, g_q6.xf, xh);
     q6k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
-        g_q6.w, g_q6.q4src, nb);
+        g_q6.w, cached, nb);
     {
         const cudaError_t de = cudaGetLastError();
         if (de != cudaSuccess) {

@@ -78152,6 +78152,19 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
             ds4_gpu_q4k_resident_budget(getenv("DS4_GPU_NO_RESIDENT")
                                             ? 0ull
                                             : 5ull * 1024ull * 1024ull * 1024ull);
+            {
+                /* Everything six-bit is four and four tenths gigabytes and fits; the
+                 * four-bit cache and this one are never both large in a run that only
+                 * arms the six-bit path. */
+                /* Off by default: holding four and four tenths gigabytes of six-bit
+                 * weights on a device with six leaves the dequantiser's own buffers
+                 * competing for what is left, and the measurement says the copies it
+                 * saves are worth less than that. */
+                extern void ds4_gpu_q6k_cache_budget(uint64_t bytes);
+                ds4_gpu_q6k_cache_budget(getenv("DS4_GPU_Q6_CACHE")
+                                             ? 5ull * 1024ull * 1024ull * 1024ull
+                                             : 0ull);
+            }
             extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
             /* Registering the whole weight image is not an option on Windows: fifteen and
              * a half gigabytes of pinned system memory is charged against the device's own
@@ -78438,25 +78451,30 @@ static void qwen35_cpu_matvec_batch(
         if (in_dim0 <= 0xFFFFFFFFull && rows0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
             const void *hq6 = tensor_data(m, w);
             {
-                static int diag = 0;
-                if (diag++ < 6)
+                static long tries = 0, ok = 0, nodata = 0, tooshort = 0;
+                tries++;
+                if (!hq6) nodata++;
+                if (n_tok < 32u) tooshort++;
+                static long printed = 0;
+                if (tries - printed >= 100) {
+                    printed = tries;
                     fprintf(stderr,
-                            "ds4: [gpu_q6] try K=%llu M=%llu T=%llu data=%d\n",
-                            (unsigned long long)in_dim0, (unsigned long long)rows0,
-                            (unsigned long long)n_tok, hq6 != NULL);
+                            "ds4: [gpu_q6] single-path attempts %ld (ok %ld, no data %ld, "
+                            "short %ld)\n", tries, ok, nodata, tooshort);
+                }
+                extern int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6,
+                                               uint32_t K, uint32_t M,
+                                               const float *host_act, uint32_t T,
+                                               float *host_out);
+                if (hq6 && ds4_gpu_q6k_mm_keyed(w->abs_offset, hq6, (uint32_t)in_dim0,
+                                                (uint32_t)rows0, x, (uint32_t)n_tok,
+                                                out)) {
+                    ok++;
+                    free(xq);
+                    return;
+                }
             }
-            if (hq6 && ds4_gpu_q6k_mm(hq6, (uint32_t)in_dim0, (uint32_t)rows0, x,
-                                      (uint32_t)n_tok, out)) {
-                static long q6_blocks = 0;
-                q6_blocks++;
-                if (q6_blocks <= 2 || (q6_blocks % 50) == 0)
-                    fprintf(stderr,
-                            "ds4: [gpu_q6] %ld products on device (K=%llu M=%llu T=%llu)\n",
-                            q6_blocks, (unsigned long long)in_dim0,
-                            (unsigned long long)rows0, (unsigned long long)n_tok);
-                free(xq);
-                return;
-            }
+
         }
     }
     if (w->type == DS4_TENSOR_Q6_K && !exact &&
@@ -79119,8 +79137,13 @@ static bool qwen35_cpu_matvec_multi(
                 const uint64_t rows = ws[i]->dim[1];
                 if (rows > 0xFFFFFFFFull) { all_ok = 0; break; }
                 const void *hq = tensor_data(m, ws[i]);
-                if (!hq || !ds4_gpu_q6k_mm(hq, (uint32_t)K0, (uint32_t)rows, x,
-                                           (uint32_t)n_tok, outs[i]))
+                extern int ds4_gpu_q6k_mm_keyed(uint64_t key, const void *host_q6,
+                                               uint32_t K, uint32_t M,
+                                               const float *host_act, uint32_t T,
+                                               float *host_out);
+                if (!hq || !ds4_gpu_q6k_mm_keyed(ws[i]->abs_offset, hq, (uint32_t)K0,
+                                                 (uint32_t)rows, x, (uint32_t)n_tok,
+                                                 outs[i]))
                     all_ok = 0;
                 else
                     moved++;

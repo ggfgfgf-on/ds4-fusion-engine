@@ -390,6 +390,42 @@ extern "C" int ds4_gpu_q6k_mm_from_device(const void *host_q6, uint32_t K, uint3
            cudaSuccess;
 }
 
+/* The weights are already on the device - which is the case inside the feed-forward block,
+ * where the down matrix arrives on a prefetch queue. Passing a device pointer to the entry
+ * above is a silent error: it reaches cudaMemcpy as a host source, the copy fails, and the
+ * product declines, which is what made half the prefetched blocks fall back to the host.
+ */
+extern "C" int ds4_gpu_q6k_mm_from_device_devw(const void *dev_w, uint32_t K, uint32_t M,
+                                               const void *dev_act_f16, uint32_t T,
+                                               float *host_out) {
+    if (!g_q6.ready) {
+        if (cublasCreate(&g_q6.cublas) != CUBLAS_STATUS_SUCCESS) return 0;
+        g_q6.ready = 1;
+    }
+    if (!dev_w || !dev_act_f16 || !host_out || !K || !M || !T || (K % 256u)) return 0;
+    if (!q6grow((void **)&g_q6.w, &g_q6.cap_w, (size_t)M * K * 2)) return 0;
+    if (!q6grow((void **)&g_q6.y, &g_q6.cap_y, (size_t)T * M * 4)) return 0;
+    const unsigned long long nb = (unsigned long long)M * (K / 256u);
+    const unsigned warps = 8u;
+    q6k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
+        g_q6.w, (const unsigned char *)dev_w, nb);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    const float one = 1.0f, zero = 0.0f;
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+    const uint32_t tile = 5120u;
+    for (uint32_t r0 = 0; r0 < M && st == CUBLAS_STATUS_SUCCESS; r0 += tile) {
+        const uint32_t rows = (M - r0) < tile ? (M - r0) : tile;
+        st = cublasGemmEx(g_q6.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)T,
+                          (int)K, &one, g_q6.w + (size_t)r0 * K, CUDA_R_16F, (int)K,
+                          (const __half *)dev_act_f16, CUDA_R_16F, (int)K, &zero,
+                          g_q6.y + r0, CUDA_R_32F, (int)M,
+                          CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    return cudaMemcpy(host_out, g_q6.y, (size_t)T * M * 4, cudaMemcpyDeviceToHost) ==
+           cudaSuccess;
+}
+
 #ifndef Q6K_NO_MAIN
 #include <math.h>
 /* Host reference over the same field mapping, and a comparison against the kernel. The

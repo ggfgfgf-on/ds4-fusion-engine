@@ -92,6 +92,8 @@ typedef struct {
     cublasHandle_t cublas;
     unsigned char *q4src;    /* packed weights when they are streamed */
     size_t cap_q4src;
+    unsigned char *stage[3];  /* prefetch destinations */
+    size_t cap_stage[3];
     __half *xh;          /* activations, halves */
     __half *wf;          /* one dequantised weight at a time */
     __half *af;          /* silu(up*gate) halves */
@@ -368,4 +370,81 @@ extern "C" int ds4_gpu_q4k_ffn_block_q6(const void *gate_q4, const void *up_q4,
     if (cudaGetLastError() != cudaSuccess) return 0;
     return ds4_gpu_q6k_mm_from_device(down_q6, (uint32_t)FF, (uint32_t)K, g_ffn.af,
                                       n_tok, host_out);
+}
+
+extern "C" int ds4_pf_start(void);
+extern "C" void ds4_pf_issue(const void *src, unsigned char *dst, size_t bytes);
+extern "C" int ds4_pf_consume(void);
+extern "C" int ds4_gpu_q6k_mm_from_device_devw(const void *dev_w, uint32_t K, uint32_t M,
+                                               const void *dev_act_f16, uint32_t T,
+                                               float *host_out);
+
+/* The same block with the three copies on a prefetch queue.
+ *
+ * The first attempts handed the prefetched down matrix to the six-bit entry that takes a
+ * host pointer, so the copy inside it read a device address as host memory, failed, and
+ * the product declined - which is why half the blocks fell back to the host while the
+ * block itself measured faster. The device-weight entry did not exist; it does now.
+ */
+extern "C" int ds4_gpu_q4k_ffn_block_q6_pf(const void *gate_q4, const void *up_q4,
+                                           const void *down_q6, const float *host_x,
+                                           uint32_t n_tok, uint32_t K, uint32_t FF,
+                                           float *host_out) {
+    static long fails_mm = 0, fails_down = 0, calls = 0;
+    calls++;
+    if (!ffn_open() || !ds4_pf_start()) return 0;
+    if (!gate_q4 || !up_q4 || !down_q6 || !host_x || !host_out) return 0;
+    if (!n_tok || !K || !FF || (K % 256u) || (FF % 256u)) return 0;
+    const size_t n_x = (size_t)n_tok * K;
+    const size_t n_f = (size_t)n_tok * FF;
+    const size_t qb = ((size_t)FF * K / 256u) * Q6K_BLK_BYTES;
+    const size_t db = ((size_t)K * FF / 256u) * Q6K_BLK_BYTES;
+    const size_t big = qb > db ? qb : db;
+    const int ok = fgrow((void **)&g_ffn.xh, &g_ffn.cap_xh, n_x * 2) &&
+                   fgrow((void **)&g_ffn.xf, &g_ffn.cap_xf, n_x * 4) &&
+                   fgrow((void **)&g_ffn.wf, &g_ffn.cap_wf, (size_t)FF * K * 2) &&
+                   fgrow((void **)&g_ffn.af, &g_ffn.cap_af, n_f * 2) &&
+                   fgrow((void **)&g_ffn.g, &g_ffn.cap_g, n_f * 4) &&
+                   fgrow((void **)&g_ffn.u, &g_ffn.cap_u, n_f * 4) &&
+                   fgrow((void **)&g_ffn.stage[0], &g_ffn.cap_stage[0], big) &&
+                   fgrow((void **)&g_ffn.stage[1], &g_ffn.cap_stage[1], big) &&
+                   fgrow((void **)&g_ffn.stage[2], &g_ffn.cap_stage[2], big);
+    if (!ok) {
+        static int shown = 0;
+        if (shown++ < 3) {
+            size_t vf = 0, vt = 0;
+            cudaMemGetInfo(&vf, &vt);
+            fprintf(stderr, "ffnpf: alloc failed (%.0f MB free, need %.0f)\\n",
+                    (double)vf / 1048576.0, (double)(big * 3) / 1048576.0);
+        }
+        return 0;
+    }
+    cudaMemcpy(g_ffn.xf, host_x, n_x * 4, cudaMemcpyHostToDevice);
+    ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, n_x);
+    /* the window: all three in flight before the first product starts */
+    ds4_pf_issue(gate_q4, g_ffn.stage[0], qb);
+    ds4_pf_issue(up_q4, g_ffn.stage[1], qb);
+    ds4_pf_issue(down_q6, g_ffn.stage[2], db);
+    if (!ds4_pf_consume() ||
+        !ffn_mm(g_ffn.wf, g_ffn.stage[0], FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL)) {
+        fails_mm++;
+        return 0;
+    }
+    if (!ds4_pf_consume() ||
+        !ffn_mm(g_ffn.wf, g_ffn.stage[1], FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL)) {
+        fails_mm++;
+        return 0;
+    }
+    ffn_silu_mul<<<(unsigned)((n_f + 255) / 256), 256>>>(g_ffn.af, g_ffn.g, g_ffn.u, n_f);
+    if (!ds4_pf_consume()) {
+        fails_down++;
+        return 0;
+    }
+    const int r = ds4_gpu_q6k_mm_from_device_devw(g_ffn.stage[2], (uint32_t)FF, (uint32_t)K,
+                                                  g_ffn.af, n_tok, host_out);
+    if (!r) fails_down++;
+    if ((calls % 25) == 0)
+        fprintf(stderr, "ffnpf: %ld calls | mm fails %ld | down fails %ld\\n", calls,
+                fails_mm, fails_down);
+    return r;
 }

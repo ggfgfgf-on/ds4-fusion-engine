@@ -79766,8 +79766,18 @@ static void qwen35_cpu_forward_batch(
                                                     const float *host_x, uint32_t n_tok,
                                                     uint32_t K, uint32_t FF,
                                                     float *host_out);
+                extern int ds4_gpu_q4k_ffn_block_q6_pf(const void *gate_q4,
+                                                       const void *up_q4,
+                                                       const void *down_q6,
+                                                       const float *host_x,
+                                                       uint32_t n_tok, uint32_t K,
+                                                       uint32_t FF, float *host_out);
                 const int done = (l->ffn_down->type == DS4_TENSOR_Q6_K)
-                    ? ds4_gpu_q4k_ffn_block_q6(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk)
+                    ? (getenv("DS4_FFN_SERIAL")
+                           ? ds4_gpu_q4k_ffn_block_q6(ga, ua, da, blk, NT, ffn_k, ffn_ff,
+                                                      blk)
+                           : ds4_gpu_q4k_ffn_block_q6_pf(ga, ua, da, blk, NT, ffn_k,
+                                                         ffn_ff, blk))
                     : ds4_gpu_q4k_ffn_block_ex(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk,
                                                streamed);
                 clock_gettime(CLOCK_MONOTONIC, &b1);

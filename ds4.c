@@ -78175,8 +78175,19 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
              * free memory, and cudaMemGetInfo comes back with nothing left - every later
              * allocation fails. The copies out of ordinary large pages run slower, which is
              * the price of having device memory at all. */
-            if (getenv("DS4_GPU_PIN_WEIGHTS") && m && m->lp_base && m->size)
-                (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
+            /* A bounded window, not the whole image: registering all fifteen and a half
+             * gigabytes leaves the device with no free memory at all, because Windows
+             * charges pinned system memory against it. A window big enough to cover what a
+             * prefill streams is worth trying, and the size is the parameter. */
+            {
+                const char *pinsz = getenv("DS4_GPU_PIN_MB");
+                if (pinsz && pinsz[0] && m && m->lp_base && m->size) {
+                    uint64_t mb = strtoull(pinsz, NULL, 10);
+                    uint64_t bytes = mb * 1024ull * 1024ull;
+                    if (bytes > (uint64_t)m->size) bytes = (uint64_t)m->size;
+                    if (bytes) (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)bytes);
+                }
+            }
             /* Size the buffers for the largest projection up front: the first real
              * call otherwise paid half a second of context setup inside the prefill. */
             if (!ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE, (uint32_t)DS4_N_FF_DENSE,

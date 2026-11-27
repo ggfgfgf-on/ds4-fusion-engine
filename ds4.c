@@ -79097,6 +79097,49 @@ static void qwen35_mv_multi_worker(void *vctx, uint64_t c0, uint64_t c1) {
 static bool qwen35_cpu_matvec_multi(
         const ds4_model *m, const ds4_tensor *const *ws, float *const *outs,
         uint64_t n, const float *x, uint64_t n_tok) {
+    /* Mixed pairs: the gated recurrence's qkv is six-bit and its gate is not, so a rule
+     * that required the whole pair to match left the largest six-bit tensor in the model
+     * on the host. Each six-bit member goes to the device on its own and the rest fall
+     * through to the host path below. */
+    if (n >= 2u && n <= 3u && n_tok >= 32u && qwen35_gpu_prefill_wanted(m)) {
+        extern int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
+                                  const float *host_act, uint32_t T, float *host_out);
+        uint64_t K0 = 0;
+        int any_six = 0, all_ok = 1;
+        for (uint64_t i = 0; i < n; i++) {
+            if (!ws[i] || ws[i]->ndim < 2) { all_ok = 0; break; }
+            if (i == 0) K0 = ws[i]->dim[0];
+            if (ws[i]->dim[0] != K0) { all_ok = 0; break; }
+            if (ws[i]->type == DS4_TENSOR_Q6_K) any_six = 1;
+        }
+        if (any_six && all_ok && K0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            int moved = 0;
+            for (uint64_t i = 0; i < n && all_ok; i++) {
+                if (ws[i]->type != DS4_TENSOR_Q6_K) continue;
+                const uint64_t rows = ws[i]->dim[1];
+                if (rows > 0xFFFFFFFFull) { all_ok = 0; break; }
+                const void *hq = tensor_data(m, ws[i]);
+                if (!hq || !ds4_gpu_q6k_mm(hq, (uint32_t)K0, (uint32_t)rows, x,
+                                           (uint32_t)n_tok, outs[i]))
+                    all_ok = 0;
+                else
+                    moved++;
+            }
+            if (all_ok && moved) {
+                for (uint64_t i = 0; i < n; i++) {
+                    if (ws[i]->type == DS4_TENSOR_Q6_K) continue;
+                    qwen35_cpu_matvec_batch(m, ws[i], x, outs[i], n_tok, false);
+                }
+                static long mixed_pairs = 0, moved_total = 0;
+                mixed_pairs++;
+                moved_total += (long)moved;
+                if (mixed_pairs <= 2 || (mixed_pairs % 50) == 0)
+                    fprintf(stderr, "ds4: [gpu_q6] %ld mixed pairs, %ld tensors moved\n",
+                            mixed_pairs, moved_total);
+                return true;
+            }
+        }
+    }
     /* Split the fused pair the same way the single projections are split, because this
      * is where the arithmetic actually is: gate and up carry most of a layer's work and
      * share one activation, so one device submission covers two large products while

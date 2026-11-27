@@ -326,3 +326,46 @@ extern "C" int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
     memcpy(host_out, g_ffn.pin_out, n_x * 4);
     return 1;
 }
+
+extern "C" int ds4_gpu_q6k_mm_from_device(const void *host_q6, uint32_t K, uint32_t M,
+                                          const void *dev_act_f16, uint32_t T,
+                                          float *host_out);
+
+/* The same block with a six-bit down matrix.
+ *
+ * A Q4_K_M model mixes widths inside the feed-forward: gate and up are four-bit and down
+ * is six-bit, every layer. Requiring all three to be four-bit therefore left the block
+ * unused for the layers that have a six-bit down, which by the tensor survey is all of
+ * them; this path handles the mix. Gate and up go through this module's unpack, the silu
+ * product stays on the device, and the down matrix goes to the six-bit module as halves.
+ */
+extern "C" int ds4_gpu_q4k_ffn_block_q6(const void *gate_q4, const void *up_q4,
+                                        const void *down_q6, const float *host_x,
+                                        uint32_t n_tok, uint32_t K, uint32_t FF,
+                                        float *host_out) {
+    if (!ffn_open()) return 0;
+    if (!gate_q4 || !up_q4 || !down_q6 || !host_x || !host_out) return 0;
+    if (!n_tok || !K || !FF || (K % 256u) || (FF % 256u)) return 0;
+    const size_t n_x = (size_t)n_tok * K;
+    const size_t n_f = (size_t)n_tok * FF;
+    const size_t qb = ((size_t)FF * K / 256u) * Q6K_BLK_BYTES;
+    if (!fgrow((void **)&g_ffn.xh, &g_ffn.cap_xh, n_x * 2)) return 0;
+    if (!fgrow((void **)&g_ffn.xf, &g_ffn.cap_xf, n_x * 4)) return 0;
+    if (!fgrow((void **)&g_ffn.wf, &g_ffn.cap_wf, (size_t)FF * K * 2)) return 0;
+    if (!fgrow((void **)&g_ffn.q4src, &g_ffn.cap_q4src, qb)) return 0;
+    if (!fgrow((void **)&g_ffn.af, &g_ffn.cap_af, n_f * 2)) return 0;
+    if (!fgrow((void **)&g_ffn.g, &g_ffn.cap_g, n_f * 4)) return 0;
+    if (!fgrow((void **)&g_ffn.u, &g_ffn.cap_u, n_f * 4)) return 0;
+    cudaMemcpy(g_ffn.xf, host_x, n_x * 4, cudaMemcpyHostToDevice);
+    ffn_f32_to_f16<<<(unsigned)((n_x + 255) / 256), 256>>>(g_ffn.xh, g_ffn.xf, n_x);
+    cudaMemcpy(g_ffn.q4src, gate_q4, qb, cudaMemcpyHostToDevice);
+    if (!ffn_mm(g_ffn.wf, g_ffn.q4src, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.g, NULL))
+        return 0;
+    cudaMemcpy(g_ffn.q4src, up_q4, qb, cudaMemcpyHostToDevice);
+    if (!ffn_mm(g_ffn.wf, g_ffn.q4src, FF, K, g_ffn.xh, n_tok, NULL, g_ffn.u, NULL))
+        return 0;
+    ffn_silu_mul<<<(unsigned)((n_f + 255) / 256), 256>>>(g_ffn.af, g_ffn.g, g_ffn.u, n_f);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    return ds4_gpu_q6k_mm_from_device(down_q6, (uint32_t)FF, (uint32_t)K, g_ffn.af,
+                                      n_tok, host_out);
+}

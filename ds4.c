@@ -79701,7 +79701,8 @@ static void qwen35_cpu_forward_batch(
         int ffn_on_device = 0;
         if (qwen35_gpu_prefill_wanted(m) && l->ffn_gate && l->ffn_up && l->ffn_down &&
             l->ffn_gate->type == DS4_TENSOR_Q4_K && l->ffn_up->type == DS4_TENSOR_Q4_K &&
-            l->ffn_down->type == DS4_TENSOR_Q4_K && NT >= 32u) {
+            (l->ffn_down->type == DS4_TENSOR_Q4_K ||
+             l->ffn_down->type == DS4_TENSOR_Q6_K) && NT >= 32u) {
             extern const void *ds4_gpu_q4k_resident(uint64_t key, const void *host_q4k,
                                                     uint64_t bytes);
             extern int ds4_gpu_q4k_ffn_block_ex(const void *gate_q4, const void *up_q4,
@@ -79743,8 +79744,14 @@ static void qwen35_cpu_forward_batch(
             if (ga && ua && da) {
                 struct timespec b0, b1;
                 clock_gettime(CLOCK_MONOTONIC, &b0);
-                const int done =
-                    ds4_gpu_q4k_ffn_block_ex(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk,
+                extern int ds4_gpu_q4k_ffn_block_q6(const void *gate_q4,
+                                                    const void *up_q4, const void *down_q6,
+                                                    const float *host_x, uint32_t n_tok,
+                                                    uint32_t K, uint32_t FF,
+                                                    float *host_out);
+                const int done = (l->ffn_down->type == DS4_TENSOR_Q6_K)
+                    ? ds4_gpu_q4k_ffn_block_q6(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk)
+                    : ds4_gpu_q4k_ffn_block_ex(ga, ua, da, blk, NT, ffn_k, ffn_ff, blk,
                                                streamed);
                 clock_gettime(CLOCK_MONOTONIC, &b1);
                 static long blocks = 0;

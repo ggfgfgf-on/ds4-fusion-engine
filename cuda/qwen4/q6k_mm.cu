@@ -38,16 +38,21 @@ __global__ void q6k_to_f16(__half *out, const unsigned char *in,
     const signed char *sc = (const signed char *)(blk + 192u);
     const float d = __half2float(*(const __half *)(blk + 208u));
 
-    /* Eight consecutive values, which is lane*8 .. lane*8+7 within the super-block. */
+    /* Eight consecutive values per lane, explicitly unrolled: as a loop over an array of
+     * eight halves the compiler kept it, but a spilled array would have turned every
+     * value into a local-memory round trip, and the kernel is the largest single item left
+     * in this path. */
     __half h[8];
+#pragma unroll
     for (unsigned u = 0; u < 8u; u++) {
         const unsigned n = lane * 8u + u;
         const unsigned half = n >> 7;
         const unsigned within = n & 127u;
         const unsigned l = within & 31u;
         const unsigned jj = within >> 5;
-        const unsigned ql_idx = half * 64u + (jj & 1u ? 32u : 0u) + l;
-        const unsigned nib = (jj >= 2u) ? (ql[ql_idx] >> 4) : (ql[ql_idx] & 0xFu);
+        const unsigned ql_idx = half * 64u + ((jj & 1u) ? 32u : 0u) + l;
+        const unsigned byte = ql[ql_idx];
+        const unsigned nib = (jj >= 2u) ? (byte >> 4) : (byte & 0xFu);
         const unsigned top = (qh[half * 32u + l] >> (jj * 2u)) & 3u;
         const int q = (int)(nib | (top << 4)) - 32;
         const int s = sc[half * 8u + (l >> 4) + 2u * jj];

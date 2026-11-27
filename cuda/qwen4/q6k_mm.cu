@@ -58,11 +58,12 @@ __global__ void q6k_to_f16(__half *out, const unsigned char *in,
 
 typedef struct {
     cublasHandle_t cublas;
+    unsigned char *q4src;    /* the packed weights, on the device */
     __half *w;
     __half *x;
     float *xf;
     float *y;
-    size_t cap_w, cap_x, cap_xf, cap_y;
+    size_t cap_q4src, cap_w, cap_x, cap_xf, cap_y;
     int ready;
 } q6k_ctx;
 
@@ -88,13 +89,15 @@ extern "C" int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
                               const float *host_act, uint32_t T, float *host_out) {
     if (!g_q6.ready) {
         if (cublasCreate(&g_q6.cublas) != CUBLAS_STATUS_SUCCESS) return 0;
-        /* the same math mode the four-bit module sets: without it a product of this shape
-         * comes back as CUBLAS_STATUS_NOT_SUPPORTED and the handle is left unusable */
-        cublasSetMathMode(g_q6.cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+        /* No cublasSetMathMode call here: the four-bit module does not make one, and
+         * making one with CUBLAS_TF32_TENSOR_OP_MATH is what turned this shape into
+         * CUBLAS_STATUS_NOT_SUPPORTED. The compute type on the product is what selects
+         * the arithmetic. */
         g_q6.ready = 1;
     }
     if (!host_q6 || !K || !M || !T || (K % 256u)) return 0;
     const size_t xh = (size_t)T * K;
+    const size_t qbytes = (size_t)M * (K / 256u) * Q6K_BYTES;
     {
         static int first = 0;
         if (first++ == 0) {
@@ -106,7 +109,8 @@ extern "C" int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
     }
     {
         static int reported = 0;
-        const int ok = q6grow((void **)&g_q6.w, &g_q6.cap_w, (size_t)M * K * 2) &&
+        const int ok = q6grow((void **)&g_q6.q4src, &g_q6.cap_q4src, qbytes) &&
+                       q6grow((void **)&g_q6.w, &g_q6.cap_w, (size_t)M * K * 2) &&
                        q6grow((void **)&g_q6.x, &g_q6.cap_x, xh * 2) &&
                        q6grow((void **)&g_q6.xf, &g_q6.cap_xf, xh * 4) &&
                        q6grow((void **)&g_q6.y, &g_q6.cap_y, (size_t)T * M * 4);
@@ -123,15 +127,38 @@ extern "C" int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
 
     const unsigned long long nb = (unsigned long long)M * (K / 256u);
     const unsigned warps = 8u;
+    cudaMemcpy(g_q6.q4src, host_q6, qbytes, cudaMemcpyHostToDevice);
     cudaMemcpy(g_q6.xf, host_act, xh * 4, cudaMemcpyHostToDevice);
     q6k_f32_to_f16<<<(unsigned)((xh + 255) / 256), 256>>>(g_q6.x, g_q6.xf, xh);
     q6k_to_f16<<<(unsigned)((nb + warps - 1u) / warps), warps * 32u>>>(
-        g_q6.w, (const unsigned char *)host_q6, nb);
+        g_q6.w, g_q6.q4src, nb);
+    {
+        const cudaError_t de = cudaGetLastError();
+        if (de != cudaSuccess) {
+            static int rep = 0;
+            if (rep++ < 3)
+                fprintf(stderr, "q6k: dequant launch failed: %s\n", cudaGetErrorString(de));
+            return 0;
+        }
+    }
     const float one = 1.0f, zero = 0.0f;
-    const cublasStatus_t st = cublasGemmEx(
-        g_q6.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)T, (int)K, &one, g_q6.w,
-        CUDA_R_16F, (int)K, g_q6.x, CUDA_R_16F, (int)K, &zero, g_q6.y, CUDA_R_32F,
-        (int)M, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+    /* Rows in tiles. Ten thousand two hundred and forty rows comes back
+     * CUBLAS_STATUS_NOT_SUPPORTED from this handle while five thousand one hundred and
+     * twenty and twelve thousand two hundred and eighty-eight both succeed, so the shape
+     * is cut rather than the question pursued - the tiling costs one extra call per tile
+     * and nothing else. */
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+    const uint32_t tile = 5120u;
+    for (uint32_t r0 = 0; r0 < M && st == CUBLAS_STATUS_SUCCESS; r0 += tile) {
+        const uint32_t rows = (M - r0) < tile ? (M - r0) : tile;
+        /* C is column-major M x T with leading dimension M, so a row tile starts at
+         * offset r0 and keeps that leading dimension. */
+        st = cublasGemmEx(g_q6.cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)T,
+                          (int)K, &one, g_q6.w + (size_t)r0 * K, CUDA_R_16F, (int)K,
+                          g_q6.x, CUDA_R_16F, (int)K, &zero, g_q6.y + r0,
+                          CUDA_R_32F, (int)M, CUBLAS_COMPUTE_32F_FAST_TF32,
+                          CUBLAS_GEMM_DEFAULT);
+    }
     if (st != CUBLAS_STATUS_SUCCESS) {
         static int reported = 0;
         if (reported++ < 3)
@@ -208,6 +235,53 @@ int main(void) {
     printf("values %llu  nonzero %llu  worst rel %.3e  mean abs %.3e\n", n, covered,
            worst, mean / (double)n);
     printf("%s\n", worst < 1e-2 ? "PASS" : "FAIL");
+
+    /* The shape the engine presents first, called through the same entry point the
+     * engine uses, to tell a shape problem from an integration one. */
+    {
+        const uint32_t K = 5120u, M = 10240u, T = 305u;
+        unsigned char *wq = (unsigned char *)malloc((size_t)M * (K / 256u) * Q6K_BYTES);
+        float *act = (float *)malloc((size_t)T * K * 4);
+        float *res = (float *)malloc((size_t)T * M * 4);
+        for (size_t i = 0; i < (size_t)M * (K / 256u) * Q6K_BYTES; i++)
+            wq[i] = (unsigned char)(rand() & 0xFF);
+        for (size_t i = 0; i < (size_t)M * (K / 256u); i++) {
+            unsigned char *blk = wq + i * Q6K_BYTES;
+            for (unsigned j = 0; j < 16u; j++) blk[192u + j] = (unsigned char)(1 + (rand() % 40));
+            const __half hd = __float2half_rn(0.001f);
+            memcpy(blk + 208u, &hd, 2);
+        }
+        for (size_t i = 0; i < (size_t)T * K; i++) act[i] = (float)(rand() % 1000) / 1000.0f;
+        const int ok = ds4_gpu_q6k_mm(wq, K, M, act, T, res);
+        printf("shape test K=%u M=%u T=%u -> %s (res[0]=%.4f)\n", K, M, T,
+               ok ? "OK" : "FAILED", ok ? (double)res[0] : 0.0);
+        /* Sweep the compute type and the token count against a hand-made pair of
+         * half-precision matrices, which is the exact call the module makes. */
+        {
+            __half *A = NULL, *B = NULL;
+            float *C = NULL;
+            cublasHandle_t h;
+            cublasCreate(&h);
+            cudaMalloc((void **)&A, (size_t)M * K * 2);
+            cudaMalloc((void **)&B, (size_t)T * K * 2);
+            cudaMalloc((void **)&C, (size_t)M * T * 4);
+            const cublasComputeType_t tys[4] = {
+                CUBLAS_COMPUTE_32F, CUBLAS_COMPUTE_32F_FAST_16F,
+                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_COMPUTE_16F};
+            const char *nm[4] = {"32F", "32F_FAST_16F", "32F_FAST_TF32", "16F"};
+            for (int ti = 0; ti < 4; ti++) {
+                const float one = 1.0f, zero = 0.0f;
+                const cublasStatus_t st = cublasGemmEx(
+                    h, CUBLAS_OP_T, CUBLAS_OP_N, (int)M, (int)T, (int)K, &one, A,
+                    CUDA_R_16F, (int)K, B, CUDA_R_16F, (int)K, &zero, C, CUDA_R_32F,
+                    (int)M, tys[ti], CUBLAS_GEMM_DEFAULT);
+                printf("  compute %-14s -> %d\n", nm[ti], (int)st);
+            }
+            cudaFree(A); cudaFree(B); cudaFree(C);
+            cublasDestroy(h);
+        }
+        free(wq); free(act); free(res);
+    }
     return 0;
 }
 #endif

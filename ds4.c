@@ -78146,12 +78146,20 @@ static int qwen35_gpu_prefill_wanted(const ds4_model *m) {
             /* Leave room for the scratch the products need, then spend the rest on
              * resident weights: every byte that lives on the device is a byte the host
              * does not have to read again. */
-            ds4_gpu_q4k_resident_budget(5ull * 1024ull * 1024ull * 1024ull);
+            /* The six-bit path needs a couple of hundred megabytes of scratch of its own
+             * and the weights it handles gain nothing from being resident, so the budget
+             * can be handed back entirely while that path is being measured. */
+            ds4_gpu_q4k_resident_budget(getenv("DS4_GPU_NO_RESIDENT")
+                                            ? 0ull
+                                            : 5ull * 1024ull * 1024ull * 1024ull);
             extern int ds4_gpu_q4k_stream_warm(uint32_t K, uint32_t M, uint32_t T);
-            if (m && m->lp_base && m->size)
+            /* Registering the whole weight image is not an option on Windows: fifteen and
+             * a half gigabytes of pinned system memory is charged against the device's own
+             * free memory, and cudaMemGetInfo comes back with nothing left - every later
+             * allocation fails. The copies out of ordinary large pages run slower, which is
+             * the price of having device memory at all. */
+            if (getenv("DS4_GPU_PIN_WEIGHTS") && m && m->lp_base && m->size)
                 (void)ds4_gpu_q4k_stream_pin(m->lp_base, (size_t)m->size);
-            else if (m && m->map && m->size)
-                (void)ds4_gpu_q4k_stream_pin((void *)m->map, (size_t)m->size);
             /* Size the buffers for the largest projection up front: the first real
              * call otherwise paid half a second of context setup inside the prefill. */
             if (!ds4_gpu_q4k_stream_warm((uint32_t)DS4_N_FF_DENSE, (uint32_t)DS4_N_FF_DENSE,
@@ -78417,6 +78425,40 @@ static void qwen35_cpu_matvec_batch(
      * does come out ahead once the translation lookaside stops being the limit. The
      * repack costs one to two and a half seconds, once per process, so this is on by
      * default and DS4_NO_QWEN35_Q6W turns it off. */
+    /* Six-bit weights are a third of a prefill's host time and the slowest thing the
+     * host does: two and seven tenths teraflops, against ten on four-bit weights, because
+     * unpacking six bits costs more per value than it saves in bytes. The device cares
+     * much less, and these weights need no residency - the arithmetic pays for moving them
+     * across the bus several times over. */
+    if (w->type == DS4_TENSOR_Q6_K && !exact && n_tok >= 32u &&
+        qwen35_gpu_prefill_wanted(m)) {
+        extern int ds4_gpu_q6k_mm(const void *host_q6, uint32_t K, uint32_t M,
+                                  const float *host_act, uint32_t T, float *host_out);
+        const uint64_t in_dim0 = w->dim[0], rows0 = w->ndim >= 2 ? w->dim[1] : 1u;
+        if (in_dim0 <= 0xFFFFFFFFull && rows0 <= 0xFFFFFFFFull && n_tok <= 0xFFFFFFFFull) {
+            const void *hq6 = tensor_data(m, w);
+            {
+                static int diag = 0;
+                if (diag++ < 6)
+                    fprintf(stderr,
+                            "ds4: [gpu_q6] try K=%llu M=%llu T=%llu data=%d\n",
+                            (unsigned long long)in_dim0, (unsigned long long)rows0,
+                            (unsigned long long)n_tok, hq6 != NULL);
+            }
+            if (hq6 && ds4_gpu_q6k_mm(hq6, (uint32_t)in_dim0, (uint32_t)rows0, x,
+                                      (uint32_t)n_tok, out)) {
+                static long q6_blocks = 0;
+                q6_blocks++;
+                if (q6_blocks <= 2 || (q6_blocks % 50) == 0)
+                    fprintf(stderr,
+                            "ds4: [gpu_q6] %ld products on device (K=%llu M=%llu T=%llu)\n",
+                            q6_blocks, (unsigned long long)in_dim0,
+                            (unsigned long long)rows0, (unsigned long long)n_tok);
+                free(xq);
+                return;
+            }
+        }
+    }
     if (w->type == DS4_TENSOR_Q6_K && !exact &&
         getenv("DS4_NO_QWEN35_Q6W") == NULL) {
         if (getenv("DS4_QWEN35_Q6DBG")) {

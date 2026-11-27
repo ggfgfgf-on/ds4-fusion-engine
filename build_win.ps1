@@ -206,7 +206,8 @@ if ($Cuda) {
 # The streaming Q4_K projection lives outside ds4_cuda.cu so it stays testable on
 # its own; the engine build passes the flag that suppresses its harness main().
 Compile-Cu 'cuda\qwen4\q4k_stream.cu' 'q4k_stream.obj' @('-DQ4K_STREAM_NO_MAIN')
-Compile-Cu 'cuda\qwen4\q4k_ffn_block.cu' 'q4k_ffn_block.obj'
+Compile-Cu 'cuda\qwen4\q4k_ffn_block.cu' 'q4k_ffn_block.obj'
+Compile-Cu 'cuda\qwen4\q6k_mm.cu' 'q6k_mm.obj' @('-DQ6K_NO_MAIN')
     $mmqFiles = @('ds4_ggml_stubs.cu','ds4_mmq.cu','ds4_mmq_d2r.cu','quantize.cu','mmid.cu','mmvq.cu','ds4_repack.cu')
     $mmqObjs = @()
     foreach ($f in $mmqFiles) {
@@ -215,7 +216,7 @@ Compile-Cu 'cuda\qwen4\q4k_ffn_block.cu' 'q4k_ffn_block.obj'
         $mmqObjs += $name
     }
 
-    $cores = @('ds4.obj','q4k_stream.obj','q4k_ffn_block.obj','ds4_image.obj','ds4_distributed.obj','ds4_tp.obj','ds4_ssd.obj','ds4_cuda.obj','ds4_layer_pack.obj','ds4_engram.obj') + $mmqObjs + @('win_compat.obj', 'win_compat_regex.obj')
+    $cores = @('ds4.obj','q4k_stream.obj','q4k_ffn_block.obj','q6k_mm.obj','ds4_image.obj','ds4_distributed.obj','ds4_tp.obj','ds4_ssd.obj','ds4_cuda.obj','ds4_layer_pack.obj','ds4_engram.obj') + $mmqObjs + @('win_compat.obj', 'win_compat_regex.obj')
 
     $cudart = "$CudaToolkit\lib\x64\cudart.lib"
     $cublas = "$CudaToolkit\lib\x64\cublas.lib"
